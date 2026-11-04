@@ -149,6 +149,20 @@ TEST_CASE("Ampere geometry exit setup results must be dead before the body reads
     code = Program;
     code[10] = Nop;
     RequireAccepted(code);
+
+    // ALD R3, a[0x70] of the vertex in R7 (Orbitals' layered geometry): writes R3; reading R3
+    // as the vertex does not.
+    code = Program;
+    code[9] = Instruction{{0xff037321, 0x00007007, 0x00000000, 0x000e2800}};
+    RequireAccepted(code);
+    code[9].words[1] = 0x00007003;
+    RequireRejected(code, reads, 0x90);
+    // OUT.EMIT R3, R7, RZ writes the next handle to R3; with the handle in R3 it reads it.
+    code = Program;
+    code[9] = Instruction{{0x07037324, 0xff, 0x00004000, 0x000e2800}};
+    RequireAccepted(code);
+    code[9].words[0] = 0x03037324;
+    RequireRejected(code, reads, 0x90);
 }
 
 TEST_CASE("Ampere geometry exit body cannot touch the handler state", "[video_core][ampere]") {
