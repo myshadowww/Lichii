@@ -183,7 +183,10 @@ bool Start() {
     return true;
 }
 
-bool WantsDevice() { return GetState().started; }
+bool WantsDevice() {
+    const auto& state = GetState();
+    return state.started && !state.device;
+}
 bool IsAvailable() { return GetState().available; }
 std::vector<std::string> InstanceExtensions() { return GetState().instance_extensions; }
 std::vector<std::string> DeviceExtensions(VkInstance, VkPhysicalDevice) {
@@ -193,7 +196,7 @@ std::vector<std::string> DeviceExtensions(VkInstance, VkPhysicalDevice) {
 bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device, u32,
                   vk::DeviceDispatch &dld) {
     State &state = GetState();
-    if (!state.started) {
+    if (!WantsDevice()) {
         return false;
     }
     VkPhysicalDeviceProperties props{};

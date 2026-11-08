@@ -224,6 +224,13 @@ int main(int argc, char **argv) try {
             Device device{*instance, vk::PhysicalDevice{physical_devices[gpu], dispatch},
                           VK_NULL_HANDLE, dispatch};
             Require(NvidiaDlss::IsAvailable(), "Native DLSS unavailable on selected device");
+            Require(!NvidiaDlss::WantsDevice(), "Attached runtime still requests a device");
+            auto duplicate_dispatch = device.GetDispatchLoader();
+            Require(!NvidiaDlss::AttachDevice(*instance, physical_devices[gpu],
+                                              *device.GetLogical(), device.GetGraphicsFamily(),
+                                              duplicate_dispatch),
+                    "NGX accepted a second device attachment");
+            Require(NvidiaDlss::IsAvailable(), "Duplicate attachment disturbed the active device");
             RenderCases(device);
         }
         Require(!NvidiaDlss::IsAvailable(), "Device teardown left NGX active");
