@@ -14,6 +14,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "video_core/neural_rendering/runtime.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 
 #define VMA_IMPLEMENTATION
@@ -71,7 +72,7 @@ InputImage MakeInput(const Device &device, MemoryAllocator &allocator, VkFormat 
     return result;
 }
 
-void RenderCases(const Device &device, u32 scale) {
+void RenderCases(const Device& device, u32 scale, bool expect_neural) {
     MemoryAllocator allocator{device};
     StateTracker tracker;
     Scheduler scheduler{device, tracker};
@@ -83,6 +84,14 @@ void RenderCases(const Device &device, u32 scale) {
                            VK_IMAGE_ASPECT_DEPTH_BIT, input_extent);
     auto motion = MakeInput(device, allocator, VK_FORMAT_R16G16_SFLOAT,
                             VK_IMAGE_ASPECT_COLOR_BIT, input_extent);
+    auto alternate_motion_view = device.GetLogical().CreateImageView({
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = *motion.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = motion.resource.format,
+        .subresourceRange = motion.resource.range,
+    });
+    const auto original_motion_view = motion.resource.view;
     auto &api = const_cast<Ngx::Api &>(Ngx::GetApi());
     const auto evaluate = api.evaluate;
     SCOPE_EXIT { api.evaluate = evaluate; };
@@ -90,6 +99,8 @@ void RenderCases(const Device &device, u32 scale) {
                                  VkExtent2D{320, 180}, VkExtent2D{480, 270}, VkExtent2D{480, 270},
                                  VkExtent2D{480, 270}};
     for (size_t frame = 0; frame < outputs.size(); ++frame) {
+        // Rebind while temporal history is live, without resizing the backend.
+        motion.resource.view = frame == 1 ? *alternate_motion_view : original_motion_view;
         const VkExtent2D extent{outputs[frame].width * scale, outputs[frame].height * scale};
         const bool inject_failure = frame == outputs.size() - 1;
         if (inject_failure) {
@@ -183,22 +194,30 @@ void RenderCases(const Device &device, u32 scale) {
             }
         }
         for (size_t c = 0; c < sums.size(); ++c) {
-            Require(std::abs(sums[c] / pixels - (inject_failure ? 0.0f : expected[c])) < 0.025,
-                    "Readback differs from input; stale or incorrect output");
+            if (!expect_neural || inject_failure) {
+                Require(std::abs(sums[c] / pixels - (inject_failure ? 0.0f : expected[c])) < 0.025,
+                        "Readback differs from input; stale or incorrect output");
+            } else {
+                Require(sums[c] / pixels > 0.01 && sums[c] / pixels < 16.0,
+                        "Neural output is empty or outside the expected HDR range");
+            }
         }
         std::printf("PASS frame %zu: %ux%u -> %ux%u; RGB %.4f %.4f %.4f\n", frame,
                     input_extent.width, input_extent.height, extent.width, extent.height,
                     sums[0] / pixels, sums[1] / pixels, sums[2] / pixels);
     }
     Require(Ngx::GetStatus().evaluations == outputs.size() - 1, "Incorrect evaluation count");
+    const auto neural = VideoCore::NeuralRendering::GetStatus();
+    Require(neural.submitted_frames == (expect_neural ? outputs.size() - 1 : 0),
+            "Incorrect neural rendering submission count");
 }
 } // namespace
 
 int main(int argc, char **argv) try {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
-        std::fprintf(stderr,
-                     "Usage: ngx_smoke <directory containing Linux DLSS model> [GPU index] [scale 1-8]\n");
+        std::fprintf(stderr, "Usage: ngx_smoke <Linux DLSS directory> [GPU index] [scale 1-8] [NR "
+                             "model directory or missing]\n");
         return 2;
     }
     const auto scratch =
@@ -218,18 +237,30 @@ int main(int argc, char **argv) try {
     setenv("LICHII_NGX_DIR", std::filesystem::absolute(argv[1]).c_str(), 1);
     const size_t gpu = argc > 2 ? std::stoul(argv[2]) : 0;
     const auto scale = argc > 3 ? std::stoul(argv[3]) : 1;
+    const bool request_neural = argc > 4;
+    const bool expect_neural = request_neural && std::string_view{argv[4]} != "missing";
+    Settings::values.neural_rendering =
+        request_neural ? Settings::NeuralRendering::Natural : Settings::NeuralRendering::Off;
+    if (expect_neural) {
+        const auto target = VideoCore::NeuralRendering::UserFolder();
+        std::filesystem::create_directories(target.parent_path());
+        std::filesystem::create_directory_symlink(std::filesystem::absolute(argv[4]), target);
+    }
     Require(scale >= 1 && scale <= 8, "Scale must be between 1 and 8 (4K output)");
     for (int run = 0; run < 2; ++run) {
         Require(NvidiaDlss::Start(), "NGX startup failed");
         {
             auto library = OpenLibrary();
             vk::InstanceDispatch dispatch;
-            auto instance = CreateInstance(*library, dispatch, VK_API_VERSION_1_3);
+            auto instance = CreateInstance(*library, dispatch, VK_API_VERSION_1_3,
+                                           Core::Frontend::WindowSystemType::X11);
             const auto physical_devices = instance.EnumeratePhysicalDevices();
             Require(gpu < physical_devices.size(), "GPU index out of range");
             Device device{*instance, vk::PhysicalDevice{physical_devices[gpu], dispatch},
                           VK_NULL_HANDLE, dispatch};
             Require(NvidiaDlss::IsAvailable(), "Native DLSS unavailable on selected device");
+            Require(!request_neural || device.SupportsNeuralRendering(),
+                    "Neural rendering device features were not enabled");
             Require(!NvidiaDlss::WantsDevice(), "Attached runtime still requests a device");
             auto duplicate_dispatch = device.GetDispatchLoader();
             Require(!NvidiaDlss::AttachDevice(*instance, physical_devices[gpu],
@@ -237,7 +268,11 @@ int main(int argc, char **argv) try {
                                               duplicate_dispatch),
                     "NGX accepted a second device attachment");
             Require(NvidiaDlss::IsAvailable(), "Duplicate attachment disturbed the active device");
-            RenderCases(device, static_cast<u32>(scale));
+            RenderCases(device, static_cast<u32>(scale), expect_neural);
+            if (request_neural && !expect_neural) {
+                Require(!VideoCore::NeuralRendering::GetStatus().error.empty(),
+                        "Missing neural model was not diagnosed");
+            }
         }
         Require(!NvidiaDlss::IsAvailable(), "Device teardown left NGX active");
         std::printf("PASS device lifecycle %d\n", run + 1);

@@ -300,6 +300,10 @@ public:
         return instance;
     }
 
+    bool SupportsNeuralRendering() const noexcept {
+        return neural_rendering_supported;
+    }
+
     VkPipelineCache StaticPipelineCache() const noexcept {
         return *static_pipeline_cache;
     }
@@ -1268,6 +1272,7 @@ private:
     void SaveStaticPipelineCache() const;
 
 private:
+    bool EnableNeuralRendering();
     VkInstance instance;         ///< Vulkan instance.
     VmaAllocator allocator{};    ///< VMA allocator.
     mutable std::mutex separate_pools_mutex;
@@ -1339,6 +1344,13 @@ private:
     Properties properties{};
 
     VkPhysicalDeviceFeatures2 features2{};
+#ifdef EGLANTINE_NGX
+    VkPhysicalDeviceCooperativeMatrix2FeaturesNV nr_cooperative_matrix{};
+    VkPhysicalDeviceShaderFloat8FeaturesEXT nr_float8{};
+    VkPhysicalDeviceShaderClockFeaturesKHR nr_clock{};
+    VkPhysicalDeviceShaderSMBuiltinsFeaturesNV nr_sm{};
+#endif
+    bool neural_rendering_supported{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
     VkPhysicalDeviceProperties2 properties2{};
 

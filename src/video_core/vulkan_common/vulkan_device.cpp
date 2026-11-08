@@ -37,6 +37,7 @@
 #include "common/scope_exit.h"
 #endif
 #ifdef EGLANTINE_NGX
+#include "video_core/neural_rendering/runtime.h"
 #include "video_core/vulkan_common/ngx_dlss.h"
 #endif
 
@@ -792,6 +793,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     if (host_float16_supported) {
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
+    neural_rendering_supported = EnableNeuralRendering();
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -864,7 +866,98 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 #endif
 }
 
+bool Device::EnableNeuralRendering() {
+#ifdef EGLANTINE_NGX
+    namespace NR = VideoCore::NeuralRendering;
+    NR::ResetStatus();
+    if (!Settings::values.nvidia_dlss.GetValue() ||
+        Settings::values.neural_rendering.GetValue() == Settings::NeuralRendering::Off) {
+        return false;
+    }
+    const auto unavailable = [](const char* reason) {
+        NR::ReportFailure(reason);
+        return false;
+    };
+    if (!IsNvidia() || instance_version < VK_API_VERSION_1_3 || !nvidia_dlss_extensions) {
+        return unavailable("the selected device does not support native NVIDIA neural rendering");
+    }
+    constexpr std::array required_extensions{VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
+                                             VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME,
+                                             VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
+                                             VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,
+                                             VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
+                                             VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME,
+                                             "VK_NV_cuda_kernel_launch"};
+    if (!std::ranges::all_of(required_extensions, [&](const char* name) {
+            return supported_extensions.contains(name);
+        })) {
+        return unavailable("the selected GPU or driver lacks required neural rendering extensions");
+    }
+    // The renderer already owns these core feature structures. Require their enabled bits instead
+    // of adding duplicate Vulkan 1.1/1.2/1.3 structures to its device-creation chain.
+    const bool core =
+        features2.features.shaderInt16 && features2.features.shaderInt64 &&
+        features.bit16_storage.storageBuffer16BitAccess &&
+        features.bit16_storage.uniformAndStorageBuffer16BitAccess &&
+        features.bit8_storage.storageBuffer8BitAccess &&
+        features.bit8_storage.uniformAndStorageBuffer8BitAccess &&
+        features.shader_float16_int8.shaderFloat16 && features.shader_float16_int8.shaderInt8 &&
+        features.vulkan_memory_model.vulkanMemoryModel &&
+        features.vulkan_memory_model.vulkanMemoryModelDeviceScope &&
+        features.buffer_device_address.bufferDeviceAddress &&
+        features.host_query_reset.hostQueryReset &&
+        features.subgroup_size_control.subgroupSizeControl &&
+        features.subgroup_size_control.computeFullSubgroups && features.maintenance4.maintenance4 &&
+        features.synchronization2.synchronization2 && features.cooperative_matrix.cooperativeMatrix;
+    if (!core) {
+        return unavailable("required neural rendering Vulkan features are unavailable");
+    }
+    nr_cooperative_matrix.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV;
+    nr_float8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+    nr_clock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+    nr_sm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_FEATURES_NV;
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 probe{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    probe.pNext = &nr_cooperative_matrix;
+    nr_cooperative_matrix.pNext = &nr_float8;
+    nr_float8.pNext = &nr_clock;
+    nr_clock.pNext = &nr_sm;
+    nr_sm.pNext = &executable;
+    physical.GetFeatures2(probe);
+    const bool extra = nr_float8.shaderFloat8 && nr_float8.shaderFloat8CooperativeMatrix &&
+                       nr_cooperative_matrix.cooperativeMatrixWorkgroupScope &&
+                       nr_cooperative_matrix.cooperativeMatrixFlexibleDimensions &&
+                       nr_cooperative_matrix.cooperativeMatrixReductions &&
+                       nr_cooperative_matrix.cooperativeMatrixConversions &&
+                       nr_cooperative_matrix.cooperativeMatrixPerElementOperations &&
+                       nr_cooperative_matrix.cooperativeMatrixTensorAddressing &&
+                       nr_cooperative_matrix.cooperativeMatrixBlockLoads &&
+                       nr_clock.shaderSubgroupClock && nr_clock.shaderDeviceClock &&
+                       nr_sm.shaderSMBuiltins && executable.pipelineExecutableInfo;
+    if (!extra) {
+        nr_sm.pNext = nullptr;
+        return unavailable("the GPU cannot execute the FP8 neural rendering kernels");
+    }
+    // Only now modify the renderer's enabled feature chain; failed probes leave it unchanged.
+    nr_sm.pNext = features2.pNext;
+    features2.pNext = &nr_cooperative_matrix;
+    features.pipeline_executable_properties.pipelineExecutableInfo = VK_TRUE;
+    loaded_extensions.insert(required_extensions.begin(), required_extensions.end());
+    LOG_INFO(Render_Vulkan, "Native FP8 neural rendering device features enabled");
+    return true;
+#else
+    return false;
+#endif
+}
+
 Device::~Device() {
+#ifdef EGLANTINE_NGX
+    if (nvidia_dlss_attached) {
+        VideoCore::NeuralRendering::ResetStatus();
+    }
+#endif
 #ifdef EGLANTINE_NVIDIA_DLSS
     if (nvidia_dlss_attached) {
         NvidiaDlss::Stop();

@@ -7,12 +7,17 @@
 
 #include <array>
 #include <atomic>
+#include <memory>
 
 #include "common/common_types.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 struct NVSDK_NGX_Handle;
 struct NVSDK_NGX_Parameter;
+
+namespace VideoCore::NeuralRendering {
+class Backend;
+}
 
 namespace Vulkan {
 
@@ -70,6 +75,13 @@ class NvidiaDlssUpscaler {
     Scheduler &scheduler;
     MemoryAllocator &memory_allocator;
 #ifdef EGLANTINE_NGX
+    void PrepareNeuralRendering(const Inputs& inputs);
+    std::unique_ptr<VideoCore::NeuralRendering::Backend> neural_rendering;
+    VkImageView neural_motion_view{};
+    u32 neural_style{};
+    bool neural_requested{};
+    bool neural_failed{};
+    bool neural_model_verified{};
     NVSDK_NGX_Handle *feature{};
     NVSDK_NGX_Parameter *parameters{};
     bool depth_inverted = true;

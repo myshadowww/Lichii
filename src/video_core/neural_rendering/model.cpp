@@ -308,6 +308,9 @@ void ImportModel(const std::filesystem::path& dll, const std::filesystem::path& 
     if (packed.size() != PackedBytes || Digest(packed) != PackedSha256) {
         Invalid("packed model checksum mismatch");
     }
+    if (IsInstalled(destination)) {
+        return;
+    }
     std::string hash{PackedSha256};
     std::ranges::transform(hash, hash.begin(),
                            [](char c) { return c >= 'a' && c <= 'f' ? c - 'a' + 'A' : c; });

@@ -11,6 +11,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMessageBox>
@@ -23,13 +24,17 @@
 #include <QSaveFile>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QtConcurrent/QtConcurrentRun>
 #include "common/dynamic_library.h"
 #include "common/fs/fs_util.h"
+#include "video_core/neural_rendering/model.h"
+#include "video_core/neural_rendering/runtime.h"
 #include "video_core/vulkan_common/ngx_dlss.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 
 namespace {
 namespace Ngx = Vulkan::Ngx;
+namespace NR = VideoCore::NeuralRendering;
 constexpr qint64 MaxModelBytes = 70 * 1024 * 1024;
 
 QString Tr(const char *text) { return QCoreApplication::translate("NvidiaDlssPanel", text); }
@@ -78,6 +83,25 @@ NvidiaDlssPanel::NvidiaDlssPanel(QWidget *parent) : QWidget(parent) {
     buttons->addWidget(folder_button);
     buttons->addStretch();
     layout->addLayout(buttons);
+    neural_status_label = new QLabel(this);
+    neural_status_label->setWordWrap(true);
+    layout->addWidget(neural_status_label);
+    auto* neural_buttons = new QHBoxLayout;
+    neural_import_button = new QPushButton(Tr("Import neural rendering model…"), this);
+    neural_buttons->addWidget(neural_import_button);
+    neural_buttons->addStretch();
+    layout->addLayout(neural_buttons);
+    connect(neural_import_button, &QPushButton::clicked, this, &NvidiaDlssPanel::ImportNeuralModel);
+    // Model validation reads 141 MiB. Cache it for this panel and keep it off the UI thread.
+    auto* model_check = new QFutureWatcher<bool>(this);
+    connect(model_check, &QFutureWatcher<bool>::finished, this, [this, model_check] {
+        neural_model_valid = model_check->result();
+        neural_model_checked = true;
+        model_check->deleteLater();
+        Refresh();
+    });
+    model_check->setFuture(
+        QtConcurrent::run([path = NR::UserFolder()] { return NR::IsInstalled(path); }));
     connect(download_button, &QPushButton::clicked, this, &NvidiaDlssPanel::Download);
     connect(import_button, &QPushButton::clicked, this, &NvidiaDlssPanel::Import);
     connect(folder_button, &QPushButton::clicked, this, [] {
@@ -123,6 +147,68 @@ void NvidiaDlssPanel::Refresh() {
     status_label->setToolTip(PathText(model.empty() ? Ngx::UserFolder() : model));
     icon_label->setText(state.available ? QStringLiteral("✓") : QStringLiteral("ⓘ"));
     download_button->setVisible(model.empty());
+    const auto neural = NR::GetStatus();
+    QString neural_text;
+    if (neural_importing) {
+        neural_text = Tr("Importing the neural rendering model…");
+    } else if (!neural_model_checked) {
+        neural_text = Tr("Checking the neural rendering model…");
+    } else if (!neural_model_valid) {
+        neural_text = Tr(
+            "Import a DLSS neural rendering 310.8.0 model to use Standard, Natural or Cinematic.");
+    } else if (!neural.error.empty()) {
+        neural_text = Tr("Neural rendering: %1. Restart the game after resolving this.")
+                          .arg(QString::fromStdString(neural.error));
+    } else if (neural.ready) {
+        neural_text = Tr("Native neural rendering active — %1 frames submitted.")
+                          .arg(neural.submitted_frames);
+    } else {
+        neural_text =
+            Tr("Neural rendering model installed. Choose a style below and restart the game.");
+    }
+    neural_status_label->setText(neural_text);
+    neural_status_label->setToolTip(PathText(NR::UserFolder()));
+    neural_import_button->setEnabled(neural_model_checked && !neural_importing);
+}
+
+void NvidiaDlssPanel::ImportNeuralModel() {
+    const auto path =
+        QFileDialog::getOpenFileName(this, Tr("Import NVIDIA neural rendering model"), {},
+                                     Tr("Neural rendering model (nvngx_dlssnr.dll)"));
+    if (path.isEmpty())
+        return;
+    neural_importing = true;
+    Refresh();
+    auto* progress =
+        new QProgressDialog(Tr("Importing the neural rendering model…"), {}, 0, 0, this);
+    progress->setCancelButton(nullptr);
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+    progress->show();
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, progress] {
+        progress->close();
+        progress->deleteLater();
+        const auto error = watcher->result();
+        watcher->deleteLater();
+        neural_importing = false;
+        if (error.isEmpty()) {
+            neural_model_valid = true;
+            neural_model_checked = true;
+        } else {
+            QMessageBox::warning(this, Tr("Neural rendering model"), error);
+        }
+        Refresh();
+    });
+    watcher->setFuture(QtConcurrent::run([source = std::filesystem::path{path.toStdString()},
+                                          destination = NR::UserFolder()]() -> QString {
+        try {
+            NR::ImportModel(source, destination);
+            return {};
+        } catch (const std::exception& error) {
+            return QString::fromUtf8(error.what());
+        }
+    }));
 }
 
 void NvidiaDlssPanel::Import() {

@@ -234,6 +234,11 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             continue;
         }
 #endif
+#ifndef EGLANTINE_NGX
+        if (setting->Id() == Settings::values.neural_rendering.Id()) {
+            continue;
+        }
+#endif
 
         ConfigurationShared::Widget* widget = [&]() {
             if (setting->Id() == Settings::values.fsr_sharpening_slider.Id()) {

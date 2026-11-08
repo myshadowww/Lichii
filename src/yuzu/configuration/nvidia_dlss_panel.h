@@ -26,7 +26,13 @@ private:
     void Download();
 #ifdef EGLANTINE_NGX
     void Import();
+    void ImportNeuralModel();
     QPushButton* import_button{};
+    QPushButton* neural_import_button{};
+    QLabel* neural_status_label{};
+    bool neural_model_checked{};
+    bool neural_model_valid{};
+    bool neural_importing{};
 #endif
 
     QLabel* icon_label;

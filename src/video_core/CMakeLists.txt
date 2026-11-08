@@ -578,6 +578,8 @@ elseif (ENABLE_NVIDIA_DLSS)
                      ${PROJECT_BINARY_DIR}/externals/opendlss-nr)
     target_link_libraries(video_core PRIVATE lichii_nr_kernels)
     target_sources(video_core PRIVATE
+        neural_rendering/runtime.cpp
+        neural_rendering/runtime.h
         renderer_vulkan/vk_ngx_dlss.cpp
         vulkan_common/ngx_dlss.cpp
         vulkan_common/ngx_dlss.h

@@ -39,6 +39,10 @@ public:
     // queue submission, descriptor update or CPU image copy occurs here. Overwrites color last.
     void Record(VkCommandBuffer commands, const Frame& frame);
 
+    // Rebind same-sized renderer images after finishing their queue. Keeps the model, pipelines
+    // and temporal history resident; recorded commands are rebuilt because descriptors changed.
+    void Rebind(VkImage color, VkImageView color_view, VkImageView motion_view);
+
     // Only call after the submitted frame has completed on the GPU.
     [[nodiscard]] bool HadTimeout() const;
 

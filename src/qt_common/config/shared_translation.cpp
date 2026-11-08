@@ -174,6 +174,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Native (DLAA) applies anti-aliasing at the game's render resolution. "
               "In Ocarina's 1440p mode, this keeps the scene and output at 1440p instead of "
               "upscaling to 4K.\nRequires NVIDIA DLSS to be enabled. Takes effect when a game starts."));
+    INSERT(Settings, neural_rendering, tr("DLSS neural rendering:"),
+           tr("Re-renders the scene after NVIDIA DLSS using the Standard, Natural or Cinematic "
+              "style.\n"
+              "Requires a supported NVIDIA GPU and an imported neural rendering model. "
+              "Runs natively on Linux.\nRequires NVIDIA DLSS to be enabled. Takes effect when a "
+              "game starts."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
               "can produce a more stable picture in lower resolutions."));
@@ -582,6 +588,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (upscaling)")),
                               PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::NeuralRendering>::Index(),
+                          {
+                              PAIR(NeuralRendering, Off, tr("Off")),
+                              PAIR(NeuralRendering, Standard, tr("Standard")),
+                              PAIR(NeuralRendering, Natural, tr("Natural")),
+                              PAIR(NeuralRendering, Cinematic, tr("Cinematic")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

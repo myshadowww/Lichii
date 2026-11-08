@@ -6,6 +6,10 @@
 #include <string_view>
 #include <fmt/format.h>
 #include "common/logging.h"
+#include "common/settings.h"
+#include "video_core/neural_rendering/backend.h"
+#include "video_core/neural_rendering/model.h"
+#include "video_core/neural_rendering/runtime.h"
 #include "video_core/renderer_vulkan/vk_nvidia_dlss.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/ngx_api.h"
@@ -14,6 +18,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
+namespace NR = VideoCore::NeuralRendering;
 namespace {
 
 int EnvInt(const char *name, int fallback) {
@@ -80,11 +85,17 @@ NvidiaDlssUpscaler::NvidiaDlssUpscaler(const Device &device_, Scheduler &schedul
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
     }
     CreateSampler();
+    const auto mode = Settings::values.neural_rendering.GetValue();
+    neural_requested = device.SupportsNeuralRendering() && mode != Settings::NeuralRendering::Off;
+    if (neural_requested) {
+        neural_style = static_cast<u32>(mode) - 1;
+    }
 }
 
 NvidiaDlssUpscaler::~NvidiaDlssUpscaler() {
     // Renderer shutdown has already stopped recording; do not submit to released game channels.
     void(device.GetLogical().WaitIdle());
+    neural_rendering.reset();
     const auto &api = Ngx::GetApi();
     if (feature)
         api.release(feature);
@@ -110,12 +121,17 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
         }
     }
     if (extent_changed) {
+        if (neural_rendering) {
+            scheduler.Finish();
+            neural_rendering.reset();
+        }
         CreateOutput(in.upscale_size);
         render_extent = in.render_size;
         upscale_extent = in.upscale_size;
     }
     hdr_input = in.hdr;
     depth_inverted = in.depth_inverted;
+    PrepareNeuralRendering(in);
     const bool hdr = in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
     const bool auto_exposure = in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0;
     const auto mode = ModeFor(in.render_size, in.upscale_size);
@@ -251,10 +267,57 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
             fail("evaluation", result);
         } else {
             Ngx::ReportEvaluation();
+            if (neural_rendering) {
+                NR::Frame frame;
+                frame.style = static_cast<NR::Style>(neural_style);
+                frame.reset = reset;
+                frame.hdr = in.hdr;
+                frame.motion_scale = {in.motion_vector_scale[0] / in.render_size.width,
+                                      in.motion_vector_scale[1] / in.render_size.height};
+                neural_rendering->Record(*cmdbuf, frame);
+                NR::ReportFrame();
+            }
         }
     });
     scheduler.InvalidateState();
     return true;
+}
+
+void NvidiaDlssUpscaler::PrepareNeuralRendering(const Inputs& in) {
+    if (!neural_requested || neural_failed ||
+        (neural_rendering && neural_motion_view == in.motion_vectors.view)) {
+        return;
+    }
+    // The backend uploads model constants during construction. Finish before touching its queue
+    // or replacing descriptors referenced by work already recorded on the scheduler worker.
+    scheduler.Finish();
+    try {
+        if (neural_rendering) {
+            if (neural_rendering->HadTimeout()) {
+                throw std::runtime_error("a neural rendering kernel timed out");
+            }
+            neural_rendering->Rebind(*output_image, *output_view, in.motion_vectors.view);
+        } else {
+            const auto model = NR::UserFolder();
+            if (!neural_model_verified && !NR::IsInstalled(model)) {
+                throw std::runtime_error(
+                    "import the supported neural rendering model in Graphics settings");
+            }
+            neural_model_verified = true;
+            neural_rendering = std::make_unique<NR::Backend>(
+                device.GetInstance(), device.GetPhysical(), *device.GetLogical(),
+                device.GetGraphicsFamily(), model, in.upscale_size, *output_image, *output_view,
+                in.motion_vectors.view);
+            LOG_INFO(Render_Vulkan, "Native FP8 neural rendering ready: {}x{}, style {}",
+                     in.upscale_size.width, in.upscale_size.height, neural_style);
+            NR::ReportReady();
+        }
+        neural_motion_view = in.motion_vectors.view;
+    } catch (const std::exception& error) {
+        neural_rendering.reset();
+        neural_failed = true;
+        NR::ReportFailure(error.what());
+    }
 }
 
 } // namespace Vulkan

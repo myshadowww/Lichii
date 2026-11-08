@@ -251,6 +251,11 @@ struct Backend::Impl {
         command_allocate.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
         command_allocate.commandBufferCount = 2;
         VK_CHECK(vkAllocateCommandBuffers(device, &command_allocate, compute_commands));
+        RecordCommands();
+    }
+
+    void RecordCommands() {
+        VK_CHECK(vkResetCommandPool(device, command_pool, 0));
         for (uint32_t h = 0; h < 2; ++h) {
             context->resetDescriptorPool(h);
             VkCommandBufferInheritanceInfo inheritance{
@@ -295,6 +300,30 @@ Backend::Backend(VkInstance instance, VkPhysicalDevice physical, VkDevice device
 }
 
 Backend::~Backend() = default;
+
+void Backend::Rebind(VkImage color, VkImageView color_view, VkImageView motion_view) {
+    auto& state = *impl;
+    state.color = color;
+    state.color_view = color_view;
+    state.motion_view = motion_view;
+    const VkDescriptorImageInfo images[] = {{state.nearest, color_view, VK_IMAGE_LAYOUT_GENERAL},
+                                            {state.nearest, motion_view, VK_IMAGE_LAYOUT_GENERAL}};
+    for (auto& parity : state.sets) {
+        for (auto set : parity) {
+            VkWriteDescriptorSet writes[2]{};
+            for (uint32_t i = 0; i < 2; ++i) {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = set;
+                writes[i].dstBinding = i * 2;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                writes[i].pImageInfo = &images[i];
+            }
+            vkUpdateDescriptorSets(state.device, 2, writes, 0, nullptr);
+        }
+    }
+    state.RecordCommands();
+}
 
 void Backend::Record(VkCommandBuffer commands, const Frame& frame) {
     auto& state = *impl;
