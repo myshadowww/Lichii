@@ -69,13 +69,16 @@ cmake --build build --target ngx_smoke
 build/bin/ngx_smoke /path/to/directory/containing/the/model 0
 ```
 
-The last argument selects the Vulkan GPU index. This does not boot the emulator. It uses
+The argument after the runtime folder selects the Vulkan GPU index. This does not boot the emulator. It uses
 Lichii's Vulkan device, memory allocator, scheduler, and upscaler; checks missing/disabled
 runtime behavior; reads back SR/DLAA output; tests continuous frames, history reset,
 resolution and HDR/depth-mode changes; injects an evaluation failure to check output clearing
 and fallback; and repeats device startup/shutdown. It writes isolated logs/cache under a temporary directory.
 It is deliberately excluded from `ctest`, since it requires NVIDIA hardware and the
 separately obtained model. Disable external graphics layers when testing this backend.
+
+An optional third argument scales the test images. Use `8` to exercise Ocarina's
+2560×1440 input and 3840×2160 output sizes; the default `1` uses small images.
 
 A passing synthetic test does not establish temporal quality in a game. Release validation
 also needs Ocarina gameplay, camera motion, scene/HUD composition, game switching, and

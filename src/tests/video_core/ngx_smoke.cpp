@@ -44,13 +44,13 @@ struct InputImage {
 };
 
 InputImage MakeInput(const Device &device, MemoryAllocator &allocator, VkFormat format,
-                     VkImageAspectFlags aspect) {
+                     VkImageAspectFlags aspect, VkExtent2D extent) {
     InputImage result;
     result.image = allocator.CreateImage({
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,
         .format = format,
-        .extent = {320, 180, 1},
+        .extent = {extent.width, extent.height, 1},
         .mipLevels = 1,
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -71,15 +71,18 @@ InputImage MakeInput(const Device &device, MemoryAllocator &allocator, VkFormat 
     return result;
 }
 
-void RenderCases(const Device &device) {
+void RenderCases(const Device &device, u32 scale) {
     MemoryAllocator allocator{device};
     StateTracker tracker;
     Scheduler scheduler{device, tracker};
     NvidiaDlssUpscaler upscaler{device, scheduler, allocator};
-    auto color =
-        MakeInput(device, allocator, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT);
-    auto depth = MakeInput(device, allocator, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT);
-    auto motion = MakeInput(device, allocator, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT);
+    const VkExtent2D input_extent{320 * scale, 180 * scale};
+    auto color = MakeInput(device, allocator, VK_FORMAT_R16G16B16A16_SFLOAT,
+                           VK_IMAGE_ASPECT_COLOR_BIT, input_extent);
+    auto depth = MakeInput(device, allocator, VK_FORMAT_D32_SFLOAT,
+                           VK_IMAGE_ASPECT_DEPTH_BIT, input_extent);
+    auto motion = MakeInput(device, allocator, VK_FORMAT_R16G16_SFLOAT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, input_extent);
     auto &api = const_cast<Ngx::Api &>(Ngx::GetApi());
     const auto evaluate = api.evaluate;
     SCOPE_EXIT { api.evaluate = evaluate; };
@@ -87,7 +90,7 @@ void RenderCases(const Device &device) {
                                  VkExtent2D{320, 180}, VkExtent2D{480, 270}, VkExtent2D{480, 270},
                                  VkExtent2D{480, 270}};
     for (size_t frame = 0; frame < outputs.size(); ++frame) {
-        const auto extent = outputs[frame];
+        const VkExtent2D extent{outputs[frame].width * scale, outputs[frame].height * scale};
         const bool inject_failure = frame == outputs.size() - 1;
         if (inject_failure) {
             api.evaluate = [](VkCommandBuffer, const NVSDK_NGX_Handle *,
@@ -129,7 +132,7 @@ void RenderCases(const Device &device) {
         Require(upscaler.Upscale({color.resource,
                                   depth.resource,
                                   motion.resource,
-                                  {320, 180},
+                                  input_extent,
                                   extent,
                                   {0, 0},
                                   {1, 1},
@@ -183,8 +186,9 @@ void RenderCases(const Device &device) {
             Require(std::abs(sums[c] / pixels - (inject_failure ? 0.0f : expected[c])) < 0.025,
                     "Readback differs from input; stale or incorrect output");
         }
-        std::printf("PASS frame %zu: 320x180 -> %ux%u; RGB %.4f %.4f %.4f\n", frame, extent.width,
-                    extent.height, sums[0] / pixels, sums[1] / pixels, sums[2] / pixels);
+        std::printf("PASS frame %zu: %ux%u -> %ux%u; RGB %.4f %.4f %.4f\n", frame,
+                    input_extent.width, input_extent.height, extent.width, extent.height,
+                    sums[0] / pixels, sums[1] / pixels, sums[2] / pixels);
     }
     Require(Ngx::GetStatus().evaluations == outputs.size() - 1, "Incorrect evaluation count");
 }
@@ -194,7 +198,7 @@ int main(int argc, char **argv) try {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
         std::fprintf(stderr,
-                     "Usage: ngx_smoke <directory containing Linux DLSS model> [GPU index]\n");
+                     "Usage: ngx_smoke <directory containing Linux DLSS model> [GPU index] [scale 1-8]\n");
         return 2;
     }
     const auto scratch =
@@ -213,6 +217,8 @@ int main(int argc, char **argv) try {
     Require(!NvidiaDlss::Start() && !Ngx::GetStatus().error.empty(), "Missing model not diagnosed");
     setenv("LICHII_NGX_DIR", std::filesystem::absolute(argv[1]).c_str(), 1);
     const size_t gpu = argc > 2 ? std::stoul(argv[2]) : 0;
+    const auto scale = argc > 3 ? std::stoul(argv[3]) : 1;
+    Require(scale >= 1 && scale <= 8, "Scale must be between 1 and 8 (4K output)");
     for (int run = 0; run < 2; ++run) {
         Require(NvidiaDlss::Start(), "NGX startup failed");
         {
@@ -231,7 +237,7 @@ int main(int argc, char **argv) try {
                                               duplicate_dispatch),
                     "NGX accepted a second device attachment");
             Require(NvidiaDlss::IsAvailable(), "Duplicate attachment disturbed the active device");
-            RenderCases(device);
+            RenderCases(device, static_cast<u32>(scale));
         }
         Require(!NvidiaDlss::IsAvailable(), "Device teardown left NGX active");
         std::printf("PASS device lifecycle %d\n", run + 1);
