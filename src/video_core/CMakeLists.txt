@@ -14,6 +14,8 @@ if(LIBVA_FOUND)
 endif()
 
 add_library(video_core STATIC
+    neural_rendering/model.cpp
+    neural_rendering/model.h
     buffer_cache/buffer_base.h
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
@@ -458,6 +460,7 @@ if (ENABLE_OPENGL)
 endif()
 
 target_link_libraries(video_core PUBLIC common core)
+target_link_libraries(video_core PRIVATE OpenSSL::Crypto)
 if(WIN32)
     target_link_libraries(video_core PRIVATE advapi32)
 endif()
@@ -571,6 +574,9 @@ if (ENABLE_NVIDIA_DLSS AND MSVC)
     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
 elseif (ENABLE_NVIDIA_DLSS)
     include(NvidiaNGX)
+    add_subdirectory(${PROJECT_SOURCE_DIR}/externals/opendlss-nr
+                     ${PROJECT_BINARY_DIR}/externals/opendlss-nr)
+    target_link_libraries(video_core PRIVATE lichii_nr_kernels)
     target_sources(video_core PRIVATE
         renderer_vulkan/vk_ngx_dlss.cpp
         vulkan_common/ngx_dlss.cpp
