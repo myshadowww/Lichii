@@ -21,6 +21,21 @@ failures appear in the panel and log. Existing game-specific fallback behavior a
 The runtime is downloaded separately; Lichii packages do not contain NVIDIA's model,
 DLSS5VKLayer, or OptiScaler. No layer installation or Wine process is required.
 
+## Quality
+
+The **NVIDIA DLSS quality** setting applies globally or per game and takes effect on
+the next game start:
+
+- **Automatic (upscaling)** preserves the existing supported upscaling path. In
+  Ocarina's 1440p mode, it reconstructs the scene at 3840×2160.
+- **Native (DLAA)** applies DLSS anti-aliasing at the game's render resolution. In
+  Ocarina's 1440p mode, both the DLAA input and output remain 2560×1440. Window scaling
+  still determines how that image fits the display; selecting Native does not make
+  the game render at the display's resolution.
+
+Natural and Cinematic are controls for the separate DLSS 5 neural-rendering model.
+They are not SR/DLAA quality presets and are not available in this backend.
+
 ## Supported behavior
 
 Linux shares Windows' recognized-pass selection, color/depth/motion inputs, jitter,

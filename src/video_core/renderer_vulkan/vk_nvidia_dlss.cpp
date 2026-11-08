@@ -16,7 +16,7 @@ constexpr VkImageUsageFlags OUTPUT_USAGE = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE
 } // namespace
 
 void NvidiaDlssUpscaler::CreateSampler() {
-    point_sampler = device.GetLogical().CreateSampler(VkSamplerCreateInfo{
+    VkSamplerCreateInfo info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
@@ -35,7 +35,11 @@ void NvidiaDlssUpscaler::CreateSampler() {
         .maxLod = VK_LOD_CLAMP_NONE,
         .borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
         .unnormalizedCoordinates = VK_FALSE,
-    });
+    };
+    point_sampler = device.GetLogical().CreateSampler(info);
+    info.magFilter = VK_FILTER_LINEAR;
+    info.minFilter = VK_FILTER_LINEAR;
+    linear_sampler = device.GetLogical().CreateSampler(info);
 }
 
 void NvidiaDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {

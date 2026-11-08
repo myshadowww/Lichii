@@ -60,6 +60,7 @@ class NvidiaDlssUpscaler {
     [[nodiscard]] VkImageView OutputView() const noexcept { return *output_view; }
     /// Nearest-neighbour clamp sampler (normalized coordinates), for reading the output.
     [[nodiscard]] VkSampler PointSampler() const noexcept { return *point_sampler; }
+    [[nodiscard]] VkSampler LinearSampler() const noexcept { return *linear_sampler; }
 
   private:
     void CreateSampler();
@@ -82,6 +83,7 @@ class NvidiaDlssUpscaler {
     vk::Image output_image;
     vk::ImageView output_view;
     vk::Sampler point_sampler;
+    vk::Sampler linear_sampler;
     std::atomic<bool> failed{};
 };
 
