@@ -398,7 +398,7 @@ struct Values {
                                                            Specialization::Percentage,
                                                        true,
                                                        true};
-    // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
+    // NVIDIA DLSS through the platform runtime, in place of a game's DLSS.
     SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,

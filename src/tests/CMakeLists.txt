@@ -187,6 +187,12 @@ endif()
 
 add_test(NAME tests COMMAND tests)
 
+if (ENABLE_NVIDIA_DLSS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ngx_smoke EXCLUDE_FROM_ALL video_core/ngx_smoke.cpp)
+    target_link_libraries(ngx_smoke PRIVATE video_core core common frontend_common ${PLATFORM_LIBRARIES})
+    target_include_directories(ngx_smoke PRIVATE $<TARGET_PROPERTY:video_core,INCLUDE_DIRECTORIES>)
+endif()
+
 if (TARGET SDL3::SDL3)
     add_executable(sdl_window_state_tests yuzu_cmd/sdl_window_state.cpp)
     target_link_libraries(sdl_window_state_tests PRIVATE SDL3::SDL3 Catch2::Catch2WithMain)

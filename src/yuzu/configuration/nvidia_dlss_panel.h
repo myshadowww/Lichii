@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Shown under the NVIDIA DLSS setting: which of NVIDIA's files were found, and
-// a button that fetches missing ones from NVIDIA's own Streamline release.
+// controls to obtain the platform runtime from NVIDIA's official repository.
 
 #pragma once
 
-#ifdef EGLANTINE_STREAMLINE
+#ifdef EGLANTINE_NVIDIA_DLSS
 
 #include <QWidget>
 
@@ -24,6 +24,10 @@ protected:
 
 private:
     void Download();
+#ifdef EGLANTINE_NGX
+    void Import();
+    QPushButton* import_button{};
+#endif
 
     QLabel* icon_label;
     QLabel* status_label;

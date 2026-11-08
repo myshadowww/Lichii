@@ -537,14 +537,21 @@ if (ANDROID AND ARCHITECTURE_arm64)
     target_link_libraries(video_core PRIVATE adrenotools)
 endif()
 
-# NVIDIA DLSS through NVIDIA Streamline, in place of a game's DLSS (before FSR 3.1) when the
-# setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
-# linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
-cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
-                       "MSVC AND ARCHITECTURE_x86_64" OFF)
+# NVIDIA DLSS replaces supported game passes before FSR 3.1 when enabled. Windows uses
+# Streamline; Linux uses the driver's native NGX core. Only interface headers are compiled in.
+# Proprietary runtime/model libraries are obtained separately by the user.
+cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS replacement" ON
+                       "ARCHITECTURE_x86_64;MSVC OR CMAKE_SYSTEM_NAME STREQUAL Linux" OFF)
 set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
     "NVIDIA Streamline SDK directory for its headers (empty: download them)")
 if (ENABLE_NVIDIA_DLSS)
+    target_sources(video_core PRIVATE
+        renderer_vulkan/vk_nvidia_dlss.cpp
+        renderer_vulkan/vk_nvidia_dlss.h
+        vulkan_common/nvidia_dlss.h)
+    target_compile_definitions(video_core PUBLIC EGLANTINE_NVIDIA_DLSS)
+endif()
+if (ENABLE_NVIDIA_DLSS AND MSVC)
     if (EGLANTINE_STREAMLINE_SDK)
         set(STREAMLINE_INCLUDE_DIR "${EGLANTINE_STREAMLINE_SDK}/include")
     else()
@@ -553,7 +560,7 @@ if (ENABLE_NVIDIA_DLSS)
     endif()
     target_sources(video_core PRIVATE
         renderer_vulkan/vk_streamline_dlss.cpp
-        renderer_vulkan/vk_streamline_dlss.h
+        vulkan_common/nvidia_dlss.cpp
         vulkan_common/streamline.cpp
         vulkan_common/streamline.h
         vulkan_common/streamline_api.h
@@ -562,6 +569,16 @@ if (ENABLE_NVIDIA_DLSS)
     target_link_libraries(video_core PRIVATE version wintrust crypt32)
     target_compile_definitions(video_core PUBLIC EGLANTINE_STREAMLINE)
     message(STATUS "NVIDIA DLSS through Streamline: ${STREAMLINE_INCLUDE_DIR}")
+elseif (ENABLE_NVIDIA_DLSS)
+    include(NvidiaNGX)
+    target_sources(video_core PRIVATE
+        renderer_vulkan/vk_ngx_dlss.cpp
+        vulkan_common/ngx_dlss.cpp
+        vulkan_common/ngx_dlss.h
+        vulkan_common/ngx_api.h)
+    target_include_directories(video_core SYSTEM PRIVATE "${NGX_INCLUDE_DIR}")
+    target_compile_definitions(video_core PUBLIC EGLANTINE_NGX)
+    message(STATUS "NVIDIA DLSS through native Linux NGX: ${NGX_INCLUDE_DIR}")
 endif()
 
 create_target_directory_groups(video_core)
