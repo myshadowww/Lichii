@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [nx2]
   push:
-    branches: [nx2]
+    branches: [nx2, "ci/native-dlss-*"]
   workflow_dispatch:
 
 permissions:
