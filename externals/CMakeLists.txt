@@ -40,7 +40,7 @@ if (NOT TARGET enet::enet)
     add_library(enet::enet ALIAS enet)
 endif()
 
-# nxformat reader, header-only (see nxformat/README.md)
+# nxformat reader, header-only
 add_library(nxformat_reader INTERFACE)
 target_include_directories(nxformat_reader SYSTEM INTERFACE ./nxformat)
 target_compile_features(nxformat_reader INTERFACE cxx_std_17)
@@ -54,6 +54,12 @@ if (NOT TARGET stb::headers)
 endif()
 
 AddJsonPackage(NAME zbic DOWNLOAD_ONLY)
+
+# xxHash (header only)
+AddJsonPackage(NAME xxhash DOWNLOAD_ONLY)
+add_library(xxhash INTERFACE)
+target_include_directories(xxhash INTERFACE "${xxhash_SOURCE_DIR}")
+
 set(ZBIC_INCLUDE_DIR
     "${zbic_SOURCE_DIR}/src"
     PARENT_SCOPE)

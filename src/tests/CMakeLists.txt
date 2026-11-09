@@ -78,7 +78,6 @@ add_executable(tests
     video_core/ampere_trap_guards.cpp
     video_core/async_draw_policy.cpp
     video_core/async_shader_emission.cpp
-    video_core/pipeline_build.cpp
     video_core/oot_network.cpp
     video_core/page_filter.cpp
     video_core/pipeline_optimization.cpp
@@ -92,6 +91,7 @@ add_executable(tests
     video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
+    video_core/nx2_written_pages.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
@@ -115,6 +115,10 @@ add_executable(tests
     video_core/pipeline_cache_files.cpp
     video_core/canonical_native_key.cpp
     video_core/native_preparation.cpp
+    video_core/shader_cache_v2.cpp
+    video_core/shader_cache_v2_programs.cpp
+    video_core/shader_cache_v2_driver.cpp
+    video_core/vulkan_pipeline_binaries.cpp
     video_core/shader_precache.cpp
     video_core/shader_object_pool.cpp
     video_core/storage_binding_capacity.cpp
@@ -131,6 +135,8 @@ add_executable(tests
     video_core/spirv_min_max_denorms.cpp
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
+    video_core/ocarina_upscale.cpp
+    video_core/fsr4_support.cpp
     common/bit_field.cpp
     common/bit_util.cpp
     common/cityhash.cpp
@@ -186,6 +192,7 @@ add_executable(tests
     video_core/ampere_uniform_immediate_shift.cpp
     video_core/ampere_bindless_surfaces.cpp
     video_core/native_macro_fifo.cpp
+    video_core/turing_macro_effects.cpp
     video_core/turing_macro_ram.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/usage_tracker.cpp
@@ -243,6 +250,56 @@ add_executable(update_checker_tests
     ../frontend_common/update_installer.cpp)
 target_link_libraries(update_checker_tests PRIVATE common Catch2::Catch2WithMain)
 add_test(NAME update_checker_tests COMMAND update_checker_tests)
+
+# A libFuzzer target for the shader cache v2 reader, where the compiler has libFuzzer. Built on
+# request: ninja shader_cache_v2_fuzzer, then shader_cache_v2_fuzzer <corpus directory>
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS -fsanitize=fuzzer)
+check_cxx_source_compiles("
+    #include <cstddef>
+    #include <cstdint>
+    extern \"C\" int LLVMFuzzerTestOneInput(const std::uint8_t*, std::size_t) { return 0; }"
+    HAVE_LIBFUZZER)
+unset(CMAKE_REQUIRED_FLAGS)
+if (HAVE_LIBFUZZER)
+    add_executable(shader_cache_v2_fuzzer EXCLUDE_FROM_ALL
+        fuzz/shader_cache_v2_reader.cpp
+        ../video_core/shader_cache_v2/cache_format.cpp)
+    target_compile_options(shader_cache_v2_fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_options(shader_cache_v2_fuzzer PRIVATE -fsanitize=fuzzer,address,undefined)
+    target_link_libraries(shader_cache_v2_fuzzer PRIVATE common xxhash)
+    if (BOOST_NO_HEADERS)
+        target_link_libraries(shader_cache_v2_fuzzer PRIVATE Boost::crc)
+    endif()
+endif()
+
+# The shader job scheduler on its own, so it can be built with a sanitizer: configure with
+# -DSHADER_JOBS_SANITIZER=thread (or address,undefined), then build and run shader_jobs_tests.
+set(SHADER_JOBS_SANITIZER "" CACHE STRING "Build shader_jobs_tests with -fsanitize=<value>")
+add_executable(shader_jobs_tests
+    video_core/shader_jobs.cpp
+    ../video_core/shader_jobs.cpp)
+target_link_libraries(shader_jobs_tests PRIVATE common Catch2::Catch2WithMain Threads::Threads)
+if (SHADER_JOBS_SANITIZER)
+    target_compile_options(shader_jobs_tests PRIVATE -fsanitize=${SHADER_JOBS_SANITIZER}
+        -fno-omit-frame-pointer -fno-sanitize-recover=all -g)
+    target_link_options(shader_jobs_tests PRIVATE -fsanitize=${SHADER_JOBS_SANITIZER})
+endif()
+add_test(NAME shader_jobs_tests COMMAND shader_jobs_tests)
+
+# Stage translation on shader job workers over the tools/shader-sweep fixtures. For
+# ThreadSanitizer the shader recompiler needs instrumenting too: configure a separate build with
+# -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread, then build and run
+# shader_translation_tests.
+add_executable(shader_translation_tests
+    video_core/stage_translation.cpp
+    ../video_core/shader_jobs.cpp
+    ../video_core/shader_stage_translation.cpp)
+target_link_libraries(shader_translation_tests PRIVATE common shader_recompiler
+    Catch2::Catch2WithMain Threads::Threads)
+target_compile_definitions(shader_translation_tests PRIVATE
+    SHADER_SWEEP_FIXTURES="${PROJECT_SOURCE_DIR}/tools/shader-sweep/fixtures")
+add_test(NAME shader_translation_tests COMMAND shader_translation_tests)
 
 if (NOT ANDROID)
     target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp)

@@ -87,6 +87,7 @@ class NvidiaDlssUpscaler {
     bool depth_inverted = true;
 #else
     void *set_options{}; ///< slDLSSSetOptions
+    void *get_state{}; ///< slDLSSGetState
 #endif
     VkExtent2D render_extent{};
     VkExtent2D upscale_extent{};

@@ -140,6 +140,7 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 
 template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
@@ -1269,6 +1270,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     if (images.empty()) {
         return;
     }
+    const StutterTrace::SiteScope site{StutterTrace::Site::TextureDownload};
     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
     });
@@ -2877,6 +2879,7 @@ std::optional<DAddr> TextureCache<P>::ImageCpuAddress(GPUVAddr gpu_addr, size_t 
 template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::ImageCreate};
     std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {
         const DAddr fake_addr = ~(1ULL << 40ULL) + virtual_invalid_space;
@@ -3196,6 +3199,25 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             copied_whole = true;
             break;
         }
+    }
+    // The copies from overlaps the GPU wrote can each write a part of it, together all of it:
+    // Mario Kart World renders each layer of its shadow map and colour arrays as a target of its
+    // own, then samples the array, and the upload under those copies took 13-31 ms an array.
+    if (!can_rescale && !copied_whole && new_info.num_samples == 1) {
+        std::vector<u8> written(
+            static_cast<size_t>(new_info.resources.levels * new_info.resources.layers));
+        for (const JoinCopy& copy : join_copies_to_do) {
+            const Image& overlap = slot_images[copy.id];
+            if (copy.is_alias || False(overlap.flags & ImageFlagBits::GpuModified) ||
+                overlap.info.num_samples != 1) {
+                continue;
+            }
+            const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();
+            MarkSubresourcesWrittenWhole(new_image, overlap,
+                                         MakeShrinkImageCopies(new_info, overlap.info, base, 1, 0),
+                                         written);
+        }
+        copied_whole = std::ranges::all_of(written, [](u8 whole) { return whole != 0; });
     }
     if (overwritten_by_clear()) {
         // Stays CpuModified: UpdateRenderTargets' PrepareImage drops the upload only when
@@ -3908,6 +3930,7 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
 
 template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+    const StutterTrace::SiteScope site{StutterTrace::Site::ImageDelete};
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
     VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
