@@ -1257,6 +1257,8 @@ void GraphicsPipeline::KeepImageDescriptors(size_t stage, size_t first_entry) {
                               entries + end_entry);
 }
 
+/// Records draw bindings and any mesh fallback dispatch, profiling both pipeline-build waits.
+/// Returns false when descriptor preparation fails and the draw must be skipped.
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                      const RenderAreaPushConstant& render_area) {
     if (guest_descriptor_queue.UpdateCount() != num_descriptor_entries) {
