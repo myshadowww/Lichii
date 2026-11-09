@@ -8,6 +8,7 @@ add_executable(tests
     yuzu/neural_model_sources.cpp
     video_core/neural_rendering_model.cpp
     common/addon_config.cpp
+    common/thread_worker.cpp
     video_core/vulkan_overlay_filter.cpp
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
