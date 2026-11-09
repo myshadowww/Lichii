@@ -286,7 +286,7 @@ TEST_CASE("Prepared graphics keys match runtime and v2 keys across drivers",
     Vulkan::GraphicsPipelineCacheKey runtime{};
     runtime.unique_hashes[1] = 0x1234;
     runtime.unique_hashes[5] = 0x5678;
-    runtime.state.dynamic_vertex_input = 1;
+    runtime.state.dynamic_vertex_input.Assign(1);
     runtime.state.CanonicalizeNative(0b0101);
 
     auto prepared = runtime;
