@@ -122,8 +122,9 @@ IR::F64 UnpackCbuf(TranslatorVisitor& v, u64 insn) {
     return v.ir.PackDouble2x32(vector);
 }
 
+/// Translates F2I with the encoded modifiers, rounding, saturation and destination writes.
+/// F32-to-S32 keeps NaN and overflow out of the conversion, then selects the exact integer result.
 void TranslateF2I(TranslatorVisitor& v, u64 insn, const IR::F16F32F64& src_a) {
-    // F2I is used to convert from a floating point value to an integer
     const F2I f2i{insn};
 
     const bool denorm_cares{f2i.src_format != SrcFormat::F16 && f2i.src_format != SrcFormat::F64 &&
