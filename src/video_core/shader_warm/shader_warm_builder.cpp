@@ -312,11 +312,23 @@ fs::path FindNativeRecipe(u64 title_id) {
     if (fs::exists(NativeRecipePath(title_id), ec)) {
         return NativeRecipePath(title_id);
     }
+    fs::path recipe_dir;
+#ifdef _WIN32
+    recipe_dir = Common::FS::GetExeDirectory() / "recipes";
+#elif defined(__linux__)
+    const auto executable = fs::read_symlink("/proc/self/exe", ec);
+    if (ec) {
+        return {};
+    }
+    recipe_dir = executable.parent_path() / "recipes";
+#else
+    return {};
+#endif
     std::vector<fs::path> candidates;
-    for (const auto& entry :
-         fs::directory_iterator(Common::FS::GetExeDirectory() / "recipes", ec)) {
-        if (entry.path().extension() == ".nx2recipe" && entry.is_regular_file(ec)) {
-            candidates.push_back(entry.path());
+    for (fs::directory_iterator it(recipe_dir, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code type_ec;
+        if (it->path().extension() == ".nx2recipe" && it->is_regular_file(type_ec)) {
+            candidates.push_back(it->path());
         }
     }
     std::ranges::sort(candidates);
