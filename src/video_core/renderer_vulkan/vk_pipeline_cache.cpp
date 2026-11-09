@@ -2077,7 +2077,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir, bo
         return;
     }
     // Without a driver cache of its own the prepared pipelines would only warm this session.
-    if (prepare && !DriverCachesPipelines(device) && !(enabled && enabled[0] == '1')) {
+    if (prepare && !device.DriverCachesPipelines() && !(enabled && enabled[0] == '1')) {
         LOG_INFO(Render_Vulkan, "Native shader preparation skipped: the driver keeps no pipeline "
                                 "cache of its own (EDEN_NX2_PRECOMPILED=1 prepares anyway)");
         prepare = false;
@@ -2189,10 +2189,9 @@ void PipelineCache::RunNativePreparation(const std::filesystem::path& path,
             }
             bool skip = done_before.contains(index);
             if (!skip && kind == 0) {
-                // Records carry the recording machine's driver; draws key them with this one.
+                // Prepared pipelines use the same driver-independent keys as runtime draws.
                 auto& key_state = graphics.state;
-                key_state.driver_id = static_cast<u32>(device.GetDriverID());
-                key_state.driver_version = device.GetDriverVersion();
+                ClearDriverFields(graphics);
                 const bool other_device =
                     (key_state.extended_dynamic_state != 0) !=
                         dynamic_features.has_extended_dynamic_state ||

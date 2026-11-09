@@ -16,6 +16,7 @@
 #include "shader_recompiler/info_serialize.h"
 #include "video_core/nx2_recipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_shader_cache_v2.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/prepared_store.h"
 #include "video_core/shader_warm/warm_records.h"
@@ -278,4 +279,32 @@ TEST_CASE("Recipes from elsewhere or damaged ones are refused", "[video_core][pr
     Recipe::Report report;
     REQUIRE_THROWS(
         Recipe::Assemble(damaged, {}, VideoCommon::ShaderWarm::WarmCacheVersion, report, 1, {}));
+}
+
+TEST_CASE("Prepared graphics keys match runtime and v2 keys across drivers",
+          "[video_core][preparation][shader_cache_v2]") {
+    Vulkan::GraphicsPipelineCacheKey runtime{};
+    runtime.unique_hashes[1] = 0x1234;
+    runtime.unique_hashes[5] = 0x5678;
+    runtime.state.dynamic_vertex_input = 1;
+    runtime.state.CanonicalizeNative(0b0101);
+
+    auto prepared = runtime;
+    prepared.state.driver_id = 4;
+    prepared.state.driver_version = 123;
+    REQUIRE(prepared.Hash() != runtime.Hash());
+    Vulkan::ClearDriverFields(prepared);
+
+    Scratch scratch;
+    PreparedStore store;
+    REQUIRE(store.Open(scratch.path, std::string{Identity}));
+    REQUIRE(store.AddRecord(1, std::span{reinterpret_cast<const u8*>(&prepared), sizeof(prepared)}));
+    std::ifstream file(scratch.path, std::ios::binary);
+    const auto bytes = PreparedStore::ReadFrame(file, store.Records()[0].at);
+    REQUIRE(bytes.size() == sizeof(prepared));
+    Vulkan::GraphicsPipelineCacheKey restored{};
+    std::memcpy(&restored, bytes.data(), sizeof(restored));
+    REQUIRE(restored == runtime);
+    REQUIRE(restored.Hash() == runtime.Hash());
+    REQUIRE(restored.Hash() == Vulkan::GraphicsRecordKey(runtime));
 }
