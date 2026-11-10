@@ -907,14 +907,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 #endif
 }
 
-/// Prepare native inference features when DLSS is enabled so neural styles can be switched live.
+/// Prepare native inference features so DLSS and neural styles can be switched live.
 bool Device::EnableNeuralRendering() {
 #ifdef EGLANTINE_NGX
     namespace NR = VideoCore::NeuralRendering;
     NR::ResetStatus();
-    if (!Settings::values.nvidia_dlss.GetValue()) {
-        return false;
-    }
     const auto unavailable = [](const char* reason) {
         NR::ReportFailure(reason);
         return false;

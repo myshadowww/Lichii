@@ -1825,7 +1825,7 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
         return false;
     }
 #ifdef EGLANTINE_NVIDIA_DLSS
-    if (NvidiaDlss::IsAvailable() && !dlss_unsupported) {
+    if (UsesNvidiaDlss()) {
         return true;
     }
 #endif
@@ -1839,7 +1839,8 @@ bool TextureCacheRuntime::UsesNvidiaDlss() const {
         const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
         return value && std::string_view{value} == "fsr";
     }();
-    return !force_fsr && !dlss_unsupported && NvidiaDlss::IsAvailable();
+    return Settings::GetNvidiaDlssRuntimeSettings().enabled && !force_fsr &&
+           !dlss_unsupported && NvidiaDlss::IsAvailable();
 #else
     return false;
 #endif
@@ -1994,7 +1995,8 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
         return value && std::string_view{value} == "fsr";
     }();
-    if (force_fsr || dlss_unsupported) {
+    if (force_fsr || dlss_unsupported || !Settings::GetNvidiaDlssRuntimeSettings().enabled) {
+        dlss_history_reset = true;
         return false;
     }
     if (!dlss_upscaler) {
@@ -2047,7 +2049,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .jitter = jitter,
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
-            .reset = reset,
+            .reset = reset || dlss_history_reset,
         });
     } catch (const vk::Exception& exception) {
         LOG_WARNING(Render_Vulkan, "NVIDIA DLSS evaluation unavailable ({}); using FSR 3.1",
@@ -2057,6 +2059,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         dlss_unsupported = true;
         return false;
     }
+    dlss_history_reset = false;
     DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
                        native_resolution ? dlss_upscaler->LinearSampler()
                                          : dlss_upscaler->PointSampler());
@@ -2952,6 +2955,12 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 }
 
 void TextureCacheRuntime::TickFrame() {
+    const bool dlss_enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+    if (dlss_enabled != last_dlss_enabled) {
+        dlss_history_reset = true;
+        fsr3_last_evaluation.reset();
+        last_dlss_enabled = dlss_enabled;
+    }
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
@@ -4658,8 +4667,13 @@ void CustomBorderColorBudget::Release() noexcept {
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
     if (!ocarina_fsr_lod_bias) {
         const bool ocarina = Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
-        ocarina_fsr_lod_bias =
-            ocarina ? VideoCommon::OcarinaFsrLodBias(ResolveOcarinaUpscaler(device)) : 0.0f;
+        ocarina_fsr_active = ocarina && ResolveOcarinaUpscaler(device) ==
+                                          VideoCommon::OcarinaUpscaleBackend::Fsr;
+        // Keep both sampler variants available when switching between DLSS and FSR live.
+        const bool can_use_fsr = ocarina &&
+            (ocarina_fsr_active || Settings::values.ocarina_fsr.GetValue());
+        ocarina_fsr_lod_bias = can_use_fsr ? VideoCommon::OcarinaFsrLodBias(
+                                              VideoCommon::OcarinaUpscaleBackend::Fsr) : 0.0f;
     }
     return *ocarina_fsr_lod_bias;
 }
@@ -4727,6 +4741,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     // size's mips; the bias keeps the output's detail (VideoCommon::OcarinaFsrLodBias).
     f32 lod_bias = tsc.LodBias();
     ocarina_fsr_failed = &runtime.ocarina_fsr_failed;
+    ocarina_fsr_active = &runtime.ocarina_fsr_active;
     if (const f32 fsr_lod_bias = runtime.OcarinaFsrLodBias();
         fsr_lod_bias != 0.0f && tsc.mipmap_filter != TextureMipmapFilter::None) {
         const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
@@ -4774,7 +4789,7 @@ Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth)
     // the upscaler failed this session (the game's pass runs again).
     if (added_lod_bias != 0.0f) {
         const Image* const image = image_view.BackingImage();
-        key.drop_lod_bias = !VideoCommon::KeepOcarinaFsrLodBias(
+        key.drop_lod_bias = !*ocarina_fsr_active || !VideoCommon::KeepOcarinaFsrLodBias(
             Settings::IsDockedMode(), *ocarina_fsr_failed,
             image != nullptr && True(image->flags & ImageFlagBits::GpuModified));
     }

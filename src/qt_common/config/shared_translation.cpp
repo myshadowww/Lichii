@@ -183,7 +183,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Fire Emblem: Fortune's Weave also needs "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
               "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
-              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
+              "upscaler at 1x resolution scale.\n"
+#ifdef __linux__
+              "Can be switched during gameplay with Apply. Install the runtime files before "
+              "starting the game."
+#else
+              "Takes effect when a game starts."
+#endif
+              ));
     INSERT(Settings, nvidia_dlss_quality, tr("NVIDIA DLSS quality:"),
            tr("Automatic preserves the game's supported upscaling path.\n"
               "Native (DLAA) applies anti-aliasing at the game's render resolution. "

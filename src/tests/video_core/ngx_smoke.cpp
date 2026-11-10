@@ -306,8 +306,6 @@ int main(int argc, char **argv) try {
     Common::Log::Initialize();
     Common::Log::Start();
     Settings::values.nvidia_dlss = false;
-    Require(!NvidiaDlss::Start() && !NvidiaDlss::WantsDevice(), "Disabled setting loaded NGX");
-    Settings::values.nvidia_dlss = true;
     setenv("LICHII_NGX_DIR", scratch.c_str(), 1);
     Require(!NvidiaDlss::Start() && !Ngx::GetStatus().error.empty(), "Missing model not diagnosed");
     setenv("LICHII_NGX_DIR", std::filesystem::absolute(argv[1]).c_str(), 1);
@@ -322,7 +320,8 @@ int main(int argc, char **argv) try {
     }
     Require(scale >= 1 && scale <= 8, "Scale must be between 1 and 8 (4K output)");
     for (int run = 0; run < 2; ++run) {
-        // Device creation must prepare inference features even when the session starts with Off.
+        // Both DLSS and neural rendering may start off, then be enabled without a new device.
+        Settings::values.nvidia_dlss = run != 0;
         Settings::values.neural_rendering = Settings::NeuralRendering::Off;
         Settings::RefreshNvidiaDlssRuntimeSettings();
         Require(NvidiaDlss::Start(), "NGX startup failed");
@@ -345,6 +344,8 @@ int main(int argc, char **argv) try {
                                               duplicate_dispatch),
                     "NGX accepted a second device attachment");
             Require(NvidiaDlss::IsAvailable(), "Duplicate attachment disturbed the active device");
+            Settings::values.nvidia_dlss = true;
+            Settings::RefreshNvidiaDlssRuntimeSettings();
             RenderCases(device, static_cast<u32>(scale), request_neural, expect_neural);
             if (request_neural && !expect_neural) {
                 Require(!VideoCore::NeuralRendering::GetStatus().error.empty(),

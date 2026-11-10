@@ -259,15 +259,17 @@ public:
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
 
-    /// The LOD bias Ocarina's FSR adds to mipmapped samplers this session (0 for other games or
-    /// upscalers), resolved on first use.
+    /// Potential FSR LOD bias (0 for other games); sampler variants gate it on the active backend.
     [[nodiscard]] f32 OcarinaFsrLodBias();
     std::optional<f32> ocarina_fsr_lod_bias;
     /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
     bool ocarina_fsr_failed{};
+    bool ocarina_fsr_active{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+    bool dlss_history_reset = true;
+    bool last_dlss_enabled{};
 
     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
@@ -887,6 +889,7 @@ private:
 
     const Device* device_ptr{nullptr};
     const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
+    const bool* ocarina_fsr_active{}; ///< TextureCacheRuntime::ocarina_fsr_active
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};

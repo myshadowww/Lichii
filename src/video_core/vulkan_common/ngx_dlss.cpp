@@ -116,17 +116,13 @@ void ReportEvaluation() { evaluations.fetch_add(1, std::memory_order_relaxed); }
 
 namespace NvidiaDlss {
 
-/// Reset status and load the native NGX API and model when enabled, reporting startup failures
-/// for the UI.
+/// Prepare NGX before Vulkan device creation, even when DLSS will initially be disabled.
 bool Start() {
     Stop();
     {
         std::scoped_lock lock{status_mutex};
         status = {};
         evaluations.store(0, std::memory_order_relaxed);
-    }
-    if (!Settings::values.nvidia_dlss.GetValue()) {
-        return false;
     }
     State &state = GetState();
     const auto model = Ngx::FindModel();

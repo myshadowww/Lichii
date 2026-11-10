@@ -412,7 +412,14 @@ struct Values {
                                                   true,
                                                   false};
     // NVIDIA DLSS through the platform runtime, in place of a game's DLSS.
-    SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer,
+                                        Specialization::Default, true,
+#ifdef __linux__
+                                        true
+#else
+                                        false
+#endif
+    };
     SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{
         linkage, NvidiaDlssQuality::Automatic, "nvidia_dlss_quality", Category::Renderer,
         Specialization::Default, true, true};
@@ -1079,6 +1086,7 @@ struct NvidiaDlssRuntimeSettings {
     u32 strength = 100;
     u32 tone = 100;
     u32 structure = 100;
+    bool enabled = false;
 };
 
 /// Publish the selected DLSS options from the settings thread for use by renderer threads.

@@ -289,7 +289,8 @@ TEST_CASE("Per-game overrides and use-global flags survive the new global profil
 
 TEST_CASE("Neural controls retain defaults, persist, and publish per-game overrides", "[config]") {
     ConfigDirectory directory;
-    directory.Write("qt-config.ini", "[Renderer]\nneural_rendering=2\nneural_rendering\\default=false\n");
+    directory.Write("qt-config.ini", "[Renderer]\nneural_rendering=2\nneural_rendering\\default=false\n"
+                                    "nvidia_dlss=true\nnvidia_dlss\\default=false\n");
     FileConfig global{std::string{"qt-config"}};
     auto& values = Settings::values;
     CHECK(values.neural_rendering_strength.GetValue() == 100);
@@ -308,7 +309,8 @@ TEST_CASE("Neural controls retain defaults, persist, and publish per-game overri
     CHECK(values.neural_rendering_structure.GetValue() == 61);
 
     directory.Write("custom/neural.ini",
-                    "[Renderer]\nneural_rendering_strength=0\n"
+                    "[Renderer]\nnvidia_dlss=false\nnvidia_dlss\\default=false\n"
+                    "nvidia_dlss\\use_global=false\nneural_rendering_strength=0\n"
                     "neural_rendering_strength\\default=false\n"
                     "neural_rendering_strength\\use_global=false\n"
                     "neural_rendering_tone=200\nneural_rendering_tone\\default=false\n"
@@ -317,6 +319,12 @@ TEST_CASE("Neural controls retain defaults, persist, and publish per-game overri
     FileConfig game{std::string{"neural"}, Config::ConfigType::PerGameConfig};
     Settings::RefreshNvidiaDlssRuntimeSettings();
     const auto options = Settings::GetNvidiaDlssRuntimeSettings();
+    CHECK_FALSE(options.enabled);
+    CHECK(values.nvidia_dlss.GetValue(true));
+    values.nvidia_dlss.SetGlobal(true);
+    CHECK_FALSE(Settings::GetNvidiaDlssRuntimeSettings().enabled);
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().enabled);
     CHECK(options.neural_rendering == Settings::NeuralRendering::Natural);
     CHECK(options.strength == 0);
     CHECK(options.tone == 100);
