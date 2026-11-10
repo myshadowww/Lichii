@@ -3016,8 +3016,9 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
     constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
     const bool pass_1440p = replace && pipeline.ShaderHash() == ComputePipeline::Ocarina1440pShader;
-    const bool native_resolution = oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
-        Settings::values.nvidia_dlss_quality.GetValue() == Settings::NvidiaDlssQuality::Native;
+    const bool native_resolution =
+        oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss &&
+        Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
     const bool upscale_4k = pass_1440p && !native_resolution;
     if ((!replace && pipeline.ShaderHash() != depth_reader) || !OcarinaTemporalEnabled()) {
         return false;
