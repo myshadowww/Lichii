@@ -165,6 +165,30 @@ TEST_CASE("Ampere geometry exit setup results must be dead before the body reads
     RequireRejected(code, reads, 0x90);
 }
 
+TEST_CASE("Ampere geometry exit tracks the reverse-encoded global load predicate",
+          "[video_core][ampere]") {
+    constexpr Instruction load{{0x04087381, 0, 0x001e8900, 0}};
+    for (const u32 predicate : {0U, 6U, 8U, 14U}) {
+        auto code = Program;
+        code[6] = load;
+        code[6].words[2] |= predicate;
+        RequireAccepted(code);
+    }
+    for (const u32 predicate : {7U, 15U}) {
+        auto code = Program;
+        code[6] = load;
+        code[6].words[2] |= predicate;
+        RequireRejected(code, "native body reads exit setup state", 0x60);
+
+        // The original ISETP at index 8 overwrites P0 before this load reads it.
+        code = Program;
+        code[9] = load;
+        code[9].words[0] = 0x04037381;
+        code[9].words[2] |= predicate;
+        RequireAccepted(code);
+    }
+}
+
 TEST_CASE("Ampere geometry exit body cannot touch the handler state", "[video_core][ampere]") {
     for (const u32 word0 : {0x00007357U, 0x00007957U, 0x00007355U, 0x0000734eU}) {
         auto code = Program;

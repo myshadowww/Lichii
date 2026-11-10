@@ -138,6 +138,7 @@ GeometryExitEnvelope AnalyzeGeometryExit(const Code& code) {
         } else if (opcode == 0x805 || opcode == 0xab9 || opcode == 0x945) {
         } else if (opcode == 0x381 || opcode == 0x981) {
             const u32 address = bits(index, 24, 8), size = bits(index, 73, 3);
+            if (opcode == 0x381) read_predicate(7 - bits(index, 64, 3));
             if (address != 255) {
                 read_register(address);
                 read_register(address + 1);

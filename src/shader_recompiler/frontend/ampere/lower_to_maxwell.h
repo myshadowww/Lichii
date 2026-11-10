@@ -940,15 +940,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 break;
             }
             if (insn.Bits(24, 8) != 255 || insn.Bits(64, 8) != 255 || insn.words[2] != 0x078e00ff) {
-                // Bit 63 negates the constant buffer addend (bit 62 would be its absolute value).
-                if ((insn.words[2] & ~0x2ffU) != 0x078e0000 || (opcode == 0x624 && insn.Bits(62, 1)))
+                if ((insn.words[2] & ~0x2ffU) != 0x078e0000 || (opcode == 0x624 && insn.Bits(62, 2)))
                     return fail(index, "native multiply wide addend mode");
-                const u32 a = operand(0, false), b = operand(1, false);
-                u32 c = operand(2, false);
-                if (opcode == 0x624 && insn.Bits(63, 1)) {
-                    emit(0x5c10000000000000ULL | predicate | 252 | (u64{255} << 8) | (u64{c} << 20) | (u64{1} << 48));
-                    c = 252;
-                }
+                const u32 a = operand(0, false), b = operand(1, false), c = operand(2, false);
                 multiply_low(a, b, c, false);
                 break;
             }
@@ -1601,10 +1595,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
+            const u32 coordinates = dimension == 5 ? 3U : 2U;
+            const u32 reserved = uses_uniform_bank ? high_uniform_base : 246U;
             // 3D (5, as in Orchid) reads x, y, z from three consecutive registers.
             if ((insn.words[2] & ~0x03800000U) != 0x0010e000 ||
                 (dimension != 1 && dimension != 3 && dimension != 5) || binding >= 18 ||
-                offset > 0x1fff || insn.Bits(59, 2) || coordinate > (dimension == 5 ? 252U : 253U))
+                offset > 0x1fff || insn.Bits(59, 2) || coordinate + coordinates > reserved)
                 return fail(index, "native surface reduction mode");
             if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
                 return fail(index, "native surface descriptor buffer conflict");
