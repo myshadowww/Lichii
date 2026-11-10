@@ -3882,6 +3882,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     const auto precompiled_begin = std::chrono::steady_clock::now();
     auto pipeline{CreatePrecompiledGraphicsPipeline(environments)};
     if (pipeline) {
+        // Recipe validation records the same pointer classifications as runtime translation.
+        VideoCommon::EvictedPointerSlots::Slots mapped_pointers;
+        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
+            if (graphics_key.unique_hashes[index] != 0) {
+                mapped_pointers[index] = environments.envs[index].MappedStoragePointerKeys();
+            }
+        }
+        pipeline->SetMappedPointers(std::move(mapped_pointers));
         precompiled_created.fetch_add(1, std::memory_order_relaxed);
         precompiled_gpu_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - precompiled_begin)
