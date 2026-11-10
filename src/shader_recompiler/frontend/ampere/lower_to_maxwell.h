@@ -2020,7 +2020,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 return fail(index, "native global load mode");
             if (opcode == 0x381) {
                 // Bit 77 (strong/scoped ordering) needs nothing extra from a Maxwell LDG.
-                if ((insn.words[2] & ~0x2e00U) != 0x001e8100 || (address & 1) || address >= 246)
+                // Bits 64-67 are the load predicate, handled below.
+                if ((insn.words[2] & ~0x2e0fU) != 0x001e8100 || (address & 1) || address >= 246)
                     return fail(index, "native global load mode");
             } else {
                 // The uniform base sits where a register source would (bits 32-37).
@@ -2048,6 +2049,28 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                          (u64{insn.Bits(90, 1) ? address + 1 : 255} << 20) | (u64{1} << 43));
                     address = 250;
                 }
+            }
+            if (opcode == 0x381 && insn.Bits(64, 4)) {
+                // Load predicate (from Orchid): a false one returns zero without reading memory.
+                // Its index is reverse encoded (7-P), independently of the execution predicate.
+                // Staged in R248+ so the zero fill cannot clobber an aliased address register.
+                if (native_predicate != 7) {
+                    relocations.push_back({static_cast<u32>(result.instructions.size()), index + 1});
+                    emit(0xe24000000000000fULL | (u64{native_predicate ^ 8U} << 16));
+                    predicate = u64{7} << 16;
+                }
+                const u32 components = size < 4 ? 1U : 1U << (size - 4);
+                const u32 load_predicate = (7 - insn.Bits(64, 3)) | (insn.Bits(67, 1) << 3);
+                for (u32 i = 0; i < components; ++i) mov_imm(248 + i, 0);
+                emit(0xeed0000000000000ULL | (u64{load_predicate} << 16) | 248 |
+                     (u64{address} << 8) | (u64{insn.Bits(40, 24)} << 20) |
+                     (u64{1} << 45) | (u64{size} << 48));
+                for (u32 i = 0; i < components; ++i) {
+                    if (dest != 255)
+                        emit(0x5c98000000000000ULL | predicate | (dest + i) |
+                             (u64{248 + i} << 20) | (u64{15} << 39));
+                }
+                break;
             }
             emit(base(0xeed0000000000000ULL) | (u64{address} << 8) |
                  (u64{insn.Bits(40, 24)} << 20) | (u64{1} << 45) |
@@ -3263,6 +3286,16 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         }
         case 0x845: case 0x906: {
             const bool round_up = opcode == 0x906;
+            if (opcode == 0x906 && !insn.Bits(24, 8) && !(insn.words[3] & 0xc00001ffU) &&
+                (insn.words[2] & ~0xdc00U) == 0x00200000U && insn.Bits(75, 2) == 1) {
+                // I2F.F16.U32/S32 immediate (from Orchid): format at 75-76 and rounding at 78-79,
+                // as Maxwell I2F's 8 and 39.
+                mov_imm(250, insn.words[1]);
+                emit(base(0x5cb8000000000000ULL) | (u64{1} << 8) | (u64{2} << 10) |
+                     (u64{insn.Bits(74, 1)} << 13) | (u64{250} << 20) |
+                     (u64{insn.Bits(78, 2)} << 39));
+                break;
+            }
             if (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||
                 (insn.words[2] & ~0xc400U) != 0x00201000U)
                 return fail(index, "native immediate integer-to-float conversion mode");
