@@ -1878,6 +1878,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
 #ifdef EGLANTINE_NVIDIA_DLSS
     if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
                         motion_scale, reset)) {
+        fsr3_history_reset = true;
         return true;
     }
 #endif
@@ -1924,7 +1925,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .frame_time_ms = frame_time_ms,
-            .reset = reset,
+            .reset = reset || fsr3_history_reset,
             .sharpen = sharpen,
             .sharpness = FSR::RcasSharpnessFromStops(stops),
         });
@@ -1934,6 +1935,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         fsr3_unsupported = true;
         return false;
     }
+    fsr3_history_reset = false;
     DrawUpscaledOutput(dst_framebuffer, fsr3_upscaler->OutputView(), fsr3_upscaler->OutputImage(),
                        fsr3_upscaler->PointSampler());
     static bool logged{};

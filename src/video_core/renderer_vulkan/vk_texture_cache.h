@@ -269,6 +269,7 @@ public:
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
     bool dlss_history_reset = true;
+    bool fsr3_history_reset = true;
     bool last_dlss_enabled{};
 
     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
