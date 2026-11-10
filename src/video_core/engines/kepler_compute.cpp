@@ -543,6 +543,8 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
     }
 }
 
+/// Set up the compute registers from the native descriptor and submit the dispatch.
+/// Returns true if the dispatch was submitted, skipped, or replaced.
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
     launch_description = {};
     launch_description.grid_dim_x.Assign(qmd[12]);
@@ -1067,6 +1069,8 @@ std::optional<Texture::TICEntry> KeplerCompute::ConstBuffer0Image(u32 offset) co
     return GetTICEntry(tic_index);
 }
 
+/// Identify a known 1.0.0 output pass before shader translation can reject it.
+/// The first word is a quick filter. The full native key must match before replacing the pass.
 bool KeplerCompute::BypassOotBaseNetwork() {
     using namespace VideoCommon::OotNetwork;
     const u64 program_id = Settings::GetCurrentProgramID();
@@ -1090,6 +1094,8 @@ bool KeplerCompute::BypassOotBaseNetwork() {
            BypassOotNetwork(program_id, match->key);
 }
 
+/// Replace a known output pass with the latest tonemap, using scaling for the base game.
+/// The update's prepass and network may be skipped after a successful replacement.
 bool KeplerCompute::BypassOotNetwork(u64 program_id, u64 native_key) {
     using namespace VideoCommon::OotNetwork;
     if (!BypassEnabled(program_id)) {

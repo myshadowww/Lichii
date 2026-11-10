@@ -1,8 +1,8 @@
 # Ocarina of Time: bypassing the game's anti-aliasing network
 
 The Legend of Zelda: Ocarina of Time (`0400486024DEC000`) runs a tensor network on its tonemapped
-image followed by an output pass that sharpens hard. The "Ocarina of Time anti-aliasing" setting
-(`oot_anti_aliasing`: Game / No sharpening) can skip both and show the tonemapped image instead.
+image followed by an output pass that sharpens hard. The No sharpening option
+(`oot_anti_aliasing`) shows the tonemapped image and can also skip the update's network passes.
 
 ## What the game does
 
@@ -27,11 +27,12 @@ output shaders use the same constant-buffer handle offsets as the update.
 
 ## What No sharpening does
 
-- On 1.1.1, `ShaderCache::GetComputePipeline` calls `KeplerCompute::BypassOotNetwork`. The output
+- On 1.1.1, `ShaderCache::ComputeShader` calls `KeplerCompute::BypassOotNetwork`. The output
   pass uses a same-size point copy. The prepass and network are skipped while the replacement works.
-- On 1.0.0, `KeplerCompute::DispatchNativeCompute` recognizes the known output programs before
-  translation, which can reject their per-tap gathers. It uses a bilinear copy that can scale the
-  tonemap up to the output resolution. The base game's other compute passes still run.
+- On 1.0.0, `KeplerCompute::BypassOotBaseNetwork` recognizes the known output programs from
+  `DispatchNativeCompute` before translation, which can reject their per-tap gathers. It uses a
+  bilinear copy that can scale the tonemap up to the output resolution. The base game's other
+  compute passes still run.
 - Both paths use `AccelerateSurfaceCopy` and get the output format, size and block-linear layout
   from the output pass's texture descriptor at cb0+0xd0.
 

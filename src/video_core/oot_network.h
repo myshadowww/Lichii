@@ -13,9 +13,8 @@
 
 // The Legend of Zelda: Ocarina of Time's anti-aliasing. After tonemapping, the game runs a
 // single-frame tensor network on the tonemapped image and an output pass that sharpens the result
-// hard. With the "Ocarina of Time anti-aliasing" setting at No sharpening, the network is skipped
-// and its output pass is replaced by a copy of the tonemapped image
-// (docs/nx2/oot-network-bypass.md).
+// hard. The No sharpening setting replaces the output pass with a copy of the tonemapped image
+// and can also skip the update's network passes (docs/nx2/oot-network-bypass.md).
 //
 // The update and the base game use different native output programs.
 namespace VideoCommon::OotNetwork {
