@@ -40,7 +40,8 @@ class NvMap;
 
 namespace Service::Nvidia::Devices {
 
-// Refresh a reused device range after CPU virtual memory was remapped. Call in GPU-thread order.
+// Refresh changed pages of a reused device range, preserving unchanged cached GPU writes.
+// Call in GPU-thread order after CPU virtual memory was remapped.
 void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Memory& memory,
                        Core::Asid asid, DAddr device_address, u64 cpu_address, u64 size);
 

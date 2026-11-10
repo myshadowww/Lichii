@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <exception>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -18,11 +20,86 @@
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
-#include "video_core/gpu.h"
+#include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/memory_manager.h"
-#include "video_core/renderer_null/null_rasterizer.h"
+#include "video_core/rasterizer_interface.h"
 
-TEST_CASE("NX2 presentation resolves parent handles and image offsets", "[video_core][nx2_mapping]") {
+namespace {
+
+struct CachedPages {
+    std::map<DAddr, s32> counts;
+
+    void UpdatePagesCachedCount(DAddr address, size_t size, s32 delta) {
+        constexpr u64 Page = Core::Memory::YUZU_PAGESIZE;
+        for (DAddr page = address / Page; page < (address + size + Page - 1) / Page; ++page) {
+            counts[page * Page] += delta;
+        }
+    }
+
+    void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta) {
+        for (const auto& [address, size] : ranges) {
+            UpdatePagesCachedCount(address, size, delta);
+        }
+    }
+};
+
+// Use the buffer cache's real page-state tracker behind the SMMU invalidation callback.
+class InvalidationRasterizer final : public VideoCore::RasterizerInterface {
+public:
+    CachedPages pages;
+    VideoCommon::MemoryTrackerBase<CachedPages> tracker{pages};
+    std::vector<std::pair<DAddr, u64>> invalidations;
+
+    void InvalidateRegion(DAddr address, u64 size, VideoCommon::CacheType) override {
+        invalidations.emplace_back(address, size);
+        tracker.MarkRegionAsCpuModified(address, size);
+    }
+
+    void Draw(bool, u32) override {}
+    void DrawTexture() override {}
+    void Clear(u32) override {}
+    void DispatchCompute() override {}
+    void ResetCounter(VideoCommon::QueryType) override {}
+    void Query(GPUVAddr, VideoCommon::QueryType, VideoCommon::QueryPropertiesFlags, u32,
+               u32) override {}
+    void BindGraphicsUniformBuffer(size_t, u32, GPUVAddr, u32) override {}
+    void DisableGraphicsUniformBuffer(size_t, u32) override {}
+    void SignalFence(std::function<void()>&&) override {}
+    void SyncOperation(std::function<void()>&&) override {}
+    void SignalSyncPoint(u32) override {}
+    void SignalReference() override {}
+    void ReleaseFences(bool) override {}
+    void FlushAll() override {}
+    void FlushRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    bool MustFlushRegion(DAddr, u64, VideoCommon::CacheType) override {
+        return false;
+    }
+    VideoCore::RasterizerDownloadArea GetFlushArea(DAddr address, u64 size) override {
+        return {address, address + size, false};
+    }
+    void OnCacheInvalidation(DAddr, u64) override {}
+    bool OnCPUWrite(DAddr, u64) override {
+        return false;
+    }
+    void InvalidateGPUCache() override {}
+    void UnmapMemory(DAddr, u64) override {}
+    void ModifyGPUMemory(size_t, GPUVAddr, u64) override {}
+    void FlushAndInvalidateRegion(DAddr, u64, VideoCommon::CacheType) override {}
+    void WaitForIdle() override {}
+    void FragmentBarrier() override {}
+    void TiledCacheBarrier() override {}
+    void FlushCommands() override {}
+    void TickFrame() override {}
+    Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override {
+        std::terminate();
+    }
+    void AccelerateInlineToMemory(GPUVAddr, size_t, std::span<const u8>) override {}
+};
+
+} // namespace
+
+TEST_CASE("NX2 presentation resolves parent handles and image offsets",
+          "[video_core][nx2_mapping]") {
     Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
     registry.MapAt(7, 0x1000, 0x8000, 0x4000, 0x3000);
     registry.RecordDeviceRange(0x4000, 0x3000, 0x10000);
@@ -107,7 +184,7 @@ TEST_CASE("NX2 reused device backing follows CPU pages through every GPU alias",
     std::memset(old_pages, 0x11, Page);
     std::memset(old_pages + Page, 0x22, Page);
     std::memset(old_pages + 2 * Page, 0x33, Page);
-    std::memset(new_page, 0xbb, Page);
+    std::memset(new_page, 0xbb, 3 * Page);
     const auto set_page = [&](u64 offset, u8* backing) {
         const u64 address = Cpu + offset;
         table.entries.GetAndFault(address / Page)
@@ -120,8 +197,7 @@ TEST_CASE("NX2 reused device backing follows CPU pages through every GPU alias",
     auto& memory = process.GetMemory();
     memory.SetCurrentPageTable(process);
     Tegra::MaxwellDeviceMemoryManager device{system.DeviceMemory()};
-    Tegra::GPU gpu{system, false, false};
-    Null::RasterizerNull rasterizer{gpu};
+    InvalidationRasterizer rasterizer;
     device.BindInterface(&rasterizer);
     const Core::Asid asid = device.RegisterProcess(&memory);
     device.Map(Device, Cpu, 3 * Page, asid, true);
@@ -139,6 +215,9 @@ TEST_CASE("NX2 reused device backing follows CPU pages through every GPU alias",
     second.BindRasterizer(&rasterizer);
     first.Map(Gpu, Device, 3 * Page, Tegra::PTEKind::PITCH, false);
     second.Map(GpuAlias, Device, 3 * Page, Tegra::PTEKind::PITCH, false);
+    rasterizer.tracker.UnmarkRegionAsCpuModified(Device, 3 * Page);
+    rasterizer.tracker.MarkRegionAsGpuModified(Device, 3 * Page);
+    rasterizer.invalidations.clear();
     const auto refresh = [&] {
         Service::Nvidia::Devices::Nx2RefreshBacking(device, memory, asid, Device, Cpu, 3 * Page);
     };
@@ -157,6 +236,11 @@ TEST_CASE("NX2 reused device backing follows CPU pages through every GPU alias",
     REQUIRE(device.TranslationGeneration() == unchanged_generation);
     REQUIRE(first.GetPointer(Gpu + Page) == old_pages + Page);
     REQUIRE(second.GetPointer(GpuAlias + Page) == old_pages + Page);
+    REQUIRE(rasterizer.invalidations.empty());
+    for (u64 offset = 0; offset < 3 * Page; offset += Page) {
+        REQUIRE(rasterizer.tracker.IsRegionGpuModified(Device + offset, Page));
+        REQUIRE(rasterizer.pages.counts.at(Device + offset) == 1);
+    }
 
     SECTION("A changed later page replaces stale geometry and keeps other aliases intact") {
         // Same CPU address and size, different physical page, as after sub 102 and sub 101.
@@ -165,6 +249,14 @@ TEST_CASE("NX2 reused device backing follows CPU pages through every GPU alias",
         REQUIRE(first.GetPointer(Gpu + Page) == old_pages + Page);
         REQUIRE(*first.GetPointer(Gpu + Page) == 0x22);
         refresh();
+        const std::vector<std::pair<DAddr, u64>> expected{{Device + Page, Page}};
+        REQUIRE(rasterizer.invalidations == expected);
+        REQUIRE(rasterizer.tracker.IsRegionGpuModified(Device, Page));
+        REQUIRE_FALSE(rasterizer.tracker.IsRegionGpuModified(Device + Page, Page));
+        REQUIRE(rasterizer.tracker.IsRegionGpuModified(Device + 2 * Page, Page));
+        REQUIRE(rasterizer.pages.counts.at(Device) == 1);
+        REQUIRE(rasterizer.pages.counts.at(Device + Page) == 0);
+        REQUIRE(rasterizer.pages.counts.at(Device + 2 * Page) == 1);
         REQUIRE(device.TranslationGeneration() > unchanged_generation);
         REQUIRE(first.GetPointer(Gpu + Page) == new_page);
         REQUIRE(second.GetPointer(GpuAlias + Page) == new_page);
@@ -211,5 +303,40 @@ TEST_CASE("NX2 reused device backing follows CPU pages through every GPU alias",
         refresh();
         REQUIRE(first.GetPointer(Gpu + 2 * Page) == new_page);
         REQUIRE(second.GetPointer(GpuAlias + 2 * Page) == new_page);
+    }
+
+    SECTION("Separated replacements preserve the GPU-owned page between them") {
+        set_page(0, new_page);
+        set_page(2 * Page, new_page + 2 * Page);
+        refresh();
+        const std::vector<std::pair<DAddr, u64>> expected{{Device, Page},
+                                                          {Device + 2 * Page, Page}};
+        REQUIRE(rasterizer.invalidations == expected);
+        REQUIRE_FALSE(rasterizer.tracker.IsRegionGpuModified(Device, Page));
+        REQUIRE(rasterizer.tracker.IsRegionGpuModified(Device + Page, Page));
+        REQUIRE_FALSE(rasterizer.tracker.IsRegionGpuModified(Device + 2 * Page, Page));
+        REQUIRE(rasterizer.pages.counts.at(Device + Page) == 1);
+        REQUIRE(first.GetPointer(Gpu + Page) == old_pages + Page);
+        std::array<u8, 3 * Page> bytes{};
+        second.ReadBlockUnsafe(GpuAlias, bytes.data(), bytes.size());
+        REQUIRE(std::all_of(bytes.begin(), bytes.begin() + Page, [](u8 b) { return b == 0xbb; }));
+        REQUIRE(std::all_of(bytes.begin() + Page, bytes.begin() + 2 * Page,
+                            [](u8 b) { return b == 0x22; }));
+        REQUIRE(std::all_of(bytes.begin() + 2 * Page, bytes.end(), [](u8 b) { return b == 0xbb; }));
+    }
+
+    SECTION("Adjacent replacements share one invalidation ending at the range boundary") {
+        set_page(Page, new_page);
+        set_page(2 * Page, new_page + Page);
+        refresh();
+        const std::vector<std::pair<DAddr, u64>> expected{{Device + Page, 2 * Page}};
+        REQUIRE(rasterizer.invalidations == expected);
+        REQUIRE(rasterizer.tracker.IsRegionGpuModified(Device, Page));
+        REQUIRE_FALSE(rasterizer.tracker.IsRegionGpuModified(Device + Page, 2 * Page));
+        REQUIRE(rasterizer.pages.counts.at(Device) == 1);
+        std::array<u8, 3 * Page> bytes{};
+        first.ReadBlockUnsafe(Gpu, bytes.data(), bytes.size());
+        REQUIRE(std::all_of(bytes.begin(), bytes.begin() + Page, [](u8 b) { return b == 0x11; }));
+        REQUIRE(std::all_of(bytes.begin() + Page, bytes.end(), [](u8 b) { return b == 0xbb; }));
     }
 }

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -46,6 +47,7 @@ void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Me
     }
     u64 stale_pages = 0;
     u64 first_stale = 0;
+    std::vector<std::pair<u64, u64>> stale_ranges;
     for (u64 offset = 0; offset < size; offset += PageSize) {
         const auto device_page =
             reinterpret_cast<uintptr_t>(smmu.GetPointer<u8>(device_address + offset));
@@ -54,6 +56,12 @@ void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Me
         if ((device_page & ~PageMask) != (cpu_page & ~PageMask)) {
             if (stale_pages++ == 0) {
                 first_stale = offset;
+            }
+            if (!stale_ranges.empty() &&
+                stale_ranges.back().first + stale_ranges.back().second == offset) {
+                stale_ranges.back().second += PageSize;
+            } else {
+                stale_ranges.emplace_back(offset, PageSize);
             }
         }
     }
@@ -68,9 +76,12 @@ void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Me
                     device_address, cpu_address, size, stale_pages,
                     (size + PageSize - 1) / PageSize, first_stale);
     }
-    // Drop the old reverse mappings and cached data, keeping the device address shared by aliases.
-    smmu.Unmap(device_address, size);
-    smmu.Map(device_address, cpu_address, size, asid, true);
+    // Invalidate only replaced pages: unchanged pages may still hold GPU-written cached data.
+    // Unmap also cuts preceding continuity runs, keeping reads from reaching the old backing.
+    for (const auto& [offset, length] : stale_ranges) {
+        smmu.Unmap(device_address + offset, length);
+        smmu.Map(device_address + offset, cpu_address + offset, length, asid, true);
+    }
 }
 
 nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Container& core)
