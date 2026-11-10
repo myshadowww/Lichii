@@ -23,6 +23,7 @@
 #include "common/swap.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
 #include "core/hle/service/nvdrv/devices/nvdevice.h"
+#include "video_core/host1x/gpu_device_memory_manager.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -38,6 +39,10 @@ class NvMap;
 } // namespace Service::Nvidia::NvCore
 
 namespace Service::Nvidia::Devices {
+
+// Refresh a reused device range after CPU virtual memory was remapped. Call in GPU-thread order.
+void Nx2RefreshBacking(Tegra::MaxwellDeviceMemoryManager& smmu, Core::Memory::Memory& memory,
+                       Core::Asid asid, DAddr device_address, u64 cpu_address, u64 size);
 
 enum class MappingFlags : u32 {
     None = 0,
