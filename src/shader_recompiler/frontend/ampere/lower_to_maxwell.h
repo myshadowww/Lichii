@@ -1595,7 +1595,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
             const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
             const u32 dimension = insn.Bits(61, 3);
-            const u32 coordinates = dimension == 5 ? 3U : 2U;
+            const u32 coordinates = dimension == 1 ? 1U : dimension == 5 ? 3U : 2U;
             const u32 reserved = uses_uniform_bank ? high_uniform_base : 246U;
             // 3D (5, as in Orchid) reads x, y, z from three consecutive registers.
             if ((insn.words[2] & ~0x03800000U) != 0x0010e000 ||

@@ -205,3 +205,18 @@ TEST_CASE("Yoshi 3D surface register shadows include the depth coordinate",
     const u32 data = data_pressure.instruction.Bits(32, 8);
     CHECK(data / 4 != 212 / 4);
 }
+
+TEST_CASE("Ampere buffer reductions use only one coordinate register", "[ampere][yoshi]") {
+    auto instruction = Reduction;
+    instruction.words[0] = (instruction.words[0] & 0x00ffffffU) | (245U << 24);
+    const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    CHECK(((lowered.instructions.front() >> 8) & 0xff) == 245);
+
+    instruction.words[0] = (instruction.words[0] & 0x00ffffffU) | (215U << 24);
+    const auto pressure = Shader::Ampere::PrepareRegisterPressure(instruction, 216);
+    REQUIRE(pressure.valid);
+    CHECK(pressure.prefix.empty());
+    CHECK(pressure.instruction.Bits(24, 8) == 215);
+}
