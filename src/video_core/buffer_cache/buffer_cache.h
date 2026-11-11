@@ -28,6 +28,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/macro_argument_lifetime.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -224,6 +225,12 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+    if (Tegra::MacroArgumentLifetime::Enabled()) {
+        // This is cache bookkeeping, including direct OnCPUWrite and gathered invalidations.
+        // It is not an actual guest store and does not identify the original caller.
+        Tegra::MacroArgumentLifetime::Note(
+            Tegra::MacroArgumentLifetime::Kind::CacheInvalidation, device_addr, size);
+    }
     Nx2NoteListHostWrite(device_addr, size);
     NoteUniformWrite(device_addr, size);
     // EDEN_NX2_READ_CHECK: a newer value where an early download landed, as ClearDownload
@@ -497,6 +504,13 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             if (staging != nullptr) {
                 for (const Download& download : staged) {
+                    Buffer& buffer = slot_buffers[download.buffer_id];
+                    std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+                    if (Tegra::MacroArgumentLifetime::Enabled()) {
+                        lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                            reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                            buffer.SizeBytes(), 4, 0});
+                    }
                     WriteDownloadedMemory(
                         cpu_written,
                         slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
@@ -507,6 +521,12 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             if constexpr (has_mapped) {
                 for (const Download& download : mapped) {
                     Buffer& buffer = slot_buffers[download.buffer_id];
+                    std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+                    if (Tegra::MacroArgumentLifetime::Enabled()) {
+                        lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                            reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                            buffer.SizeBytes(), 5, 0});
+                    }
                     WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + download.copy.src_offset,
                                           buffer.Mapped().data() + download.copy.src_offset,
                                           download.copy.size);
@@ -1459,6 +1479,13 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                const Tegra::MacroArgumentLifetime::SourceScope source{{
+                    reinterpret_cast<std::uintptr_t>(&dest_buffer), dest_buffer.CpuAddr(),
+                    dest_buffer.SizeBytes(), 0, 3}};
+                Tegra::MacroArgumentLifetime::Note(Tegra::MacroArgumentLifetime::Kind::GpuDeclared,
+                                                  pair.first, pair.second);
+            }
         }
     }
     const auto& copy = copies[0];
@@ -2122,15 +2149,29 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     }
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::DownloadStore, device_addr, size, data);
+        }
         return;
     }
     Common::RangeSet<DAddr> parts;
     parts.Add(device_addr, size);
-    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
+    cpu_written.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
         parts.Subtract(start, end - start);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::DownloadExcluded, start, end - start,
+                data + (start - device_addr));
+        }
     });
     parts.ForEach([&](DAddr start, DAddr end) {
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::DownloadStore, start, end - start,
+                data + (start - device_addr));
+        }
     });
 }
 
@@ -3193,6 +3234,14 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    if (Tegra::MacroArgumentLifetime::Enabled()) {
+        Buffer& buffer = slot_buffers[buffer_id];
+        const Tegra::MacroArgumentLifetime::SourceScope source{{
+            reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(), buffer.SizeBytes(), 0,
+            nx2_collect_list_copies ? 2U : 1U}};
+        Tegra::MacroArgumentLifetime::Note(Tegra::MacroArgumentLifetime::Kind::GpuDeclared,
+                                          device_addr, size);
+    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -3827,6 +3876,14 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
             device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                const Tegra::MacroArgumentLifetime::SourceScope source{{
+                    reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                    buffer.SizeBytes(), 6, 0}};
+                Tegra::MacroArgumentLifetime::Note(
+                    Tegra::MacroArgumentLifetime::Kind::UploadStaged, device_addr, copy.size,
+                    src_pointer);
+            }
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {
@@ -3878,6 +3935,12 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         }};
         u8* const src_pointer = upload_staging.mapped_span.data();
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            const Tegra::MacroArgumentLifetime::SourceScope source{{
+                reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(), buffer.SizeBytes(), 7, 0}};
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::UploadStaged, dest_address, copy_size, src_pointer);
+        }
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     } else {
@@ -3999,6 +4062,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             const VideoCore::DownloadLanding landing{landing_begin, landing_end};
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             for (const BufferCopy& copy : copies) {
+                std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+                if (Tegra::MacroArgumentLifetime::Enabled()) {
+                    lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                        reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                        buffer.SizeBytes(), 1, 0});
+                }
                 WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
                                       mapped.data() + copy.src_offset, copy.size);
             }
@@ -4023,6 +4092,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
+            std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                    reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                    buffer.SizeBytes(), 2, 0});
+            }
             WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
         }
     } else {
@@ -4033,6 +4108,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             const VideoCore::DownloadLanding landing{copy_device_addr,
                                                      copy_device_addr + copy.size};
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+            std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                    reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                    buffer.SizeBytes(), 3, 0});
+            }
             WriteDownloadedMemory(cpu_written, copy_device_addr, immediate_buffer.data(), copy.size);
         }
     }

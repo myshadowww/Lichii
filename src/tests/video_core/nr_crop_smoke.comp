@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "nr_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D motionTex;
+layout(binding = 1, rgba32f) writeonly uniform image2D result;
+layout(push_constant) uniform Push {
+    vec2 valid;
+    vec2 jitter;
+    vec2 scale;
+    uint extent;
+} params;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(params.valid)))) return;
+    ivec2 texel = motionTexel(motionTex, vec2(pixel) + params.jitter,
+                             params.valid, params.extent);
+    vec2 uv = historyUv(motionTex, vec2(pixel), params.valid,
+                        params.scale, params.jitter, params.extent);
+    imageStore(result, pixel, vec4(vec2(texel), uv));
+}

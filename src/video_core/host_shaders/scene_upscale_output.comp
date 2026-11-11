@@ -1,0 +1,30 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D upscaled_color;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D target;
+layout(push_constant) uniform Parameters {
+    vec4 luminance;
+    vec4 shoulder;
+    uint enabled;
+} params;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(target))) ||
+        any(greaterThanEqual(pixel, textureSize(upscaled_color, 0)))) return;
+    vec3 value = texelFetch(upscaled_color, pixel, 0).rgb;
+    if (any(isnan(value)) || any(isinf(value))) return;
+    if (params.enabled != 0) {
+        float scale = params.luminance.x;
+        if (params.luminance.w != 0) {
+            float luma = dot(value, vec3(0.2126, 0.7152, 0.0722));
+            float weight = clamp((1.0 / luma) * params.luminance.z, 0, 1);
+            scale = fma(weight, params.luminance.y, scale);
+        }
+        value *= scale;
+        vec3 curved = 1 - exp2(fma(value, vec3(params.shoulder.y), vec3(params.shoulder.z)));
+        value = mix(value, curved, greaterThanEqual(value, vec3(params.shoulder.x)));
+        value *= params.shoulder.w;
+        if (any(isnan(value)) || any(isinf(value))) return;
+    }
+    imageStore(target, pixel, vec4(clamp(value, 0, 65504), 1));
+}

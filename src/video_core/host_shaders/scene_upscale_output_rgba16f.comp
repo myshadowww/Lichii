@@ -1,0 +1,27 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D upscaled_color;
+layout(binding = 1, rgba16f) uniform image2D target;
+layout(push_constant) uniform Parameters {
+    layout(offset = 40) ivec2 origin;
+    uvec2 active_extent;
+    uint scaled_srgb;
+    float srgb_scale;
+} params;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 target_pixel = pixel + params.origin;
+    if (any(greaterThanEqual(pixel, ivec2(params.active_extent))) ||
+        any(lessThan(target_pixel, ivec2(0))) ||
+        any(greaterThanEqual(target_pixel, imageSize(target))) ||
+        any(greaterThanEqual(pixel, textureSize(upscaled_color, 0)))) return;
+    vec3 value = texelFetch(upscaled_color, pixel, 0).rgb;
+    if (any(isnan(value)) || any(isinf(value))) return;
+    if (params.scaled_srgb != 0u) {
+        value = max(value, vec3(0));
+        value = mix(1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055, 12.92 * value,
+                    lessThanEqual(value, vec3(0.0031308))) * params.srgb_scale;
+    }
+    imageStore(target, target_pixel, vec4(value, imageLoad(target, target_pixel).a));
+}

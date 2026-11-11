@@ -231,6 +231,24 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
         // A macro call must begin by writing the macro method's register, not its argument.
         ASSERT((method % 2) == 0 && "Can't start macro execution by writing to the ARGS register");
         executing_macro = method;
+        if (MacroArgumentTrace::Enabled()) {
+            const auto positions = GetNativeMacroPositions();
+            const auto slot = ((method - MacroRegistersStart) >> 1) % positions.size();
+            const u32 entry = positions[slot];
+            try {
+                if (GetNativeMacroEngine().native_turing && MacroArgumentTrace::Selected(entry)) {
+                    if (!macro_argument_trace) {
+                        macro_argument_trace = std::make_unique<MacroArgumentTrace::Invocation>();
+                    }
+                    macro_argument_trace->Reset(entry, method,
+                                               GetNativeMacroEngine().native_code_generation);
+                } else if (macro_argument_trace) {
+                    macro_argument_trace->active = false;
+                }
+            } catch (...) {
+                macro_argument_trace.reset();
+            }
+        }
     }
 
     macro_segments.emplace_back(current_dma_segment, amount);
@@ -248,6 +266,10 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
         !Settings::IsGPULevelHigh()) {
         std::array<u32, 64> parameters;
         std::copy_n(base_start, amount, parameters.begin());
+        if (macro_argument_trace && macro_argument_trace->active) {
+            macro_argument_trace->Append(this, current_dma_segment,
+                                        std::span<const u32>{parameters.data(), amount});
+        }
         ConsumeSink(system);
         CallMacroMethod(system, executing_macro, std::span<const u32>{parameters.data(), amount});
         macro_segments.clear();
@@ -255,6 +277,10 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
         return;
     }
     macro_params.insert(macro_params.end(), base_start, base_start + amount);
+    if (macro_argument_trace && macro_argument_trace->active) {
+        macro_argument_trace->Append(
+            this, current_dma_segment, std::span<const u32>{macro_params}.last(amount));
+    }
 
     // Call the macro when there are no more parameters in the command buffer
     if (is_last_call) {
@@ -523,6 +549,11 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
     const u32 entry =
         ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
 
+    // The recorder copies this context before the macro executes any callbacks.
+    std::optional<MacroArgumentTrace::InvocationScope> argument_trace;
+    if (MacroArgumentTrace::Enabled()) {
+        argument_trace.emplace(macro_argument_trace.get(), parameters);
+    }
     // Execute the current macro.
     GetNativeMacroEngine().Execute(system, *this, GetNativeMacroPositions()[entry], parameters);
     draw_manager.DrawDeferred(*this);

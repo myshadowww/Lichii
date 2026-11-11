@@ -13,6 +13,8 @@ add_executable(tests
     video_core/unswizzle_workers.cpp
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
+    video_core/scene_camera_math.cpp
+    video_core/scene_image_alias.cpp
     video_core/frame_dump_schedule.cpp
     video_core/nx2_stutter_trace.cpp
     video_core/host_mip_limits.cpp
@@ -79,6 +81,11 @@ add_executable(tests
     video_core/unbacked_fallback.cpp
     video_core/host_memory_limit.cpp
     video_core/fire_emblem_upscale.cpp
+    video_core/yoshi_upscale.cpp
+    video_core/pokopia_upscale.cpp
+    video_core/kirby_upscale.cpp
+    video_core/orbitals_upscale.cpp
+    video_core/mario_kart_upscale.cpp
     video_core/dlss_contract.cpp
     video_core/dlss_mode.cpp
     video_core/ampere_fast_fusion.cpp
@@ -237,9 +244,33 @@ target_compile_definitions(tests PRIVATE
 add_test(NAME tests COMMAND tests)
 
 if (ENABLE_NVIDIA_DLSS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_executable(ngx_smoke EXCLUDE_FROM_ALL video_core/ngx_smoke.cpp)
+    set(NR_CROP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/nr_crop_smoke_spv.h)
+    add_custom_command(
+        OUTPUT ${NR_CROP_HEADER}
+        COMMAND ${GLSLANGVALIDATOR} -V --target-env spirv1.3
+            -I${CMAKE_SOURCE_DIR}/externals/opendlss-nr/shaders
+            --variable-name NR_CROP_SMOKE_SPV -o ${NR_CROP_HEADER}
+            ${CMAKE_CURRENT_SOURCE_DIR}/video_core/nr_crop_smoke.comp
+        DEPENDS video_core/nr_crop_smoke.comp
+            ${CMAKE_SOURCE_DIR}/externals/opendlss-nr/shaders/nr_common.glsl
+    )
+    set(NR_EXPOSURE_HEADER ${CMAKE_CURRENT_BINARY_DIR}/nr_exposure_smoke_spv.h)
+    add_custom_command(
+        OUTPUT ${NR_EXPOSURE_HEADER}
+        COMMAND ${GLSLANGVALIDATOR} -V --target-env spirv1.3
+            -I${CMAKE_SOURCE_DIR}/externals/opendlss-nr/shaders
+            --variable-name NR_EXPOSURE_SMOKE_SPV -o ${NR_EXPOSURE_HEADER}
+            ${CMAKE_CURRENT_SOURCE_DIR}/video_core/nr_exposure_smoke.comp
+        DEPENDS video_core/nr_exposure_smoke.comp
+            ${CMAKE_SOURCE_DIR}/externals/opendlss-nr/shaders/nr_native_exposure.glsl
+    )
+    add_executable(ngx_smoke EXCLUDE_FROM_ALL video_core/ngx_smoke.cpp
+        video_core/nr_crop_smoke.cpp video_core/yoshi_motion_smoke.cpp
+        video_core/mario_kart_motion_smoke.cpp video_core/nr_exposure_smoke.cpp
+        ${NR_CROP_HEADER} ${NR_EXPOSURE_HEADER})
     target_link_libraries(ngx_smoke PRIVATE video_core core common frontend_common ${PLATFORM_LIBRARIES})
     target_include_directories(ngx_smoke PRIVATE $<TARGET_PROPERTY:video_core,INCLUDE_DIRECTORIES>)
+    target_include_directories(ngx_smoke PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 endif()
 
 add_executable(profile_migration_tests

@@ -7,11 +7,13 @@
 #include <atomic>
 #include <bit>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <utility>
 #include <vector>
 
 #include "core/device_memory_manager.h"
+#include "video_core/macro_argument_lifetime.h"
 
 namespace Core {
 
@@ -25,27 +27,20 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
-        do {
-            tmp = current.load(std::memory_order_acquire);
-            original = tmp;
-            if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
-                    std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
-                    return;
-                }
-                tmp.address = t.address;
-                tmp.mask = 0;
-            }
-            if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
-            }
-            tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
-                                                std::memory_order_relaxed));
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::CpuPreStore, address, size);
+        }
+        if (size == 0 || size > std::numeric_limits<PAddr>::max() - address) {
+            return;
+        }
+        // One mask covers only 2 KiB; block writes can span a full 4 KiB guest page.
+        while (size != 0) {
+            const size_t amount = (std::min)(size, page_size - (address & page_mask));
+            CollectWindow(address, amount);
+            address += amount;
+            size -= amount;
+        }
     }
 
     /// Calls `callback` for each write collected and not yet applied, without consuming them: those
@@ -87,6 +82,9 @@ public:
 
     /// Returns true when collected writes not yet gathered overlap [address, address + size).
     bool Overlaps(PAddr address, size_t size) {
+        if (size == 0 || size > std::numeric_limits<PAddr>::max() - address) {
+            return false;
+        }
         const PAddr end = address + size;
         const auto overlaps = [&](TransformAddress t) {
             if (!IsValid(t.address)) {
@@ -113,6 +111,30 @@ public:
     }
 
 private:
+    void CollectWindow(PAddr address, size_t size) {
+        TransformAddress t = BuildTransform(address, size);
+        TransformAddress tmp, original;
+        do {
+            tmp = current.load(std::memory_order_acquire);
+            original = tmp;
+            if (tmp.address != t.address) {
+                if (IsValid(tmp.address)) {
+                    std::scoped_lock lk(guard);
+                    back_buffer.emplace_back(tmp);
+                    current.exchange(t, std::memory_order_relaxed);
+                    return;
+                }
+                tmp.address = t.address;
+                tmp.mask = 0;
+            }
+            if ((tmp.mask | t.mask) == tmp.mask) {
+                return;
+            }
+            tmp.mask |= t.mask;
+        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+                                                std::memory_order_relaxed));
+    }
+
     struct alignas(8) TransformAddress {
         u32 address;
         u32 mask;
@@ -149,6 +171,10 @@ private:
 
     template <typename T>
     T CreateMask(size_t top_bit, size_t minor_bit) {
+        top_bit = (std::min)(top_bit, sizeof(T) * 8);
+        if (top_bit == 0 || minor_bit >= top_bit) {
+            return T{0};
+        }
         T mask = ~T(0);
         mask <<= (sizeof(T) * 8 - top_bit);
         mask >>= (sizeof(T) * 8 - top_bit);

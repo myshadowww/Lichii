@@ -27,6 +27,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
+#include "video_core/macro_argument_lifetime.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
 
@@ -459,6 +460,14 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             }
             entries.submitted_words.resize(words);
             entries.submitted_offsets.reserve(entries.command_lists.size());
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                try {
+                    entries.argument_lifetime_snapshots.resize(std::min<std::size_t>(
+                        entries.command_lists.size(), Tegra::MacroArgumentLifetime::MaxEntryIds));
+                } catch (...) {
+                    entries.argument_lifetime_snapshots.clear();
+                }
+            }
             size_t offset = 0;
             for (u32 i = 0; i < entries.command_lists.size(); ++i) {
                 const auto& entry = entries.command_lists[i];
@@ -470,9 +479,26 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                 if (system.GPU().IsMapPending(entry.addr, bytes)) {
                     entries.deferred_entries.push_back(i);
                 } else {
+                    std::optional<Tegra::MacroArgumentLifetime::Token> lifetime;
+                    if (Tegra::MacroArgumentLifetime::Enabled() &&
+                        i < entries.argument_lifetime_snapshots.size() &&
+                        entry.size <= Tegra::MacroArgumentLifetime::MaxWords) {
+                        lifetime = Tegra::MacroArgumentLifetime::BeginSnapshot(
+                            entry.addr, channel_state->memory_manager->GpuToCpuAddress(entry.addr),
+                            entry.size);
+                    }
                     channel_state->memory_manager->ReadBlockUnsafe(
                         entry.addr, entries.submitted_words.data() + offset,
                         entry.size * sizeof(u32));
+                    if (lifetime) {
+                        entries.argument_lifetime_snapshots[i] =
+                            Tegra::MacroArgumentLifetime::FinishSnapshot(
+                                *lifetime,
+                                channel_state->memory_manager->GpuToCpuAddress(entry.addr),
+                                std::span<const u32>{reinterpret_cast<const u32*>(
+                                    entries.submitted_words.data() + offset),
+                                    static_cast<std::size_t>(entry.size)});
+                    }
                 }
                 offset += entry.size;
             }

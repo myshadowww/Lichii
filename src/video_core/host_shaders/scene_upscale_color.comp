@@ -1,0 +1,38 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D source_color;
+layout(binding = 1, rgba16f) uniform writeonly image2D color;
+layout(push_constant) uniform Parameters {
+    ivec2 origin;
+    float srgb_scale;
+    uint scaled_srgb;
+    uvec2 source_extent;
+    layout(offset = 96) uvec2 active_extent;
+} params;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(params.active_extent)))) return;
+    vec3 value;
+    if (all(greaterThan(params.source_extent, uvec2(0)))) {
+        vec2 position = (vec2(pixel) + 0.5) * vec2(params.source_extent) /
+                        vec2(params.active_extent) - 0.5;
+        ivec2 base = ivec2(floor(position));
+        ivec2 last = ivec2(params.source_extent) - 1;
+        ivec2 lo = clamp(base, ivec2(0), last);
+        ivec2 hi = clamp(base + 1, ivec2(0), last);
+        vec2 weight = fract(position);
+        value = mix(mix(texelFetch(source_color, lo + params.origin, 0).rgb,
+                        texelFetch(source_color, ivec2(hi.x, lo.y) + params.origin, 0).rgb, weight.x),
+                    mix(texelFetch(source_color, ivec2(lo.x, hi.y) + params.origin, 0).rgb,
+                        texelFetch(source_color, hi + params.origin, 0).rgb, weight.x), weight.y);
+    } else {
+        value = texelFetch(source_color, pixel + params.origin, 0).rgb;
+    }
+    if (any(isnan(value)) || any(isinf(value))) value = vec3(0);
+    if (params.scaled_srgb != 0u) {
+        value = max(value / params.srgb_scale, vec3(0));
+        value = mix(pow((value + 0.055) / 1.055, vec3(2.4)), value / 12.92,
+                    lessThanEqual(value, vec3(0.04045)));
+    }
+    imageStore(color, pixel, vec4(clamp(value, 0, 65504), 1));
+}

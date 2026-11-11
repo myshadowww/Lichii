@@ -167,6 +167,17 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
+    const auto valid_input = [&](const Image& image) {
+        return image.view && image.image &&
+               ((!image.extent.width && !image.extent.height) ||
+                (image.extent.width >= in.render_size.width &&
+                 image.extent.height >= in.render_size.height));
+    };
+    if (!in.render_size.width || !in.render_size.height || !in.upscale_size.width ||
+        !in.upscale_size.height || !valid_input(in.color) || !valid_input(in.depth) ||
+        !valid_input(in.motion_vectors)) {
+        return false;
+    }
     const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
                                 in.render_size.height != render_extent.height ||
                                 in.upscale_size.width != upscale_extent.width ||
@@ -290,15 +301,18 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs& in) {
         constants.reset = reset ? sl::eTrue : sl::eFalse;
         constants.motionVectorsJittered = sl::eFalse;
 
+        const auto resource_extent = [&](const Image& image) {
+            return image.extent.width && image.extent.height ? image.extent : in.render_size;
+        };
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, resource_extent(in.color),
                                       VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource depth = Resource(in.depth.image, in.depth.view, in.depth.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, resource_extent(in.depth),
                                       VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource motion = Resource(in.motion_vectors.image, in.motion_vectors.view,
                                        in.motion_vectors.format,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, resource_extent(in.motion_vectors),
                                        VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource output = Resource(output_image_handle, output_view_handle, OUTPUT_FORMAT,
                                        VK_IMAGE_LAYOUT_GENERAL, in.upscale_size, OUTPUT_USAGE);

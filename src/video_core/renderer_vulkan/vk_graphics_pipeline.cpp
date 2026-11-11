@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/kirby_upscale.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_pipeline_binaries.h"
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
@@ -892,8 +893,40 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     const bool starfox_scene_copy =
         key.unique_hashes[1] == VideoCommon::FireEmblemUpscale::StarFoxSceneCopyVertex &&
         key.unique_hashes[5] == VideoCommon::FireEmblemUpscale::StarFoxSceneCopyFragment;
-    if (RecordingSampledTextures() || starfox_scene_copy) {
-        sampled_images.clear();
+    const bool kirby_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        ((key.unique_hashes[1] == VideoCommon::KirbyUpscale::TONEMAP_VERTEX &&
+          key.unique_hashes[5] == VideoCommon::KirbyUpscale::TONEMAP_FRAGMENT) ||
+         (key.unique_hashes[1] == VideoCommon::KirbyUpscale::SMAA_VERTEX &&
+          key.unique_hashes[5] == VideoCommon::KirbyUpscale::SMAA_FRAGMENT));
+    const bool bananza_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        ((key.unique_hashes[1] == 0x8e97cea098cfdbc6ULL &&
+          key.unique_hashes[5] == 0xb56763026332db2eULL) ||
+         (key.unique_hashes[1] == 0xeb21e6be1d399ddaULL &&
+          key.unique_hashes[5] == 0x40c24603fc78bacaULL));
+    const bool pokopia_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        ((key.unique_hashes[1] == 0x42cfaa9991cd7b58ULL &&
+          key.unique_hashes[5] == 0x5cf229d46e0cd486ULL) ||
+         (key.unique_hashes[1] == 0x53e11305e82d5d5dULL &&
+          key.unique_hashes[5] == 0x4e61e66d370340f9ULL));
+    const bool mario_kart_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        key.unique_hashes[1] == 0x8e97cea098cfdbc6ULL &&
+        (key.unique_hashes[5] == 0x1a9cd661be3e12fdULL ||
+         key.unique_hashes[5] == 0xaa3759a6b406c9a4ULL ||
+         key.unique_hashes[5] == 0xe43c4b68e728622eULL);
+    const bool orbitals_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        ((key.unique_hashes[1] == 0x6895f4aa275b81d2ULL &&
+          key.unique_hashes[5] == 0xf7dd0658d2e6a7b6ULL) ||
+         (key.unique_hashes[1] == 0xee69f81e66a97cafULL &&
+          key.unique_hashes[5] == 0x892920f8b6352894ULL));
+    sampled_images.clear();
+    const bool raiders_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        ((key.unique_hashes[1] == 0x5c171536cac96dd2ULL &&
+          key.unique_hashes[5] == 0x75803985c24185fbULL) ||
+         (key.unique_hashes[1] == 0x82d076828dae7e64ULL &&
+          (key.unique_hashes[5] == 0x4d8d7af5f06da313ULL ||
+           key.unique_hashes[5] == 0x9f6f2ba6ce48ae1cULL)));
+    if (RecordingSampledTextures() || starfox_scene_copy || kirby_scene_input || bananza_scene_input || pokopia_scene_input ||
+        raiders_scene_input || mario_kart_scene_input || orbitals_scene_input) {
         size_t view_index{};
         size_t sampler_index{};
         for (size_t stage = 0; stage < Spec::enabled_stages.size(); ++stage) {

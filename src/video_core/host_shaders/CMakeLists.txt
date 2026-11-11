@@ -14,6 +14,15 @@ set(GLSL_INCLUDES
 )
 
 set(SHADER_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/mario_kart_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_camera_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_color.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_depth.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output_unorm.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/yoshi_resample_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output_rgba8.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output_rgba16f.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_vertex_repack.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp

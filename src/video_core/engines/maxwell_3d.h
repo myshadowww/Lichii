@@ -26,6 +26,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/macro_argument_trace.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
@@ -3403,6 +3404,7 @@ private:
     const bool perf_verify = VideoCommon::Nx2Perf::Verify();
     /// Parameters that have been submitted to the macro call so far.
     std::vector<u32> macro_params;
+    std::unique_ptr<MacroArgumentTrace::Invocation> macro_argument_trace;
 
     /// Interpreter for the macro codes uploaded to the GPU.
     std::shared_ptr<NativeMacroContext> native_macro_context;

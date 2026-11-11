@@ -177,9 +177,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "current AMD driver.\nNeeds AMD's FidelityFX runtime, which Lichii downloads from "
               "AMD when you ask. The files are AMD's, under AMD's licence. Without them, or if FSR 4 "
               "can't run, FSR 3.1 is used. Takes effect when a game starts."));
-    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
-           tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
-              "instead of AMD FSR 3.1.\nRequires NVIDIA's runtime files. Use the setup controls "
+    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS for supported games (experimental)"),
+           tr("Uses NVIDIA DLSS to reconstruct supported games and scenes on NVIDIA RTX GPUs.\n"
+              "Requires NVIDIA's runtime files. Use the setup controls "
               "below to download or locate them. Windows uses Streamline; Linux uses native NGX.\n"
               "Fire Emblem: Fortune's Weave uses temporal replacement while this is enabled; "
               "otherwise its spatial workaround remains active.\n"
@@ -193,9 +193,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
 #endif
               ));
     INSERT(Settings, nvidia_dlss_quality, tr("NVIDIA DLSS quality:"),
-           tr("Applies only when a game uses its own DLSS.\nAutomatic selects a mode for the "
-              "game's render/output sizes. Native (DLAA) "
-              "applies anti-aliasing at the game's render resolution, then scales to its output; "
+           tr("Applies to supported games and scenes.\nAutomatic selects a mode for the "
+              "game's render/output sizes. Native (DLAA) requests anti-aliasing at the game's "
+              "render resolution, where supported by its integration; "
               "Ocarina's 1440p mode stays at 1440p instead of reconstructing to 4K.\n"
               "Explicit modes only apply when the game's render size is within NVIDIA's "
               "supported range; otherwise Automatic is used and the fallback is logged. "
@@ -203,7 +203,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "playing."));
     INSERT(
         Settings, nvidia_dlss_preset, tr("NVIDIA DLSS model preset:"),
-        tr("Applies only when a game uses its own DLSS.\nM (DLSS 4.5) is Lichii's default for "
+        tr("Applies to supported games and scenes.\nM (DLSS 4.5) is Lichii's default for "
            "every quality mode. NVIDIA recommends K for "
            "DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.\n"
            "L/M cost more on RTX 20/30 GPUs; consider K. J may reduce ghosting but flicker more. "

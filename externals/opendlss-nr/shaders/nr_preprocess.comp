@@ -11,6 +11,9 @@ layout(set = 0, binding = 1) uniform sampler2D historyPrev;     // rgba16f neura
 layout(set = 0, binding = 2) uniform sampler2D motionTex;       // rg16f: current -> previous, uv units
 layout(std430, set = 0, binding = 3) writeonly buffer Features { vec4 features[]; };   // 4 x vec4 per pixel (coalesced 16 B stores)
 layout(std140, set = 0, binding = 4) uniform Params { NrParams params; };
+#ifdef LICHII_NATIVE_EXPOSURE
+#include "nr_native_exposure.glsl"
+#endif
 
 float hashUniform(uint value) {
   uint mixed = value;
@@ -46,6 +49,13 @@ void main() {
   vec3 scene = vec3(finiteNonnegative(raw.r), finiteNonnegative(raw.g), finiteNonnegative(raw.b));
   vec3 proxy = params.hdrInput == 0u ? clamp(scene, vec3(0), vec3(1)) : vec3(proxyComponent(scene.r, params.paperWhite), proxyComponent(scene.g, params.paperWhite),
                     proxyComponent(scene.b, params.paperWhite));
+#ifdef LICHII_NATIVE_EXPOSURE
+  if (params.hdrInput != 0u && nativeExposure.x > 0.0) {
+    vec3 exposed = nativeExposureForward(scene);
+    proxy = vec3(proxyComponent(exposed.r, 1.0), proxyComponent(exposed.g, 1.0),
+                 proxyComponent(exposed.b, 1.0));
+  }
+#endif
   vec3 centered = vec3(roundF16(roundF16(roundF16(proxy.r) - 0.5) * 0.125),
                        roundF16(roundF16(roundF16(proxy.g) - 0.5) * 0.125),
                        roundF16(roundF16(roundF16(proxy.b) - 0.5) * 0.125));
@@ -55,8 +65,8 @@ void main() {
   // lanes 7-9: the reprojected previous output, centred like the proxy; without a history (a reset, or a surface the
   // previous frame did not show) the current proxy stands in, as on the first frame
   vec3 history = centered;
-  if (params.historyValid != 0u && hasHistory(motionTex, vec2(sourceX, sourceY), vec2(params.validWidth, params.validHeight), params.motionScale, params.motionJitter)) {
-    vec3 h = historySample(historyPrev, motionTex, vec2(sourceX, sourceY), vec2(params.validWidth, params.validHeight), params.motionScale, params.motionJitter);
+  if (params.historyValid != 0u && hasHistory(motionTex, vec2(sourceX, sourceY), vec2(params.validWidth, params.validHeight), params.motionScale, params.motionJitter, params.motionExtent)) {
+    vec3 h = historySample(historyPrev, motionTex, vec2(sourceX, sourceY), vec2(params.validWidth, params.validHeight), params.motionScale, params.motionJitter, params.motionExtent);
     history = vec3(roundF16(roundF16(roundF16(h.r) - 0.5) * 0.125), roundF16(roundF16(roundF16(h.g) - 0.5) * 0.125),
                    roundF16(roundF16(roundF16(h.b) - 0.5) * 0.125));
   }

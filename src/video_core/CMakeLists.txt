@@ -99,6 +99,9 @@ add_library(video_core STATIC
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_failure_capture.h
+    macro_argument_trace.h
+    macro_argument_lifetime.h
     macro_memo.h
     macro_turing.h
     fence_manager.h
@@ -635,6 +638,13 @@ if (ENABLE_NVIDIA_DLSS)
     target_sources(video_core PRIVATE
         renderer_vulkan/vk_nvidia_dlss.cpp
         renderer_vulkan/vk_nvidia_dlss.h
+        renderer_vulkan/scene_camera_math.h
+        renderer_vulkan/vk_yoshi_motion.cpp
+        renderer_vulkan/vk_yoshi_motion.h
+        renderer_vulkan/vk_mario_kart_motion.cpp
+        renderer_vulkan/vk_mario_kart_motion.h
+        renderer_vulkan/vk_scene_upscale.cpp
+        renderer_vulkan/vk_scene_upscale.h
         renderer_vulkan/vk_starfox_dlss.cpp
         renderer_vulkan/vk_starfox_dlss.h
         vulkan_common/nvidia_dlss.h)

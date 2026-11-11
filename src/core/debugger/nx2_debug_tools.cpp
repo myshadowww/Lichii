@@ -220,6 +220,7 @@ json Status(ToolState& state, const json& params) {
                              {"error", dlss.error}};
     result["neural_rendering"] = {{"ready", neural.ready},
                                   {"submitted_frames", neural.submitted_frames},
+                                  {"exposure_history_resets", neural.exposure_history_resets},
                                   {"error", neural.error}};
 #endif
     return result;
