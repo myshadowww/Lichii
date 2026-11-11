@@ -53,7 +53,8 @@ queue underrun; correlate it with these counters.
 The sysmix `full` counter now includes routine ticks that find the deliberately
 filled queue. `retried` remains zero for these ticks because no PCM was copied.
 
-Local desktop validation with the refill fix recorded 120 seconds of the opening
+Local desktop validation on an integration based on `e860139f53`, also containing
+separate rendering fixes, recorded 120 seconds of the opening
 cutscene and 60 seconds of flight training at 48 kHz. Both recordings had no
 stereo zero runs of at least four samples, no held runs of at least twelve samples,
 and no clipped samples after the recording startup exclusion. Full two-second
