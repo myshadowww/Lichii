@@ -63,6 +63,9 @@ for v, f, s in test:
             hits[(g, k)] += 1
             hits[('ALL', k)] += 1
 print('train', len(train), 'test new', len(test))
+if not test:
+    print('the second cache holds no pipeline the first does not: nothing to test')
+    sys.exit(0)
 for g, n in sorted(groups.items(), key=lambda x: -x[1]):
     print('%-22s n=%5d pair-listed=%.2f ' % (g, n, pair_cov[(g, True)] / n) +
           ' '.join('@%d=%.2f' % (k, hits[(g, k)] / n) for k in KS))

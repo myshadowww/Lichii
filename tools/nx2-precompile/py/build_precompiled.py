@@ -27,7 +27,6 @@ import statefields as sf  # noqa: E402
 
 GRAPHICS_KEY = 1056
 STATE_TAIL = GRAPHICS_KEY - 48 - sf.STATE_LEN
-XFB_BIT = 1 << 6
 
 ap = argparse.ArgumentParser()
 ap.add_argument('--inventory', required=True)
@@ -137,7 +136,10 @@ def canonical_key(rec):
     mesh = any(e.stage in (7, 8) for e in rec.envs)
     mask = 0 if mesh else (sf.attribute_read_mask(vertex.sph) if vertex else 0xFFFFFFFF)
     state = sf.canonical(key[48:48 + sf.STATE_LEN], mask)
-    return key[:48] + state + bytes(STATE_TAIL)
+    # Bytes past the prefix are kept where the key's hash covers them (static vertex input, or
+    # transform feedback); otherwise they are cleared, as they are not the pipeline's.
+    tail = key[48 + sf.STATE_LEN:] if sf.hashes_past_prefix(state) else bytes(STATE_TAIL)
+    return key[:48] + state + tail
 
 
 w = Writer()
@@ -178,6 +180,10 @@ for path in args.train:
             continue
         key = canonical_key(rec)
         counts['recorded graphics'] += w.graphics(blobs, key)
+        # The model learns from keys with dynamic vertex input only: without it, the attribute
+        # bytes are the enabled divisors, which no prediction of a dynamic key should take.
+        if sf.hashes_past_prefix(key[48:48 + sf.STATE_LEN]):
+            continue
         if rec.envs[0].stage == 0 and rec.envs[-1].stage == 4 and len(rec.envs) == 2:
             vs, fs = shader_info(rec.envs[0], True), shader_info(rec.envs[-1], False)
             model.add(vs, fs, key[48:48 + sf.STATE_LEN])
@@ -213,8 +219,12 @@ for vh, fh in sorted(pairs):
     vs, fs = oracle_info(vh, True), oracle_info(fh, False)
     added = 0
     for state in model.candidates(vs, fs, args.k + 2):
-        if struct.unpack_from('<I', state, 0)[0] & XFB_BIT:
+        # A predicted key holds the 112-byte prefix only: one whose hash covers more (static
+        # vertex input, transform feedback) could not match a draw.
+        if sf.hashes_past_prefix(state):
             continue
+        # Candidates combine fields of several recorded keys: made canonical as draws are.
+        state = sf.canonical(state, vs['read_mask'])
         key = unique_hashes(int(vh, 16), int(fh, 16)) + state + bytes(STATE_TAIL)
         if w.graphics([oracle[vh], oracle[fh]], key):
             added += 1
@@ -263,6 +273,8 @@ if args.mesh_combos and args.mesh_envs:
                 hs[1] = mesh ^ state_hash
                 blobs = [mblob, oracle[pixel_h]]
             for state in states:
+                if sf.hashes_past_prefix(state):
+                    continue
                 key = struct.pack('<6Q', *hs) + sf.canonical(state, 0) + bytes(STATE_TAIL)
                 counts['predicted mesh'] += w.graphics(blobs, key)
 

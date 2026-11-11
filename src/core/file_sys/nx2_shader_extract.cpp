@@ -17,8 +17,11 @@
 #include <unordered_set>
 
 #include <fmt/format.h>
+#include <lz4.h>
 #include <openssl/evp.h>
+#include <zlib.h>
 #include <zstd.h>
+#include <zstd_errors.h>
 
 #include "core/file_sys/vfs/vfs.h"
 
@@ -26,10 +29,15 @@ namespace FileSys::Nx2ShaderExtract {
 namespace {
 
 constexpr size_t MaxBlob = size_t{1} << 30;       // largest file or inflated member read whole
+constexpr size_t LargeFile = size_t{64} << 20;   // read and walked by one worker at a time
+constexpr size_t InflateReserve = size_t{64} << 20; // largest first buffer a declared size gives
 constexpr size_t PeekBytes = 64 * 1024;           // what a compressed file shows before inflating
 constexpr int MaxDepth = 12;
+constexpr size_t ZipBlockSize = 64 * 1024;
+constexpr u32 EclipseShaderMagic = 0x19866891;
 constexpr std::array<u8, 4> ControlMagic{0x34, 0x12, 0x76, 0x98};
 constexpr std::array<u8, 8> BnshMagic{'B', 'N', 'S', 'H', 0, 0, 0, 0};
+constexpr std::array<u8, 4> ZstdMagic{0x28, 0xB5, 0x2F, 0xFD};
 constexpr u32 KeyControl = 0x48;                  // control bytes in a fingerprint
 
 struct Bad : std::runtime_error {
@@ -166,16 +174,21 @@ std::vector<u8> Inflate(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, size_
         ZSTD_DCtx_refDDict(context, dict);
     }
     const unsigned long long declared = ZSTD_getFrameContentSize(frame.data(), frame.size());
-    size_t reserve = limit;
+    const bool whole = limit >= MaxBlob; // the whole content is wanted, not a peek at its start
+    // The declared size only sizes the first buffer, up to 64 MiB (a frame that doesn't declare
+    // it starts at 64 KiB); the loop below grows the buffer as content arrives.
+    size_t reserve = std::min<size_t>(limit, 1 << 16);
     if (declared != ZSTD_CONTENTSIZE_UNKNOWN && declared != ZSTD_CONTENTSIZE_ERROR) {
-        if (declared > MaxBlob && limit > MaxBlob) {
+        if (declared > MaxBlob && whole) {
             throw Bad(fmt::format("zstd content of {} bytes is too large", declared));
         }
-        reserve = std::min<size_t>(limit, static_cast<size_t>(declared));
+        reserve = static_cast<size_t>(
+            std::min<unsigned long long>({declared, limit, InflateReserve}));
     }
-    std::vector<u8> out(std::min(reserve, MaxBlob));
+    std::vector<u8> out(reserve);
     ZSTD_inBuffer in{frame.data(), frame.size(), 0};
     size_t produced = 0;
+    bool ended = false;
     while (produced < limit) {
         if (produced == out.size()) {
             if (out.size() >= MaxBlob) {
@@ -190,8 +203,12 @@ std::vector<u8> Inflate(const Zstd& zstd, ZSTD_DCtx* context, Bytes frame, size_
         }
         produced += o.pos;
         if (status == 0 || (in.pos == in.size && o.pos == 0)) {
-            break; // end of frame, or no more input
+            ended = true; // end of frame, or no more input
+            break;
         }
+    }
+    if (whole && !ended) {
+        throw Bad("zstd content is too large");
     }
     out.resize(produced);
     return out;
@@ -274,14 +291,23 @@ std::vector<Member> Sarc(Bytes data) {
     return members;
 }
 
+/// What the workers of one extraction share to take turns.
+struct Turns {
+    std::mutex large; ///< held while a large file is read and walked: bounds what workers hold
+    std::mutex reads; ///< held while a file is read, when its storage is not thread-safe
+    bool serial_reads{};
+    std::stop_token stop; ///< Extract's: also checked between the windows of a large file
+};
+
 /// One extraction worker: its zstd context and the place it reports to.
 class Walker {
 public:
     using Found = std::function<void(Stage, Bytes control, Bytes code, std::string origin,
                                      std::string variation)>;
 
-    Walker(const Zstd& zstd_, Found found_, std::vector<std::string>& errors_, Stats& stats_)
-        : zstd{zstd_}, found{std::move(found_)}, errors{errors_}, stats{stats_},
+    Walker(const Zstd& zstd_, Found found_, std::vector<std::string>& errors_, Stats& stats_,
+           Turns& turns_)
+        : zstd{zstd_}, found{std::move(found_)}, errors{errors_}, stats{stats_}, turns{turns_},
           context{ZSTD_createDCtx()} {}
 
     ~Walker() {
@@ -291,22 +317,313 @@ public:
     void File(const VirtualFile& file, const std::string& path) {
         const size_t size = file->GetSize();
         ++stats.files;
-        if (size > MaxBlob) {
-            // Large media and data: only a container at the start would be read whole.
-            const auto head = file->ReadBytes(PeekBytes, 0);
-            stats.file_bytes += head.size();
-            if (!LooksLikeContainer(head)) {
-                return;
-            }
-            errors.push_back(path + ": container larger than 1 GiB was not read");
+        const auto signature = Read([&] { return file->ReadBytes(4, 0); });
+        stats.file_bytes += signature.size();
+        if (signature.size() == 4 &&
+            (Load<u32>(signature, 0) == 0x04034b50 || Starts(signature, "VZIP"))) {
+            std::scoped_lock large{turns.large};
+            Guard(path, [&] { Zip(file, path); });
             return;
         }
-        const std::vector<u8> data = file->ReadAllBytes();
+        if (size > MaxBlob) {
+            // Large media and data: only a container at the start would be read whole.
+            const auto head = Read([&] { return file->ReadBytes(PeekBytes, 0); });
+            stats.file_bytes += head.size();
+            if (LooksLikeContainer(head) && !IsZstd(head)) {
+                errors.push_back(path + ": container larger than 1 GiB was not read");
+                return;
+            }
+            // A pack of separately compressed members (Kirby Air Riders' 16.6 GB asset file):
+            // its zstd frames, read a window at a time.
+            std::scoped_lock large{turns.large};
+            if (!LargeFrames(file, size, path) && IsZstd(head)) {
+                errors.push_back(path + ": zstd frame larger than 64 MiB was not read");
+            }
+            return;
+        }
+        std::unique_lock large{turns.large, std::defer_lock};
+        if (size > LargeFile) {
+            large.lock();
+        }
+        const std::vector<u8> data = Read([&] { return file->ReadAllBytes(); });
         stats.file_bytes += data.size();
         Guard(path, [&] { Top(data, path); });
     }
 
 private:
+    std::vector<u8> ReadZip(const VirtualFile& file, u64 offset, size_t size) {
+        if (offset > file->GetSize() || size > file->GetSize() - offset) {
+            throw Bad("ZIP range past the end");
+        }
+        auto bytes = Read([&] { return file->ReadBytes(size, static_cast<size_t>(offset)); });
+        stats.file_bytes += bytes.size();
+        if (bytes.size() != size) {
+            throw Bad("truncated ZIP read");
+        }
+        return bytes;
+    }
+
+    // Eclipse's data.zip uses stored ZIP entries for raw files and a chain of 64 KiB LZ4
+    // blocks when the compressed and uncompressed sizes differ. The central-directory CRC
+    // covers the inflated bytes. Only shader members are fully read and inflated.
+    void Zip(const VirtualFile& file, const std::string& label) {
+        const size_t size = file->GetSize();
+        const auto tail = ReadZip(file, size - std::min<size_t>(size, 65557),
+                                  std::min<size_t>(size, 65557));
+        std::optional<size_t> end;
+        for (size_t at = tail.size() >= 22 ? tail.size() - 22 : 0; tail.size() >= 22;) {
+            if (Load<u32>(tail, at) == 0x06054b50 &&
+                Load<u16>(tail, at + 20) == tail.size() - at - 22) {
+                end = at;
+                break;
+            }
+            if (at-- == 0) {
+                break;
+            }
+        }
+        if (!end) {
+            throw Bad("ZIP end record missing");
+        }
+        const size_t e = *end;
+        if (Load<u16>(tail, e + 4) != 0 || Load<u16>(tail, e + 6) != 0 ||
+            Load<u16>(tail, e + 8) != Load<u16>(tail, e + 10)) {
+            throw Bad("split ZIP archives are unsupported");
+        }
+        u64 count = Load<u16>(tail, e + 10);
+        u64 directory_size = Load<u32>(tail, e + 12);
+        u64 directory_offset = Load<u32>(tail, e + 16);
+        const u64 end_offset = size - tail.size() + e;
+        u64 directory_limit = end_offset;
+        if (count == 0xffff || directory_size == 0xffffffff || directory_offset == 0xffffffff) {
+            if (end_offset < 20) {
+                throw Bad("ZIP64 locator missing");
+            }
+            const auto locator = ReadZip(file, end_offset - 20, 20);
+            if (Load<u32>(locator, 0) != 0x07064b50 || Load<u32>(locator, 4) != 0 ||
+                Load<u32>(locator, 16) != 1) {
+                throw Bad("invalid ZIP64 locator");
+            }
+            const u64 zip64_offset = Load<u64>(locator, 8);
+            if (zip64_offset > end_offset - 20 || end_offset - 20 - zip64_offset < 56) {
+                throw Bad("ZIP64 end record outside archive");
+            }
+            const auto record = ReadZip(file, zip64_offset, 56);
+            if (Load<u32>(record, 0) != 0x06064b50 || Load<u64>(record, 4) < 44 ||
+                Load<u64>(record, 4) > end_offset - 20 - zip64_offset - 12 ||
+                Load<u32>(record, 16) != 0 || Load<u32>(record, 20) != 0 ||
+                Load<u64>(record, 24) != Load<u64>(record, 32)) {
+                throw Bad("invalid ZIP64 end record");
+            }
+            directory_limit = zip64_offset;
+            count = Load<u64>(record, 32);
+            directory_size = Load<u64>(record, 40);
+            directory_offset = Load<u64>(record, 48);
+        }
+        if (directory_size > LargeFile || count > directory_size / 46 ||
+            directory_offset > directory_limit || directory_size > directory_limit - directory_offset) {
+            throw Bad("ZIP central directory exceeds bounds");
+        }
+        const auto directory = ReadZip(file, directory_offset, static_cast<size_t>(directory_size));
+        size_t at = 0;
+        ++stats.containers;
+        for (u64 index = 0; index < count && !turns.stop.stop_requested(); ++index) {
+            if (at > directory.size() || directory.size() - at < 46 ||
+                Load<u32>(directory, at) != 0x02014b50) {
+                throw Bad("invalid ZIP central directory entry");
+            }
+            const u16 flags = Load<u16>(directory, at + 8);
+            const u16 method = Load<u16>(directory, at + 10);
+            const u32 crc = Load<u32>(directory, at + 16);
+            u64 compressed = Load<u32>(directory, at + 20);
+            u64 unpacked = Load<u32>(directory, at + 24);
+            const size_t name_size = Load<u16>(directory, at + 28);
+            const size_t extra_size = Load<u16>(directory, at + 30);
+            const size_t comment_size = Load<u16>(directory, at + 32);
+            u32 disk = Load<u16>(directory, at + 34);
+            u64 offset = Load<u32>(directory, at + 42);
+            const auto name = Sub(directory, at + 46, name_size);
+            const auto extra = Sub(directory, at + 46 + name_size, extra_size);
+            Sub(directory, at + 46 + name_size + extra_size, comment_size);
+            at += 46 + name_size + extra_size + comment_size;
+            const std::string where = fmt::format("{}/{}", label,
+                std::string_view(reinterpret_cast<const char*>(name.data()), name.size()));
+            Guard(where, [&] {
+                const bool needs_zip64 = unpacked == 0xffffffff || compressed == 0xffffffff ||
+                                         offset == 0xffffffff || disk == 0xffff;
+                bool found_zip64 = false;
+                for (size_t x = 0; x < extra.size();) {
+                    const u16 tag = Load<u16>(extra, x);
+                    const u16 length = Load<u16>(extra, x + 2);
+                    const auto value = Sub(extra, x + 4, length);
+                    x += 4 + length;
+                    if (tag != 1) {
+                        continue;
+                    }
+                    size_t cursor = 0;
+                    const auto take = [&] {
+                        const u64 v = Load<u64>(value, cursor);
+                        cursor += 8;
+                        return v;
+                    };
+                    if (unpacked == 0xffffffff) unpacked = take();
+                    if (compressed == 0xffffffff) compressed = take();
+                    if (offset == 0xffffffff) offset = take();
+                    if (disk == 0xffff) disk = Load<u32>(value, cursor);
+                    found_zip64 = true;
+                    break;
+                }
+                if (needs_zip64 && !found_zip64) {
+                    throw Bad("ZIP64 member fields missing");
+                }
+                if (disk != 0 || (flags & ~u16{0x0808}) != 0 || method != 0) {
+                    throw Bad("unsupported ZIP member encoding");
+                }
+                if (unpacked > MaxBlob || compressed > MaxBlob) {
+                    throw Bad("ZIP member larger than 1 GiB");
+                }
+                if (offset > directory_offset || directory_offset - offset < 30) {
+                    throw Bad("ZIP local header outside data region");
+                }
+                const auto local = ReadZip(file, offset, 30);
+                if (Load<u32>(local, 0) != 0x04034b50 || Load<u16>(local, 6) != flags ||
+                    Load<u16>(local, 8) != method) {
+                    throw Bad("ZIP local header disagrees with central directory");
+                }
+                const u64 data_offset = offset + 30 + Load<u16>(local, 26) + Load<u16>(local, 28);
+                if (data_offset > directory_offset || compressed > directory_offset - data_offset) {
+                    throw Bad("ZIP member outside data region");
+                }
+                if (unpacked < 24) {
+                    return;
+                }
+                std::vector<u8> first;
+                u64 used = 0;
+                const bool lz4 = compressed != unpacked;
+                const auto block = [&](std::span<u8> output, std::span<const u8> dictionary) {
+                    if (used > compressed || compressed - used < 4) {
+                        throw Bad("truncated ZIP LZ4 block length");
+                    }
+                    const auto length_bytes = ReadZip(file, data_offset + used, 4);
+                    const u32 length = Load<u32>(length_bytes, 0);
+                    used += 4;
+                    if (length == 0 || length > compressed - used ||
+                        length > static_cast<u32>(LZ4_compressBound(ZipBlockSize))) {
+                        throw Bad("ZIP LZ4 block exceeds bounds");
+                    }
+                    const auto input = ReadZip(file, data_offset + used, length);
+                    used += length;
+                    const int decoded = LZ4_decompress_safe_usingDict(
+                        reinterpret_cast<const char*>(input.data()),
+                        reinterpret_cast<char*>(output.data()), static_cast<int>(input.size()),
+                        static_cast<int>(output.size()),
+                        reinterpret_cast<const char*>(dictionary.data()),
+                        static_cast<int>(dictionary.size()));
+                    if (decoded != static_cast<int>(output.size())) {
+                        throw Bad("ZIP LZ4 block has wrong decoded length");
+                    }
+                };
+                if (lz4) {
+                    first.resize(static_cast<size_t>(std::min<u64>(unpacked, ZipBlockSize)));
+                    block(first, {});
+                } else {
+                    first = ReadZip(file, data_offset,
+                                    static_cast<size_t>(std::min<u64>(unpacked, ZipBlockSize)));
+                }
+                if (Load<u32>(first, 0) != EclipseShaderMagic) {
+                    return;
+                }
+                std::vector<u8> bytes(static_cast<size_t>(unpacked));
+                std::ranges::copy(first, bytes.begin());
+                if (lz4) {
+                    size_t done = first.size();
+                    while (done < bytes.size() && !turns.stop.stop_requested()) {
+                        const size_t amount = std::min(ZipBlockSize, bytes.size() - done);
+                        const size_t dictionary_size = std::min(ZipBlockSize, done);
+                        block(std::span{bytes}.subspan(done, amount),
+                              std::span<const u8>{bytes}.subspan(done - dictionary_size,
+                                                                dictionary_size));
+                        done += amount;
+                    }
+                    if (turns.stop.stop_requested()) {
+                        return;
+                    }
+                    if (used != compressed) {
+                        throw Bad("trailing ZIP LZ4 bytes");
+                    }
+                    stats.inflated_bytes += bytes.size();
+                } else if (first.size() != bytes.size()) {
+                    const auto rest = ReadZip(file, data_offset + first.size(),
+                                               bytes.size() - first.size());
+                    std::ranges::copy(rest, bytes.begin() + first.size());
+                }
+                if (crc32(0, bytes.data(), static_cast<uInt>(bytes.size())) != crc) {
+                    throw Bad("ZIP member CRC mismatch");
+                }
+                EclipseShader(bytes, where);
+            });
+        }
+        if (!turns.stop.stop_requested() && at != directory.size()) {
+            throw Bad("trailing ZIP central directory bytes");
+        }
+    }
+
+    void EclipseShader(Bytes data, const std::string& label) {
+        const size_t code_size = Load<u32>(data, 4);
+        const size_t control_size = Load<u32>(data, 8);
+        if (code_size < 4 || control_size < KeyControl || data.size() < 24 ||
+            code_size > data.size() - 24 || control_size != data.size() - 24 - code_size) {
+            throw Bad("Eclipse shader sizes do not match the member");
+        }
+        const auto code = Sub(data, 24, code_size);
+        const auto control = Sub(data, 24 + code_size, control_size);
+        if (!Consistent(control, code) || Load<u32>(control, 0x30) != control_size) {
+            throw Bad("Eclipse shader control does not match its code");
+        }
+        const auto stage = Nvn2Stage(control, code);
+        if (!stage) {
+            throw Bad("Eclipse shader stage is unknown");
+        }
+        ++stats.containers;
+        Emit(*stage, control, code, label, label);
+    }
+
+    /// The zstd frames of a file too large to read whole, a window of LargeFile bytes at a
+    /// time; a frame that runs past a window's end starts the next window. A frame larger than
+    /// a window is not read, and a file whose first 1 GiB holds no frame (media, or data in
+    /// another form) is not read further. Whether any frame was found.
+    bool LargeFrames(const VirtualFile& file, size_t size, const std::string& path) {
+        const u64 frames_before = stats.embedded_frames + stats.embedded_failed;
+        const auto any_frame = [&] {
+            return stats.embedded_frames + stats.embedded_failed != frames_before;
+        };
+        size_t offset = 0;
+        while (offset < size && !turns.stop.stop_requested()) {
+            const size_t want = std::min(LargeFile, size - offset);
+            const auto window = Read([&] { return file->ReadBytes(want, offset); });
+            if (window.empty()) {
+                break;
+            }
+            stats.file_bytes += window.size();
+            const bool last = offset + window.size() >= size;
+            const size_t used = EmbeddedZstd(window, path, 0, last, offset);
+            // Step back to a frame cut by the window's end, unless it fills the whole window.
+            offset += used != 0 ? used : window.size();
+            if (offset >= MaxBlob && !any_frame()) {
+                break;
+            }
+        }
+        return any_frame();
+    }
+
+    template <typename F>
+    std::vector<u8> Read(F&& read) {
+        std::unique_lock lock{turns.reads, std::defer_lock};
+        if (turns.serial_reads) {
+            lock.lock();
+        }
+        return read();
+    }
+
     template <typename F>
     void Guard(const std::string& where, F&& f) {
         try {
@@ -351,7 +668,9 @@ private:
         if (depth > MaxDepth || data.size() < 8) {
             return;
         }
-        if (IsZstd(data)) {
+        if (Load<u32>(data, 0) == EclipseShaderMagic) {
+            EclipseShader(data, label);
+        } else if (IsZstd(data)) {
             const auto inner = Inflate(zstd, context, data, MaxBlob);
             stats.inflated_bytes += inner.size();
             Walk(inner, label, depth + 1);
@@ -376,10 +695,105 @@ private:
             Ndve(data, label);
         } else {
             // BNSH files, and BNSH inside other data (BFSHA archives, effect bundles, layouts).
-            if (!EmbeddedBnsh(data, label)) {
-                SeadPrimitive(data, label);
+            if (!EmbeddedBnsh(data, label) && !SeadPrimitive(data, label)) {
+                BarePrograms(data, label);
+                EmbeddedZstd(data, label, depth, true);
             }
         }
+    }
+
+    /// NVN2 programs stored bare in data no reader here knows: a control section followed by its
+    /// code (Kirby Air Riders' PMAP members hold a vertex and a pixel program, or a compute one,
+    /// this way). The programs of one piece of data are recorded as drawn together only when it
+    /// holds at most one of each stage; otherwise each is a variation of its own.
+    void BarePrograms(Bytes data, const std::string& label) {
+        struct Piece {
+            Stage stage;
+            size_t base;
+            Bytes control, code;
+        };
+        std::vector<Piece> pieces;
+        auto it = data.begin();
+        while ((it = std::search(it, data.end(), ControlMagic.begin(), ControlMagic.end())) !=
+               data.end()) {
+            const size_t base = static_cast<size_t>(it - data.begin());
+            ++it;
+            if (data.size() - base < KeyControl || !IsNvn2Control(data.subspan(base, KeyControl))) {
+                continue;
+            }
+            const size_t own = std::max<size_t>(Load<u32>(data, base + 0x30), KeyControl);
+            const size_t n = Load<u32>(data, base + 0x44);
+            if (n < 4 || own > data.size() - base || n > data.size() - base - own) {
+                continue;
+            }
+            const auto control = data.subspan(base, own);
+            const auto code = data.subspan(base + own, n);
+            const auto stage = Nvn2Stage(control, code);
+            if (!stage) {
+                continue;
+            }
+            pieces.push_back({*stage, base, control, code});
+            it = data.begin() + static_cast<std::ptrdiff_t>(base + own + n);
+        }
+        if (pieces.empty()) {
+            return;
+        }
+        ++stats.containers;
+        std::unordered_set<Stage> stages;
+        bool one_each = true;
+        for (const auto& piece : pieces) {
+            one_each = one_each && stages.insert(piece.stage).second;
+        }
+        for (const auto& piece : pieces) {
+            const std::string variation =
+                one_each ? label : fmt::format("{}#program@{:#x}", label, piece.base);
+            Emit(piece.stage, piece.control, piece.code, label, variation);
+        }
+    }
+
+    /// Zstd frames inside data no reader here knows, such as a pack of separately compressed
+    /// members behind its own catalog (Kirby Air Riders): each frame is inflated and walked like
+    /// a file of its own. A frame must parse to its end inside the data before it is inflated,
+    /// so a stray magic costs no inflation; one that still fails is counted, not reported, since
+    /// the frame was only a guess. Unless `whole`, the data is a window of a larger file: a
+    /// frame cut by its end stops the scan, and its offset is returned (0 when none was cut).
+    /// `origin` is the data's offset in `label`'s file, for the frames' labels.
+    size_t EmbeddedZstd(Bytes data, const std::string& label, int depth, bool whole,
+                        size_t origin = 0) {
+        size_t base = 0;
+        while (base + ZstdMagic.size() <= data.size()) {
+            const auto* const start = data.data() + base;
+            const auto* const hit = static_cast<const u8*>(
+                std::memchr(start, ZstdMagic[0], data.size() - base - (ZstdMagic.size() - 1)));
+            if (!hit) {
+                return 0;
+            }
+            base = static_cast<size_t>(hit - data.data());
+            if (std::memcmp(hit, ZstdMagic.data(), ZstdMagic.size()) != 0) {
+                ++base;
+                continue;
+            }
+            const size_t size = ZSTD_findFrameCompressedSize(hit, data.size() - base);
+            if (ZSTD_isError(size)) {
+                if (!whole && base != 0 &&
+                    ZSTD_getErrorCode(size) == ZSTD_error_srcSize_wrong) {
+                    return base; // runs past the window: the next window starts here
+                }
+                ++base;
+                continue;
+            }
+            const std::string where = fmt::format("{}#zstd@{:#x}", label, origin + base);
+            try {
+                const auto inner = Inflate(zstd, context, data.subspan(base, size), MaxBlob);
+                ++stats.embedded_frames;
+                stats.inflated_bytes += inner.size();
+                Guard(where, [&] { Walk(inner, where, depth + 1); });
+            } catch (const Bad&) {
+                ++stats.embedded_failed;
+            }
+            base += size;
+        }
+        return 0;
     }
 
     void Emit(Stage stage, Bytes control, Bytes code, std::string origin, std::string variation) {
@@ -714,9 +1128,9 @@ private:
 
     // sead's NVN2 primitive drawer: four u32 offsets (vertex control, pixel control, vertex
     // code, pixel code); each control section names its own length (+0x30) and its code's (+0x44).
-    void SeadPrimitive(Bytes d, const std::string& label) {
+    bool SeadPrimitive(Bytes d, const std::string& label) {
         if (d.size() < 0x10 || d.size() > (1u << 20)) {
-            return;
+            return false;
         }
         const u32 vc = Load<u32>(d, 0), pc = Load<u32>(d, 4), vk = Load<u32>(d, 8),
                   pk = Load<u32>(d, 12);
@@ -729,20 +1143,20 @@ private:
                                           std::tuple{Stage::Fragment, pc, pk}}) {
             if (c < 0x10 || u64{c} + KeyControl > d.size() ||
                 !IsNvn2Control(d.subspan(c, KeyControl))) {
-                return;
+                return false;
             }
             const u32 own = std::max<u32>(Load<u32>(d, c + 0x30), KeyControl);
             if (u64{c} + own > d.size()) {
-                return;
+                return false;
             }
             const auto control = d.subspan(c, own);
             const u32 n = Load<u32>(control, 0x44);
             if (u64{k} + n > d.size()) {
-                return;
+                return false;
             }
             const auto code = d.subspan(k, n);
             if (Nvn2Stage(control, code) != stage) {
-                return;
+                return false;
             }
             pieces.push_back({stage, control, code});
         }
@@ -751,12 +1165,14 @@ private:
         for (const auto& piece : pieces) {
             Emit(piece.stage, piece.control, piece.code, variation, variation);
         }
+        return true;
     }
 
     const Zstd& zstd;
     Found found;
     std::vector<std::string>& errors;
     Stats& stats;
+    Turns& turns;
     ZSTD_DCtx* context;
 };
 
@@ -845,7 +1261,7 @@ u64 Fingerprint(std::span<const u8> control, std::span<const u8> code) {
 }
 
 Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* progress,
-               std::stop_token stop) {
+               std::stop_token stop, bool serial_reads) {
     Zstd zstd;
     const bool dictionary_pack = LoadDictionaries(roots, zstd);
     std::vector<FileItem> files;
@@ -872,6 +1288,9 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
     std::atomic<size_t> next{0};
     std::vector<std::vector<std::string>> errors(count);
     std::vector<Stats> stats(count);
+    Turns turns;
+    turns.serial_reads = serial_reads;
+    turns.stop = stop;
     const auto work = [&](unsigned worker) {
         size_t current = 0;
         Walker walker(
@@ -899,7 +1318,7 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
                     members.push_back(it->second.index);
                 }
             },
-            errors[worker], stats[worker]);
+            errors[worker], stats[worker], turns);
         while (!stop.stop_requested()) {
             current = next.fetch_add(1);
             if (current >= files.size()) {
@@ -928,6 +1347,8 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
         result.stats.inflated_bytes += stats[i].inflated_bytes;
         result.stats.peeked_only += stats[i].peeked_only;
         result.stats.containers += stats[i].containers;
+        result.stats.embedded_frames += stats[i].embedded_frames;
+        result.stats.embedded_failed += stats[i].embedded_failed;
         result.stats.occurrences += stats[i].occurrences;
     }
     if (dictionary_pack && zstd.Count() == 0) {
