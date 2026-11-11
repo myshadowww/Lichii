@@ -35,6 +35,7 @@
 #include "ui_configure_graphics.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics.h"
+#include "yuzu/configuration/graphics_settings.h"
 #include "yuzu/configuration/amd_fsr4_panel.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 #include "yuzu/configuration/shared_widget.h"
@@ -218,14 +219,23 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     api_grid_layout->setContentsMargins(0, 0, 0, 0);
     api_layout->addWidget(api_grid_widget);
 
-    QLayout& graphics_layout = *ui->graphics_widget->layout();
+    using Section = ConfigurationShared::GraphicsSection;
+    const std::map<Section, QLayout*> layouts{
+        {Section::Display, ui->display_layout},
+        {Section::ImageQuality, ui->image_quality_layout},
+        {Section::Upscaling, ui->upscaling_layout},
+        {Section::NeuralRendering, ui->neural_rendering_layout},
+        {Section::FrameGeneration, ui->frame_generation_layout},
+    };
+    const auto settings =
+        ConfigurationShared::GetGraphicsSettings(ConfigurationShared::GraphicsPage::Graphics);
 
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
     QCheckBox* nvidia_dlss_checkbox = nullptr;
 
-    for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
+    for (const auto setting : settings) {
 #ifndef HAS_RESHADE
         if (setting->Id() == Settings::values.post_shader_enabled.Id()) {
             continue;
@@ -241,7 +251,9 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #endif
 #ifndef EGLANTINE_NGX
         if (setting->Id() == Settings::values.neural_rendering.Id() ||
-            setting->Id() == Settings::values.neural_rendering_strength.Id()) {
+            setting->Id() == Settings::values.neural_rendering_strength.Id() ||
+            setting->Id() == Settings::values.neural_rendering_tone.Id() ||
+            setting->Id() == Settings::values.neural_rendering_structure.Id()) {
             continue;
         }
 #endif
@@ -393,9 +405,13 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         }
     }
 
-    for (const auto& [id, widget] : hold_graphics) {
-        graphics_layout.addWidget(widget);
+    for (const auto* setting : settings) {
+        if (const auto it = hold_graphics.find(setting->Id()); it != hold_graphics.end()) {
+            layouts.at(ConfigurationShared::GetGraphicsSection(*setting))->addWidget(it->second);
+        }
     }
+    ui->display_layout->addWidget(ui->bg_widget);
+    ui->neural_rendering_group->setVisible(ui->neural_rendering_layout->count() != 0);
 
     // Hide rather than disable, a disabled widget would read as using the global value
     if (frame_gen_checkbox != nullptr) {

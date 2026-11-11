@@ -15,6 +15,7 @@
 #include "ui_configure_graphics_extensions.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics_extensions.h"
+#include "yuzu/configuration/graphics_settings.h"
 #include "yuzu/configuration/shared_widget.h"
 
 ConfigureGraphicsExtensions::ConfigureGraphicsExtensions(
@@ -35,12 +36,8 @@ ConfigureGraphicsExtensions::~ConfigureGraphicsExtensions() = default;
 void ConfigureGraphicsExtensions::SetConfiguration() {}
 
 void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& builder) {
-    auto& layout = *ui->populate_target->layout();
-
-    std::map<u32, QWidget*> hold{}; // A map will sort the data for us
-
-    for (auto setting :
-         Settings::values.linkage.by_category[Settings::Category::RendererExtensions]) {
+    for (auto* setting : ConfigurationShared::GetGraphicsSettings(
+             ConfigurationShared::GraphicsPage::Compatibility)) {
         ConfigurationShared::Widget* widget = [&]() {
             if (setting->Id() == Settings::values.sample_shading.Id()) {
                 // TODO(crueter): should support this natively perhaps?
@@ -60,7 +57,11 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
             continue;
         }
 
-        hold.emplace(setting->Id(), widget);
+        auto* layout = ConfigurationShared::GetGraphicsSection(*setting) ==
+                               ConfigurationShared::GraphicsSection::Vulkan
+                           ? ui->vulkan_layout
+                           : ui->hacks_layout;
+        layout->addWidget(widget);
 
 #ifdef __APPLE__
         if (setting->Id() == Settings::values.dyna_state.Id()) {
@@ -69,32 +70,6 @@ void ConfigureGraphicsExtensions::Setup(const ConfigurationShared::Builder& buil
                                   "compatibility issues that cause black screens."));
         }
 #endif
-    }
-
-    for (const auto& [id, widget] : hold) {
-        layout.addWidget(widget);
-    }
-
-    auto& hacks = *ui->hacks_target->layout();
-    std::map<u32, QWidget*> hacks_hold{}; // A map will sort the data for us
-
-    for (auto setting : Settings::values.linkage.by_category[Settings::Category::RendererHacks]) {
-        auto* widget = builder.BuildWidget(setting, apply_funcs);
-
-        if (widget == nullptr) {
-            continue;
-        }
-
-        if (!widget->Valid()) {
-            widget->deleteLater();
-            continue;
-        }
-
-        hacks_hold.emplace(setting->Id(), widget);
-    }
-
-    for (const auto& [id, widget] : hacks_hold) {
-        hacks.addWidget(widget);
     }
 }
 

@@ -13,6 +13,7 @@
 #include "ui_configure_graphics_advanced.h"
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"
+#include "yuzu/configuration/graphics_settings.h"
 #include "yuzu/configuration/shared_widget.h"
 
 ConfigureGraphicsAdvanced::ConfigureGraphicsAdvanced(
@@ -33,21 +34,18 @@ ConfigureGraphicsAdvanced::~ConfigureGraphicsAdvanced() = default;
 
 void ConfigureGraphicsAdvanced::SetConfiguration() {}
 
-/// Build advanced graphics controls, exposing neural adjustments only with the native backend.
 void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builder) {
-    auto& normal_layout = *ui->normal_target->layout();
+    using Section = ConfigurationShared::GraphicsSection;
+    const std::map<Section, QLayout*> layouts{
+        {Section::Accuracy, ui->accuracy_layout},
+        {Section::Shaders, ui->shaders_layout},
+        {Section::Memory, ui->memory_layout},
+        {Section::Performance, ui->performance_layout},
+        {Section::Diagnostics, ui->diagnostics_layout},
+    };
 
-    // A map will sort the data for us
-    std::map<u32, QWidget*> normal_hold{};
-
-    for (auto setting :
-         Settings::values.linkage.by_category[Settings::Category::RendererAdvanced]) {
-#ifndef EGLANTINE_NGX
-        if (setting->Id() == Settings::values.neural_rendering_tone.Id() ||
-            setting->Id() == Settings::values.neural_rendering_structure.Id()) {
-            continue;
-        }
-#endif
+    for (auto* setting : ConfigurationShared::GetGraphicsSettings(
+             ConfigurationShared::GraphicsPage::Advanced)) {
         ConfigurationShared::Widget* widget = builder.BuildWidget(setting, apply_funcs);
 
         if (widget == nullptr) {
@@ -58,18 +56,12 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
             continue;
         }
 
-        const auto id = setting->Id();
-
-        normal_hold.emplace(id, widget);
+        layouts.at(ConfigurationShared::GetGraphicsSection(*setting))->addWidget(widget);
 
         // Keep track of enable_compute_pipelines so we can display it when needed
         if (setting->Id() == Settings::values.enable_compute_pipelines.Id()) {
             checkbox_enable_compute_pipelines = widget;
         }
-    }
-
-    for (const auto& [id, widget] : normal_hold) {
-        normal_layout.addWidget(widget);
     }
 }
 

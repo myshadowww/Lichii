@@ -84,13 +84,13 @@ and GPU selection still require restarting the game.
 Neural controls range from **0–100%** and default to **100%**, preserving the
 existing appearance:
 
-- **Graphics → Neural rendering strength:** blends ordinary DLSS/DLAA with the
+- **Graphics → Neural Rendering → Neural rendering strength:** blends ordinary DLSS/DLAA with the
   neural result. At 0%, the original DLSS/DLAA image is shown; 100% applies the full
   effect. The model continues running at low or zero strength, so GPU cost stays
   roughly the same. Select neural rendering **Off** to release its GPU resources.
-- **Graphics → Advanced → Neural rendering tone:** adjusts the model's tonal
+- **Graphics → Neural Rendering → Neural rendering tone:** adjusts the model's tonal
   treatment, including style-dependent lighting and colour changes.
-- **Graphics → Advanced → Neural rendering structure:** adjusts the model's
+- **Graphics → Neural Rendering → Neural rendering structure:** adjusts the model's
   changes to scene detail and shapes. Lower values can help retain the original
   appearance.
 
