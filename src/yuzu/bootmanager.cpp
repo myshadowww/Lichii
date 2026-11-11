@@ -764,17 +764,21 @@ bool GRenderWindow::InitRenderTarget() {
     // Update the Window System information with the new render target
     window_info = QtCommon::GetWindowSystemInfo(child_widget->windowHandle());
 
+#if !defined(__linux__) || defined(__ANDROID__)
     const auto target_width = Settings::IsDockedMode() ? Layout::ScreenDocked::Width : Layout::ScreenUndocked::Width;
     const auto target_height = Settings::IsDockedMode() ? Layout::ScreenDocked::Height : Layout::ScreenUndocked::Height;
 
     child_widget->resize(target_width, target_height);
+#endif
     layout()->addWidget(child_widget);
     // Reset minimum required size to avoid resizing issues on the main window after restarting.
     setMinimumSize(1, 1);
 
+#if !defined(__linux__) || defined(__ANDROID__)
     resize(target_width, target_height);
 
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
+#endif
     OnFramebufferSizeChanged();
     BackupGeometry();
 
