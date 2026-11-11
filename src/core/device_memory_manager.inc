@@ -213,6 +213,10 @@ DeviceMemoryManager<Traits>::~DeviceMemoryManager() = default;
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::HintCold(DAddr address, size_t size) {
+    // GPU-only images have synthetic cache addresses, not entries in the device page table.
+    if (size == 0 || address >= device_as_size || size > device_as_size - address) {
+        return;
+    }
     struct Run {
         u64 physical_offset;
         VAddr virtual_address; ///< 0: no CPU mapping known

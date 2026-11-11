@@ -2226,7 +2226,8 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
             ForEachSparseSegment(image, [&](GPUVAddr, DAddr address, size_t size) {
                 uploaded_ranges.emplace_back(address, size);
             });
-        } else {
+        } else if (image.cpu_addr < ~(1ULL << 40)) {
+            // ImageCpuAddress uses the upper sentinel range for images without CPU backing.
             uploaded_ranges.emplace_back(image.cpu_addr, image.guest_size_bytes);
         }
     }
