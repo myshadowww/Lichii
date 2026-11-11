@@ -166,6 +166,16 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
               "of the AMD FSR 1 and SGSR window adapting filters."));
+    INSERT(Settings, ocarina_fsr, tr("Use AMD FSR 3.1 upscaling in Ocarina of Time"),
+           tr("Replaces Ocarina of Time's native upscaler using scene depth and camera motion. "
+              "Works on any supported Vulkan GPU. NVIDIA DLSS takes precedence when enabled and "
+              "available. RCAS Sharpness controls sharpening. Takes effect when a game starts."));
+    INSERT(Settings, amd_fsr4, tr("Use AMD FSR 4 in place of FSR 3.1"),
+           tr("Uses AMD's ML-based FSR 4 where FSR replaces a game's upscaler (Ocarina of Time "
+              "with the setting above). Radeon RX 6000 or newer, or a Ryzen AI processor, with a "
+              "current AMD driver.\nNeeds AMD's FidelityFX runtime, which Lichii downloads from "
+              "AMD when you ask. The files are AMD's, under AMD's licence. Without them, or if FSR 4 "
+              "can't run, FSR 3.1 is used. Takes effect when a game starts."));
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nRequires NVIDIA's runtime files. Use the setup controls "
@@ -173,13 +183,33 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Fire Emblem: Fortune's Weave also needs "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
               "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
-              "upscaler at 1x resolution scale.\nTakes effect when a game starts."));
+              "upscaler at 1x resolution scale.\n"
+#ifdef __linux__
+              "Can be switched during gameplay with Apply. Install the runtime files before "
+              "starting the game."
+#else
+              "Takes effect when a game starts."
+#endif
+              ));
     INSERT(Settings, nvidia_dlss_quality, tr("NVIDIA DLSS quality:"),
-           tr("Automatic preserves the game's supported upscaling path.\n"
-              "Native (DLAA) applies anti-aliasing at the game's render resolution. "
-              "In Ocarina's 1440p mode, this keeps the scene and output at 1440p instead of "
-              "upscaling to 4K.\nRequires NVIDIA DLSS to be enabled. Apply changes while playing; "
-              "switching resolution may briefly pause rendering."));
+           tr("Applies only when a game uses its own DLSS.\nAutomatic selects a mode for the "
+              "game's render/output sizes. Native (DLAA) "
+              "applies anti-aliasing at the game's render resolution, then scales to its output; "
+              "Ocarina's 1440p mode stays at 1440p instead of reconstructing to 4K.\n"
+              "Explicit modes only apply when the game's render size is within NVIDIA's "
+              "supported range; otherwise Automatic is used and the fallback is logged. "
+              "This does not change the game's render resolution. Apply/OK updates it while "
+              "playing."));
+    INSERT(
+        Settings, nvidia_dlss_preset, tr("NVIDIA DLSS model preset:"),
+        tr("Applies only when a game uses its own DLSS.\nM (DLSS 4.5) is Lichii's default for "
+           "every quality mode. NVIDIA recommends K for "
+           "DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.\n"
+           "L/M cost more on RTX 20/30 GPUs; consider K. J may reduce ghosting but flicker more. "
+           "E/F are deprecated CNN models. NVIDIA default lets the runtime choose.\n"
+           "L/M require DLSS 310.5 or newer; the download button provides 310.9.16. "
+           "If Fire Emblem shows horizontal lines with L/M at 2x, try K. "
+           "NVIDIA app overrides may supersede this choice. Apply/OK updates it while playing."));
     INSERT(Settings, neural_rendering, tr("DLSS neural rendering:"),
            tr("Re-renders the scene after NVIDIA DLSS using the Standard, Natural or Cinematic "
               "style.\n"
@@ -490,6 +520,21 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(SpirvOptimizeMode, OnLoad, tr("On Load")),
                               PAIR(SpirvOptimizeMode, Always, tr("Always")),
                           }});
+    translations->insert({Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Index(),
+                          {PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (game resolution)")),
+                           PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),
+                           PAIR(NvidiaDlssQuality, Quality, tr("Quality")),
+                           PAIR(NvidiaDlssQuality, Balanced, tr("Balanced")),
+                           PAIR(NvidiaDlssQuality, Performance, tr("Performance")),
+                           PAIR(NvidiaDlssQuality, UltraPerformance, tr("Ultra Performance"))}});
+    translations->insert(
+        {Settings::EnumMetadata<Settings::NvidiaDlssPreset>::Index(),
+         {PAIR(NvidiaDlssPreset, M, tr("M (DLSS 4.5, default)")),
+          PAIR(NvidiaDlssPreset, NvidiaDefault, tr("NVIDIA default")),
+          PAIR(NvidiaDlssPreset, E, tr("E (legacy CNN)")),
+          PAIR(NvidiaDlssPreset, F, tr("F (legacy CNN)")),
+          PAIR(NvidiaDlssPreset, J, tr("J (DLSS 4)")), PAIR(NvidiaDlssPreset, K, tr("K (DLSS 4)")),
+          PAIR(NvidiaDlssPreset, L, tr("L (DLSS 4.5)"))}});
     translations->insert({Settings::EnumMetadata<Settings::AstcDecodeMode>::Index(),
                           {
                               PAIR(AstcDecodeMode, Cpu, tr("CPU")),
@@ -624,11 +669,6 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
-                          }});
-    translations->insert({Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Index(),
-                          {
-                              PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (upscaling)")),
-                              PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::NeuralRendering>::Index(),
                           {

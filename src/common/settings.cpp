@@ -13,11 +13,11 @@
 #include <atomic>
 #include <compare>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <string_view>
 #include <type_traits>
-#include <deque>
 #include <fmt/core.h>
 
 #include "common/settings_enums.h"
@@ -50,6 +50,7 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(NeuralRendering, false);
+SWITCHABLE(NvidiaDlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -92,15 +93,17 @@ namespace {
 std::atomic<u64> nvidia_dlss_runtime_options{(u64{100} << 16) | (u64{100} << 24) | (u64{100} << 32)};
 } // namespace
 
-/// Publish quality, style and neural percentages together after frontend settings are applied.
+/// Publish enablement, quality, style and neural percentages after frontend settings are applied.
 void RefreshNvidiaDlssRuntimeSettings() {
     const auto quality = static_cast<u64>(values.nvidia_dlss_quality.GetValue());
     const auto neural = static_cast<u64>(values.neural_rendering.GetValue());
     const auto strength = static_cast<u64>(values.neural_rendering_strength.GetValue());
     const auto tone = static_cast<u64>(values.neural_rendering_tone.GetValue());
     const auto structure = static_cast<u64>(values.neural_rendering_structure.GetValue());
+    const auto enabled = static_cast<u64>(values.nvidia_dlss.GetValue());
     nvidia_dlss_runtime_options.store(
-        quality | (neural << 8) | (strength << 16) | (tone << 24) | (structure << 32),
+        quality | (neural << 8) | (strength << 16) | (tone << 24) | (structure << 32) |
+            (enabled << 40) | (static_cast<u64>(values.nvidia_dlss_preset.GetValue()) << 48),
         std::memory_order_relaxed);
 }
 
@@ -111,7 +114,9 @@ NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
             static_cast<NeuralRendering>((options >> 8) & 0xff),
             static_cast<u32>((options >> 16) & 0xff),
             static_cast<u32>((options >> 24) & 0xff),
-            static_cast<u32>((options >> 32) & 0xff)};
+            static_cast<u32>((options >> 32) & 0xff),
+            ((options >> 40) & 1) != 0,
+            static_cast<NvidiaDlssPreset>((options >> 48) & 0xff)};
 }
 
 std::string GetTimeZoneString(TimeZone time_zone) {

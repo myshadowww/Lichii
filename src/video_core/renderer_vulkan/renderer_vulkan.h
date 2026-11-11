@@ -67,6 +67,10 @@ public:
 #endif
     }
 
+#ifdef EGLANTINE_NVIDIA_DLSS
+    [[nodiscard]] VideoCore::DlssStatus GetDlssStatus() const override;
+#endif
+
     // Enhanced platform-specific initialization
     void InitializePlatformSpecific();
 

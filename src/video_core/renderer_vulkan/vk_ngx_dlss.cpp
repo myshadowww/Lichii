@@ -8,6 +8,9 @@
 #include <fmt/format.h>
 #include "common/logging.h"
 #include "common/settings.h"
+#include "common/scope_exit.h"
+#include "video_core/dlss_mode.h"
+#include "video_core/renderer_base.h"
 #include "video_core/neural_rendering/backend.h"
 #include "video_core/neural_rendering/model.h"
 #include "video_core/neural_rendering/runtime.h"
@@ -29,30 +32,64 @@ int EnvInt(const char *name, int fallback) {
     return value ? std::atoi(value) : fallback;
 }
 
-/// Choose DLAA or a DLSS quality mode from the render-to-output width ratio.
-NVSDK_NGX_PerfQuality_Value ModeFor(VkExtent2D render, VkExtent2D output) {
-    const float ratio = static_cast<float>(render.width) / static_cast<float>(output.width);
-    if (ratio >= 0.99f)
-        return NVSDK_NGX_PerfQuality_Value_DLAA;
-    if (ratio >= 0.65f)
-        return NVSDK_NGX_PerfQuality_Value_MaxQuality;
-    if (ratio >= 0.57f)
-        return NVSDK_NGX_PerfQuality_Value_Balanced;
-    if (ratio >= 0.49f)
-        return NVSDK_NGX_PerfQuality_Value_MaxPerf;
-    return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+std::atomic<u64> evaluations{};
+std::atomic<u32> last_evaluation{};
+
+NVSDK_NGX_PerfQuality_Value ModeFor(Settings::NvidiaDlssQuality mode) {
+    using Quality = Settings::NvidiaDlssQuality;
+    switch (mode) {
+    case Quality::Native: return NVSDK_NGX_PerfQuality_Value_DLAA;
+    case Quality::Quality: return NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    case Quality::Balanced: return NVSDK_NGX_PerfQuality_Value_Balanced;
+    case Quality::Performance: return NVSDK_NGX_PerfQuality_Value_MaxPerf;
+    case Quality::UltraPerformance: return NVSDK_NGX_PerfQuality_Value_UltraPerformance;
+    case Quality::Automatic: break;
+    }
+    return NVSDK_NGX_PerfQuality_Value_MaxQuality;
 }
 
-/// Read the supported DLSS preset override, defaulting to preset K.
-unsigned Preset() {
-    const char *value = std::getenv("EDEN_NX2_DLSS_PRESET");
-    if (value && value[0] >= 'J' && value[0] <= 'M') {
-        return NVSDK_NGX_DLSS_Hint_Render_Preset_J + value[0] - 'J';
+unsigned PresetFor(Settings::NvidiaDlssPreset preset) {
+    using Preset = Settings::NvidiaDlssPreset;
+    switch (preset) {
+    case Preset::NvidiaDefault: return NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+    case Preset::E: return NVSDK_NGX_DLSS_Hint_Render_Preset_E;
+    case Preset::F: return NVSDK_NGX_DLSS_Hint_Render_Preset_F;
+    case Preset::J: return NVSDK_NGX_DLSS_Hint_Render_Preset_J;
+    case Preset::K: return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+    case Preset::L: return NVSDK_NGX_DLSS_Hint_Render_Preset_L;
+    case Preset::M: return NVSDK_NGX_DLSS_Hint_Render_Preset_M;
     }
-    if (value && std::string_view{value} == "default") {
-        return NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+    return NVSDK_NGX_DLSS_Hint_Render_Preset_M;
+}
+
+// The SDK helper uses statically linked parameter functions. Call the same capability callback
+// through the dynamically loaded parameter interface, on the scheduler worker with other NGX calls.
+std::optional<VideoCommon::DlssMode::Range> QueryRange(
+    NVSDK_NGX_Parameter* caps, VkExtent2D output, Settings::NvidiaDlssQuality mode) {
+    void* callback{};
+    if (NVSDK_NGX_FAILED(caps->Get(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &callback)) ||
+        !callback) {
+        return std::nullopt;
     }
-    return NVSDK_NGX_DLSS_Hint_Render_Preset_K;
+    caps->Set(NVSDK_NGX_Parameter_Width, output.width);
+    caps->Set(NVSDK_NGX_Parameter_Height, output.height);
+    caps->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(ModeFor(mode)));
+    caps->Set(NVSDK_NGX_Parameter_RTXValue, 0);
+    if (NVSDK_NGX_FAILED(
+            reinterpret_cast<PFN_NVSDK_NGX_DLSS_GetOptimalSettingsCallback>(callback)(caps))) {
+        return std::nullopt;
+    }
+    VideoCommon::DlssMode::Extent optimal{};
+    if (NVSDK_NGX_FAILED(caps->Get(NVSDK_NGX_Parameter_OutWidth, &optimal.width)) ||
+        NVSDK_NGX_FAILED(caps->Get(NVSDK_NGX_Parameter_OutHeight, &optimal.height))) {
+        return std::nullopt;
+    }
+    VideoCommon::DlssMode::Range range{optimal, optimal};
+    caps->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width, &range.min.width);
+    caps->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height, &range.min.height);
+    caps->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width, &range.max.width);
+    caps->Get(NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height, &range.max.height);
+    return range;
 }
 
 NVSDK_NGX_Resource_VK Resource(const NvidiaDlssUpscaler::Image &image, VkExtent2D size,
@@ -113,12 +150,14 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
     if (failed) {
         return false;
     }
+    const auto neural_options = Settings::GetNvidiaDlssRuntimeSettings();
     const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
                                 in.render_size.height != render_extent.height ||
                                 in.upscale_size.width != upscale_extent.width ||
                                 in.upscale_size.height != upscale_extent.height;
     const bool options_changed =
-        extent_changed || in.hdr != hdr_input || in.depth_inverted != depth_inverted;
+        extent_changed || in.hdr != hdr_input || in.depth_inverted != depth_inverted ||
+        quality_mode != neural_options.quality || model_preset != neural_options.preset;
     if (options_changed && output_image) {
         scheduler.Finish();
         if (feature) {
@@ -138,7 +177,8 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
     }
     hdr_input = in.hdr;
     depth_inverted = in.depth_inverted;
-    const auto neural_options = Settings::GetNvidiaDlssRuntimeSettings();
+    quality_mode = neural_options.quality;
+    model_preset = neural_options.preset;
     const auto neural_mode = neural_options.neural_rendering;
     const bool requested = device.SupportsNeuralRendering() &&
                            neural_mode != Settings::NeuralRendering::Off;
@@ -147,20 +187,14 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
     PrepareNeuralRendering(in, requested);
     const bool hdr = in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
     const bool auto_exposure = in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0;
-    const auto mode = ModeFor(in.render_size, in.upscale_size);
-    const auto preset = Preset();
-    if (options_changed) {
-        LOG_INFO(Render_Vulkan, "NVIDIA DLSS (NGX): {}x{} -> {}x{}, mode {}, preset {}, {}",
-                 in.render_size.width, in.render_size.height, in.upscale_size.width,
-                 in.upscale_size.height, static_cast<int>(mode), preset, hdr ? "HDR" : "LDR");
-    }
+    const auto preset = PresetFor(neural_options.preset);
     const Image out{*output_view,
                     *output_image,
                     VK_FORMAT_R16G16B16A16_SFLOAT,
                     {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
                     VK_IMAGE_ASPECT_COLOR_BIT};
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, in, out, hdr, auto_exposure, mode, preset, neural_style, neural_options,
+    scheduler.Record([this, in, out, hdr, auto_exposure, preset, neural_style, neural_options,
                       reset = in.reset || options_changed](vk::CommandBuffer cmdbuf) {
         const auto &api = Ngx::GetApi();
         const auto clear_output = [&] {
@@ -197,12 +231,42 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
             }
         }
         if (!feature) {
+            NVSDK_NGX_Parameter* caps{};
+            const auto cap_result = api.capabilities(&caps);
+            SCOPE_EXIT { if (caps) api.destroy_parameters(caps); };
+            if (NVSDK_NGX_FAILED(cap_result) || !caps) {
+                fail("capability query", cap_result);
+                return;
+            }
+            namespace Mode = VideoCommon::DlssMode;
+            const auto selected = Mode::Select(
+                neural_options.quality, {in.render_size.width, in.render_size.height},
+                {in.upscale_size.width, in.upscale_size.height},
+                [&](Settings::NvidiaDlssQuality quality) {
+                    return QueryRange(caps, in.upscale_size, quality);
+                });
+            if (selected.fallback) {
+                LOG_WARNING(Render_Vulkan, "NVIDIA DLSS requested {} but using {} for {}x{} -> {}x{}",
+                    Settings::CanonicalizeEnum(neural_options.quality),
+                    selected.mode ? Settings::CanonicalizeEnum(*selected.mode) : "FSR 3.1",
+                    in.render_size.width, in.render_size.height,
+                    in.upscale_size.width, in.upscale_size.height);
+            }
+            if (!selected.mode) {
+                fail("unsupported render/output size", NVSDK_NGX_Result_FAIL_InvalidParameter);
+                return;
+            }
+            evaluated_mode = *selected.mode;
+            LOG_INFO(Render_Vulkan, "NVIDIA DLSS (NGX): {}x{} -> {}x{}, mode {}, preset {}, {}",
+                in.render_size.width, in.render_size.height, in.upscale_size.width,
+                in.upscale_size.height, Settings::CanonicalizeEnum(evaluated_mode), preset,
+                hdr ? "HDR" : "LDR");
             parameters->Reset();
             parameters->Set(NVSDK_NGX_Parameter_Width, in.render_size.width);
             parameters->Set(NVSDK_NGX_Parameter_Height, in.render_size.height);
             parameters->Set(NVSDK_NGX_Parameter_OutWidth, in.upscale_size.width);
             parameters->Set(NVSDK_NGX_Parameter_OutHeight, in.upscale_size.height);
-            parameters->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(mode));
+            parameters->Set(NVSDK_NGX_Parameter_PerfQualityValue, static_cast<int>(ModeFor(evaluated_mode)));
             int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
             if (in.depth_inverted)
                 flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
@@ -279,6 +343,10 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
         if (NVSDK_NGX_FAILED(result)) {
             fail("evaluation", result);
         } else {
+            last_evaluation.store(static_cast<u32>(evaluated_mode) |
+                (static_cast<u32>(neural_options.quality) << 8) |
+                (static_cast<u32>(neural_options.preset) << 16), std::memory_order_relaxed);
+            evaluations.fetch_add(1, std::memory_order_release);
             Ngx::ReportEvaluation();
             if (neural_rendering) {
                 NR::Frame frame;
@@ -351,6 +419,15 @@ void NvidiaDlssUpscaler::PrepareNeuralRendering(const Inputs& in, bool requested
         neural_failed = true;
         NR::ReportFailure(error.what());
     }
+}
+
+VideoCore::DlssStatus NvidiaDlssUpscaler::Status() {
+    const u64 count = evaluations.load(std::memory_order_acquire);
+    const u32 last = last_evaluation.load(std::memory_order_relaxed);
+    return {.evaluations = count,
+            .mode = static_cast<Settings::NvidiaDlssQuality>(last & 0xff),
+            .requested = static_cast<Settings::NvidiaDlssQuality>((last >> 8) & 0xff),
+            .preset = static_cast<Settings::NvidiaDlssPreset>((last >> 16) & 0xff)};
 }
 
 } // namespace Vulkan

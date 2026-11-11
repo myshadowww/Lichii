@@ -67,6 +67,7 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(NeuralRendering, false);
+SWITCHABLE(NvidiaDlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -412,9 +413,19 @@ struct Values {
                                                   true,
                                                   false};
     // NVIDIA DLSS through the platform runtime, in place of a game's DLSS.
-    SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer,
+                                        Specialization::Default, true,
+#ifdef __linux__
+                                        true
+#else
+                                        false
+#endif
+    };
     SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{
         linkage, NvidiaDlssQuality::Automatic, "nvidia_dlss_quality", Category::Renderer,
+        Specialization::Default, true, true};
+    SwitchableSetting<NvidiaDlssPreset> nvidia_dlss_preset{
+        linkage, NvidiaDlssPreset::M, "nvidia_dlss_preset", Category::Renderer,
         Specialization::Default, true, true};
     SwitchableSetting<NeuralRendering> neural_rendering{linkage, NeuralRendering::Off,
                                                         "neural_rendering", Category::Renderer,
@@ -428,6 +439,9 @@ struct Values {
     SwitchableSetting<u32, true> neural_rendering_structure{
         linkage, 100, 0, 100, "neural_rendering_structure", Category::RendererAdvanced,
         Specialization::Scalar | Specialization::Percentage, true, true};
+    SwitchableSetting<bool> ocarina_fsr{linkage, false, "ocarina_fsr", Category::Renderer};
+    // AMD FSR 4 in place of FSR 3.1 where FSR replaces a game's upscaler (Windows, AMD's driver).
+    SwitchableSetting<bool> amd_fsr4{linkage, false, "amd_fsr4", Category::Renderer};
     SwitchableSetting<AspectRatio, true> aspect_ratio{linkage,
                                                       AspectRatio::R16_9,
                                                       "aspect_ratio",
@@ -1040,6 +1054,9 @@ struct Values {
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
+    // The values the recommended settings (common/recommended_settings.h) replaced.
+    Setting<std::string> recommended_settings_backup{
+        linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
 
     // Network
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",
@@ -1070,6 +1087,8 @@ struct NvidiaDlssRuntimeSettings {
     u32 strength = 100;
     u32 tone = 100;
     u32 structure = 100;
+    bool enabled = false;
+    NvidiaDlssPreset preset = NvidiaDlssPreset::M;
 };
 
 /// Publish the selected DLSS options from the settings thread for use by renderer threads.

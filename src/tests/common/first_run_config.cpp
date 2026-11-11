@@ -6,6 +6,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
+#include "common/fs/profile_migration.h"
+#include "frontend_common/profile_import.h"
+#include "common/recommended_settings.h"
 #include "common/settings.h"
 #include "frontend_common/config.h"
 
@@ -53,10 +56,14 @@ class ConfigDirectory {
 public:
     ConfigDirectory()
         : original{Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir)},
+          original_data{Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir)},
           path{std::filesystem::temp_directory_path() /
                fmt::format("lichii-config-{}", std::random_device{}())} {
         REQUIRE(std::filesystem::create_directory(path));
         Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, path);
+        // Configuration tests use a fresh private profile, independent of host migration state.
+        Common::FS::SetEdenPath(Common::FS::EdenPath::EdenDir, path / "data");
+        Common::FS::ProfileMigration::MarkFresh(FrontendCommon::ProfileImportStateDirectory());
         for (const auto& [key, setting] : Settings::values.linkage.by_key) {
             setting->SetGlobal(false);
             setting->LoadString("");
@@ -67,6 +74,7 @@ public:
 
     ~ConfigDirectory() {
         Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, original);
+        Common::FS::SetEdenPath(Common::FS::EdenPath::EdenDir, original_data);
         std::error_code error;
         std::filesystem::remove_all(path, error);
     }
@@ -79,6 +87,7 @@ public:
     }
 
     const std::filesystem::path original;
+    const std::filesystem::path original_data;
     const std::filesystem::path path;
 };
 
@@ -288,7 +297,8 @@ TEST_CASE("Per-game overrides and use-global flags survive the new global profil
 
 TEST_CASE("Neural controls retain defaults, persist, and publish per-game overrides", "[config]") {
     ConfigDirectory directory;
-    directory.Write("qt-config.ini", "[Renderer]\nneural_rendering=2\nneural_rendering\\default=false\n");
+    directory.Write("qt-config.ini", "[Renderer]\nneural_rendering=2\nneural_rendering\\default=false\n"
+                                    "nvidia_dlss=true\nnvidia_dlss\\default=false\n");
     FileConfig global{std::string{"qt-config"}};
     auto& values = Settings::values;
     CHECK(values.neural_rendering_strength.GetValue() == 100);
@@ -307,7 +317,8 @@ TEST_CASE("Neural controls retain defaults, persist, and publish per-game overri
     CHECK(values.neural_rendering_structure.GetValue() == 61);
 
     directory.Write("custom/neural.ini",
-                    "[Renderer]\nneural_rendering_strength=0\n"
+                    "[Renderer]\nnvidia_dlss=false\nnvidia_dlss\\default=false\n"
+                    "nvidia_dlss\\use_global=false\nneural_rendering_strength=0\n"
                     "neural_rendering_strength\\default=false\n"
                     "neural_rendering_strength\\use_global=false\n"
                     "neural_rendering_tone=200\nneural_rendering_tone\\default=false\n"
@@ -316,6 +327,12 @@ TEST_CASE("Neural controls retain defaults, persist, and publish per-game overri
     FileConfig game{std::string{"neural"}, Config::ConfigType::PerGameConfig};
     Settings::RefreshNvidiaDlssRuntimeSettings();
     const auto options = Settings::GetNvidiaDlssRuntimeSettings();
+    CHECK_FALSE(options.enabled);
+    CHECK(values.nvidia_dlss.GetValue(true));
+    values.nvidia_dlss.SetGlobal(true);
+    CHECK_FALSE(Settings::GetNvidiaDlssRuntimeSettings().enabled);
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().enabled);
     CHECK(options.neural_rendering == Settings::NeuralRendering::Natural);
     CHECK(options.strength == 0);
     CHECK(options.tone == 100);
@@ -389,10 +406,100 @@ TEST_CASE("A denied config status lookup is not seeded", "[config]") {
 }
 #endif
 
+TEST_CASE("The recommended settings backup persists in the config", "[config]") {
+    ConfigDirectory directory;
+    SECTION("New install") {}
+    SECTION("Config from an older build") {
+        directory.Write("qt-config.ini",
+                        "[Renderer]\nasync_presentation=false\nasync_presentation\\default=false\n");
+    }
+    SECTION("Config from a build that offered the recommended settings at startup") {
+        directory.Write("qt-config.ini", "[Miscellaneous]\nrecommended_settings_prompt_shown=true\n"
+                                         "recommended_settings_prompt_shown\\default=false\n");
+    }
+    std::string backup;
+    std::size_t changed = 0;
+    {
+        FileConfig config{std::string{"qt-config"}};
+        CHECK(Settings::values.recommended_settings_backup.GetValue().empty());
+        Settings::values.speed_limit.SetValue(150);
+        changed = Settings::ApplyRecommendedSettings(Settings::values).size();
+        CHECK(changed > 0);
+        backup = Settings::values.recommended_settings_backup.GetValue();
+        config.SaveValues();
+    }
+    Settings::values.recommended_settings_backup = std::string{};
+    {
+        FileConfig config{std::string{"qt-config"}};
+        CHECK(Settings::values.recommended_settings_backup.GetValue() == backup);
+        CHECK(Settings::ApplyRecommendedSettings(Settings::values).empty());
+        CHECK(Settings::RestorePreviousSettings(Settings::values).size() == changed);
+        CHECK(Settings::values.speed_limit.GetValue() == 150);
+        config.SaveValues();
+    }
+    Settings::values.speed_limit.SetValue(100);
+    FileConfig config{std::string{"qt-config"}};
+    CHECK(Settings::values.recommended_settings_backup.GetValue().empty());
+    CHECK(Settings::values.speed_limit.GetValue() == 150);
+}
+
 TEST_CASE("A config path beneath a non-directory is not seeded", "[config]") {
     ConfigDirectory directory;
     directory.Write("file", "not a directory");
     FileConfig config{
         std::make_optional(Common::FS::PathToUTF8String(directory.path / "file" / "config.ini"))};
     CheckLegacyProfile();
+}
+
+TEST_CASE("DLSS old profiles default to M and preserve native quality values",
+          "[config][dlss_mode]") {
+    ConfigDirectory directory;
+    directory.Write("qt-config.ini", "[Renderer]\nnvidia_dlss=true\nnvidia_dlss\\default=false\n");
+    FileConfig config{std::string{"qt-config"}};
+    CHECK(Settings::values.nvidia_dlss.GetValue());
+    CHECK(Settings::values.nvidia_dlss_preset.GetValue() == Settings::NvidiaDlssPreset::M);
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::M);
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().quality ==
+          Settings::NvidiaDlssQuality::Automatic);
+    directory.Write("qt-config.ini",
+                    "[Renderer]\nnvidia_dlss_quality=1\nnvidia_dlss_quality\\default=false\n"
+                    "nvidia_dlss_preset=0\nnvidia_dlss_preset\\default=false\n");
+    FileConfig native_config{std::string{"qt-config"}};
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native);
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::M);
+}
+
+TEST_CASE("DLSS config round-trips choices and publishes per-game overrides",
+          "[config][dlss_mode]") {
+    ConfigDirectory directory;
+    FileConfig config{std::string{"qt-config"}};
+    for (const auto& [name, value] :
+         Settings::EnumMetadata<Settings::NvidiaDlssPreset>::Canonicalizations()) {
+        Settings::values.nvidia_dlss_preset.SetValue(value);
+        config.SaveValues();
+        Settings::values.nvidia_dlss_preset.LoadString("");
+        FileConfig loaded{std::string{"qt-config"}};
+        CHECK(Settings::values.nvidia_dlss_preset.GetValue() == value);
+        CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == value);
+    }
+    for (const auto& [name, value] :
+         Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Canonicalizations()) {
+        Settings::values.nvidia_dlss_quality.SetValue(value);
+        config.SaveValues();
+        Settings::values.nvidia_dlss_quality.LoadString("");
+        FileConfig loaded{std::string{"qt-config"}};
+        CHECK(Settings::values.nvidia_dlss_quality.GetValue() == value);
+        CHECK(Settings::GetNvidiaDlssRuntimeSettings().quality == value);
+    }
+    Settings::values.nvidia_dlss_preset = Settings::NvidiaDlssPreset::K;
+    config.SaveValues();
+    directory.Write("custom/game.ini",
+                    "[Renderer]\nnvidia_dlss_preset=0\nnvidia_dlss_preset\\default=false\n"
+                    "nvidia_dlss_preset\\use_global=false\n");
+    FileConfig game{std::string{"game"}, Config::ConfigType::PerGameConfig};
+    CHECK_FALSE(Settings::values.nvidia_dlss_preset.UsingGlobal());
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::M);
+    Settings::values.nvidia_dlss_preset.SetGlobal(true);
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+    CHECK(Settings::GetNvidiaDlssRuntimeSettings().preset == Settings::NvidiaDlssPreset::K);
 }

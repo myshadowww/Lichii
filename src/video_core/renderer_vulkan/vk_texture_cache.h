@@ -258,9 +258,19 @@ public:
                          std::array<f32, 2> motion_scale);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
+
+    /// Potential FSR LOD bias (0 for other games); sampler variants gate it on the active backend.
+    [[nodiscard]] f32 OcarinaFsrLodBias();
+    std::optional<f32> ocarina_fsr_lod_bias;
+    /// Set when the Ocarina upscaler fails during the session: samplers drop the bias again.
+    bool ocarina_fsr_failed{};
+    bool ocarina_fsr_active{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
     std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+    bool dlss_history_reset = true;
+    bool fsr3_history_reset = true;
+    bool last_dlss_enabled{};
 
     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
@@ -854,6 +864,7 @@ private:
         bool drop_custom_border;
         bool srgb_border;
         bool drop_compare;
+        bool drop_lod_bias; ///< the image was written by the GPU: no Ocarina FSR LOD bias
         std::array<VkComponentSwizzle, 4> swizzle;
 
         bool operator==(const VariantKey&) const noexcept = default;
@@ -878,6 +889,8 @@ private:
     std::vector<Variant> variants;
 
     const Device* device_ptr{nullptr};
+    const bool* ocarina_fsr_failed{}; ///< TextureCacheRuntime::ocarina_fsr_failed
+    const bool* ocarina_fsr_active{}; ///< TextureCacheRuntime::ocarina_fsr_active
     Tegra::Texture::TSCEntry descriptor{};
     VkSamplerCreateInfo base_ci{};
     VkSamplerReductionModeEXT reduction_mode{VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT};
@@ -888,6 +901,7 @@ private:
     bool has_added_anisotropy{};
     bool has_linear_filtering{};
     bool has_depth_comparison{};
+    f32 added_lod_bias{}; ///< Ocarina FSR part of base_ci.mipLodBias
     bool has_minmax_reduction{};
     bool has_custom_border_colors{};
     bool has_srgb_border_color{};

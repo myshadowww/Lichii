@@ -18,6 +18,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/neural_rendering/runtime.h"
+#include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
 
 #define VMA_IMPLEMENTATION
@@ -136,11 +137,17 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
         Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Natural},
         Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Natural, 100, 100, 0},
         Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Natural},
+        Settings::NvidiaDlssRuntimeSettings{Quality::Quality, Neural::Off, 100, 100, 100, true, Settings::NvidiaDlssPreset::K},
+        Settings::NvidiaDlssRuntimeSettings{Quality::Balanced, Neural::Off, 100, 100, 100, true, Settings::NvidiaDlssPreset::M},
+        Settings::NvidiaDlssRuntimeSettings{Quality::Performance, Neural::Off, 100, 100, 100, true, Settings::NvidiaDlssPreset::L},
+        Settings::NvidiaDlssRuntimeSettings{Quality::UltraPerformance, Neural::Off, 100, 100, 100, true, Settings::NvidiaDlssPreset::J},
+        Settings::NvidiaDlssRuntimeSettings{Quality::Native, Neural::Off, 100, 100, 100, true, Settings::NvidiaDlssPreset::NvidiaDefault},
         Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Natural}};
     u64 neural_frames{};
     std::array<double, 3> natural_reset{};
     for (size_t frame = 0; frame < cases.size(); ++frame) {
         Settings::values.nvidia_dlss_quality = cases[frame].quality;
+        Settings::values.nvidia_dlss_preset = cases[frame].preset;
         Settings::values.neural_rendering = request_neural ? cases[frame].neural_rendering : Neural::Off;
         Settings::values.neural_rendering_strength = cases[frame].strength;
         Settings::values.neural_rendering_tone = cases[frame].tone;
@@ -192,6 +199,7 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
             clear_fn(*cmd, *depth.image, VK_IMAGE_LAYOUT_GENERAL, &clear_depth, 1,
                      &depth.resource.range);
         });
+        const auto before_status = NvidiaDlssUpscaler::Status();
         Require(upscaler.Upscale({color.resource,
                                   depth.resource,
                                   motion.resource,
@@ -228,6 +236,14 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
         scheduler.Finish();
         api.evaluate = evaluate;
         Require(upscaler.Failed() == inject_failure, "Unexpected NGX evaluation result");
+        const auto after_status = NvidiaDlssUpscaler::Status();
+        Require(after_status.evaluations == before_status.evaluations + !inject_failure,
+                "DLSS status counted an unsuccessful evaluation");
+        if (!inject_failure) {
+            Require(after_status.requested == options.quality && after_status.preset == options.preset,
+                    "DLSS status lost runtime quality or preset");
+            Require(after_status.mode != Quality::Automatic, "No evaluated quality reported");
+        }
         if (inject_failure) {
             Require(!Ngx::GetStatus().error.empty(), "Evaluation failure was not diagnosed");
             Require(!upscaler.Upscale({}), "Failed upscaler did not request fallback");
@@ -306,8 +322,6 @@ int main(int argc, char **argv) try {
     Common::Log::Initialize();
     Common::Log::Start();
     Settings::values.nvidia_dlss = false;
-    Require(!NvidiaDlss::Start() && !NvidiaDlss::WantsDevice(), "Disabled setting loaded NGX");
-    Settings::values.nvidia_dlss = true;
     setenv("LICHII_NGX_DIR", scratch.c_str(), 1);
     Require(!NvidiaDlss::Start() && !Ngx::GetStatus().error.empty(), "Missing model not diagnosed");
     setenv("LICHII_NGX_DIR", std::filesystem::absolute(argv[1]).c_str(), 1);
@@ -322,7 +336,8 @@ int main(int argc, char **argv) try {
     }
     Require(scale >= 1 && scale <= 8, "Scale must be between 1 and 8 (4K output)");
     for (int run = 0; run < 2; ++run) {
-        // Device creation must prepare inference features even when the session starts with Off.
+        // Both DLSS and neural rendering may start off, then be enabled without a new device.
+        Settings::values.nvidia_dlss = run != 0;
         Settings::values.neural_rendering = Settings::NeuralRendering::Off;
         Settings::RefreshNvidiaDlssRuntimeSettings();
         Require(NvidiaDlss::Start(), "NGX startup failed");
@@ -345,6 +360,8 @@ int main(int argc, char **argv) try {
                                               duplicate_dispatch),
                     "NGX accepted a second device attachment");
             Require(NvidiaDlss::IsAvailable(), "Duplicate attachment disturbed the active device");
+            Settings::values.nvidia_dlss = true;
+            Settings::RefreshNvidiaDlssRuntimeSettings();
             RenderCases(device, static_cast<u32>(scale), request_neural, expect_neural);
             if (request_neural && !expect_neural) {
                 Require(!VideoCore::NeuralRendering::GetStatus().error.empty(),

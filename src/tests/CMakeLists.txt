@@ -10,6 +10,7 @@ add_executable(tests
     video_core/vulkan_overlay_filter.cpp
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
+    video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp
     video_core/nx2_stutter_trace.cpp
@@ -33,6 +34,7 @@ add_executable(tests
     video_core/texture_rect_descriptor.cpp
     video_core/join_whole_copy.cpp
     audio_core/batch_decoder.cpp
+    audio_core/adpcm_decode.cpp
     audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
@@ -71,8 +73,10 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/unbacked_fallback.cpp
+    video_core/host_memory_limit.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/dlss_contract.cpp
+    video_core/dlss_mode.cpp
     video_core/ampere_fast_fusion.cpp
     video_core/ampere_async_copy.cpp
     video_core/ampere_trap_guards.cpp
@@ -91,6 +95,7 @@ add_executable(tests
     video_core/nx2_semaphore_mirror.cpp
     video_core/command_writer.cpp
     video_core/split_fence_wait.cpp
+    video_core/nx2_written_pages.cpp
     video_core/command_snapshot_suspensions.cpp
     video_core/pending_maps.cpp
     video_core/maxwell_fast_method.cpp
@@ -113,6 +118,7 @@ add_executable(tests
     video_core/ampere_tennis_tessellation.cpp
     video_core/pipeline_cache_files.cpp
     video_core/shader_cache_v2.cpp
+    video_core/evicted_pointer_slots.cpp
     video_core/shader_cache_v2_programs.cpp
     video_core/shader_cache_v2_driver.cpp
     video_core/vulkan_pipeline_binaries.cpp
@@ -132,11 +138,14 @@ add_executable(tests
     video_core/spirv_min_max_denorms.cpp
     video_core/spirv_nan_safe_min_max.cpp
     video_core/virtual_range_cache.cpp
+    video_core/ocarina_upscale.cpp
+    video_core/fsr4_support.cpp
     common/bit_field.cpp
     common/bit_util.cpp
     common/cityhash.cpp
     common/container_hash.cpp
     common/core_pinning.cpp
+    common/data_directories.cpp
     common/event.cpp
     common/fibers.cpp
     common/fs_iterate.cpp
@@ -187,6 +196,7 @@ add_executable(tests
     video_core/ampere_uniform_immediate_shift.cpp
     video_core/ampere_bindless_surfaces.cpp
     video_core/native_macro_fifo.cpp
+    video_core/turing_macro_effects.cpp
     video_core/turing_macro_ram.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/usage_tracker.cpp
@@ -225,6 +235,11 @@ if (ENABLE_NVIDIA_DLSS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(ngx_smoke PRIVATE video_core core common frontend_common ${PLATFORM_LIBRARIES})
     target_include_directories(ngx_smoke PRIVATE $<TARGET_PROPERTY:video_core,INCLUDE_DIRECTORIES>)
 endif()
+
+add_executable(profile_migration_tests
+    common/profile_migration.cpp)
+target_link_libraries(profile_migration_tests PRIVATE common Catch2::Catch2WithMain)
+add_test(NAME profile_migration_tests COMMAND profile_migration_tests)
 
 if (TARGET SDL3::SDL3)
     add_executable(sdl_window_state_tests yuzu_cmd/sdl_window_state.cpp)
@@ -301,10 +316,19 @@ if (NOT ANDROID)
 
     add_executable(config_tests
         common/first_run_config.cpp
+        common/recommended_settings.cpp
+        ../frontend_common/profile_import.cpp
         ../frontend_common/config.cpp)
     target_link_libraries(config_tests PRIVATE common SimpleIni::SimpleIni Catch2::Catch2WithMain
         ${PLATFORM_LIBRARIES})
     add_test(NAME config_tests COMMAND config_tests)
+
+    add_executable(profile_import_tests
+        frontend_common/profile_import.cpp
+        ../frontend_common/profile_import.cpp)
+    target_link_libraries(profile_import_tests PRIVATE common SimpleIni::SimpleIni
+        Catch2::Catch2WithMain ${PLATFORM_LIBRARIES})
+    add_test(NAME profile_import_tests COMMAND profile_import_tests)
 endif()
 
 # needed for vma

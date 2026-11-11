@@ -599,7 +599,8 @@ private:
 
     // Sub 102: word 2 is the memory handle 101 returned, word 3 the job slot. The game frees the
     // memory (svc 0x80 clears GPU access) and reuses it as ordinary heap right after, so nothing
-    // on the GPU side may keep it: drop the mapping 101 made at its own address.
+    // on the GPU side may keep it: drop the mapping 101 made at its own address and every other
+    // GPU range still mapped into it. Parts of GPU-only regions show the region's memory again.
     void SubDestroyMemory(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u32 handle = w[2];
@@ -608,7 +609,35 @@ private:
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
             if (size != 0) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(address, size);
+                std::scoped_lock lk{m_region_mutex};
+                std::vector<std::pair<u64, u64>> tiles;
+                for (const auto& [tile_address, tile] : m_gpu_only_tiles) {
+                    if (tile.memory_handle == handle) {
+                        tiles.emplace_back(tile_address, tile.size);
+                    }
+                }
+                for (const auto& [tile_address, tile_size] : tiles) {
+                    DropGpuOnlyTiles(tile_address, tile_size, false);
+                }
+                auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+                const auto leftovers = registry.UnmapMemory(address, size);
+                for (const auto& [gpu_address, range_size] : leftovers) {
+                    // Only what still reached this memory: a later map of the range is kept.
+                    if (const auto backing = OwnBackingOf(gpu_address, range_size)) {
+                        registry.MapAt(gpu_address, *backing, range_size);
+                    }
+                    // The first 32, then every 1000th.
+                    if (++m_destroy_leftovers <= 32 || m_destroy_leftovers % 1000 == 0) {
+                        LOG_WARNING(Service,
+                                    "nx2:gpu 102 destroy of memory {} [{:#x}, +{:#x}] also unmapped "
+                                    "GPU range [{:#x}, +{:#x}] still mapped into it ({} so far)",
+                                    handle, address, size, gpu_address, range_size,
+                                    m_destroy_leftovers);
+                    }
+                }
+                // No GPU range reaches the memory any more: free its device range, so registering
+                // the address again gets a new one on the pages it has then.
+                registry.ReleaseBacking(address, size);
             }
             if (size == 0x2000) {
                 Tegra::Nx2RemoveSemaphoreRegion(address);
@@ -1131,6 +1160,7 @@ private:
     u64 m_tile_maps{};
     u64 m_tile_unmaps{};
     u64 m_tile_kept{}; ///< Maps into GPU-only regions that keep their own memory, left out
+    u64 m_destroy_leftovers{}; ///< GPU ranges 102 unmapped besides the memory's own address
     u64 m_tile_bytes{}; ///< Sparse region pages a tile maps right now
 
     void ApplySparseMapRequest(const SparseMapRequest& request) {
@@ -1747,18 +1777,6 @@ public:
             {232, &INx2Vi2Session::StubReplyZeroed, "Unknown232"},
             {251, &INx2Vi2Session::StubReplyZeroed, "Unknown251"},
             {252, &INx2Vi2Session::StubReplyZeroed, "Unknown252"},
-            {261, &INx2Vi2Session::StubReplyZeroed, "Unknown261"},
-            {262, &INx2Vi2Session::StubReplyZeroed, "Unknown262"},
-            {263, &INx2Vi2Session::StubReplyZeroed, "Unknown263"},
-            {264, &INx2Vi2Session::StubReplyZeroed, "Unknown264"},
-            {265, &INx2Vi2Session::StubReplyZeroed, "Unknown265"},
-            {266, &INx2Vi2Session::StubReplyZeroed, "Unknown266"},
-            {267, &INx2Vi2Session::StubReplyZeroed, "Unknown267"},
-            {268, &INx2Vi2Session::StubReplyZeroed, "Unknown268"},
-            {269, &INx2Vi2Session::StubReplyZeroed, "Unknown269"},
-            {270, &INx2Vi2Session::StubReplyZeroed, "Unknown270"},
-            {271, &INx2Vi2Session::StubReplyZeroed, "Unknown271"},
-            {272, &INx2Vi2Session::StubReplyZeroed, "Unknown272"},
             {301, &INx2Vi2Session::StubReplyZeroed, "Unknown301"},
             {302, &INx2Vi2Session::StubReplyZeroed, "Unknown302"},
             {351, &INx2Vi2Session::StubReplyZeroed, "Unknown351"},
@@ -3520,7 +3538,6 @@ public:
             {403, &INx2GraphicsSystemSession::CheckPermission, "CheckPermission403"},
             {424, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown424"},
             {425, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown425"},
-            {427, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown427"},
             {434, &INx2GraphicsSystemSession::AttachGpuAddressSpace, "AttachGpuAddressSpace"},
             {436, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown436"},
             {461, &INx2GraphicsSystemSession::StubReplyZeroed, "Unknown461"},
