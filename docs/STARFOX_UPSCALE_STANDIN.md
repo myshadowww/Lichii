@@ -1,8 +1,9 @@
-# Star Fox spatial upscale candidate
+# Star Fox spatial display workaround
 
 This extends the guarded Fire Emblem workaround to the captured Star Fox DLSS
-passes. It is a candidate for the Venom cutscene's repeated ship trails, not a
-verified repair of the native network. The owner must compare the same scene.
+passes. Local desktop testing confirms that it removes the black rectangles in
+the opening cutscene on the November 11 build. It does not repair the native
+temporal network; later missions and motion-vector conventions remain unverified.
 
 ## Evidence
 
@@ -68,7 +69,7 @@ the alpha produced by the native pass and its separate output at `0x350`.
 Fire Emblem keeps its original format and upscale restrictions. No new shader
 fingerprints or slot-search heuristics are added.
 
-## Owner-side comparison
+## Desktop validation
 
 ### November 11 docked cutscene capture
 
@@ -93,9 +94,43 @@ history at `+0x350`. Native dispatches still run to preserve their other
 writes; only the validated display output is replaced. This restores the
 existing spatial workaround, not the correctness of native temporal history.
 
+RenderDoc 1.46 independently reproduces the same dependency chain in the local
+`starfox_frame2878.rdc` capture (423 actions, 22 dispatches; successful Vulkan
+replay). Event 3215, translated shader `25a620c965883cde`, reads clean sRGB
+resource 1183 plus old history 8396 and writes corrupt RGBA16F resource 8530.
+Event 3279 (`bccc6a99e0f227fa`) retains that corruption; event 3308
+(`a2884a1f4cd841e7`) enlarges it into the final 4K image. Captures remain local.
+
+On the patched desktop, the existing contract diagnostic reports
+`Star Fox DLSS replacement: applied temporal=false` from 38.976 seconds.
+Uncaptured opening-cutscene screenshots show clean room and cockpit shots where
+the original displayed black rectangles. Flight training also retains its HUD,
+fonts and scene. A 20-second cinematic timing sample measured 29.39 FPS,
+34.03 ms mean and 35.77 ms p99, with no reported stutters. This is approximately
+30 FPS cinematic pacing, not a demonstrated frame-rate improvement. The baseline
+and patched flight training run at approximately 60 FPS. All native network
+work still executes, so this display repair does not reduce its compute cost.
+
+A later patched capture (`capture-1794358254-001`) verifies that this also holds
+beyond the first eight diagnostic messages: native output image 0282 is corrupt,
+while the same image sampled downstream as 0286 is repaired before tone mapping.
+A later moving-ship screenshot shows possible trailing, but that exact scene was
+not captured and its cause remains unclassified. Do not infer another network
+fingerprint or a native temporal repair from this comparison.
+
+The final audio-fixed build measured 59.80 FPS in a 30-second training sample,
+with 17.63 ms p99 and no reported stutters. Its 30-second cinematic sample measured
+29.23 FPS with one 88 ms hitch. Neither measurement establishes an average-FPS gain.
+
+Native font draws without depth are also protected from asynchronous shader
+discard, porting upstream Eglantine PR #785 (`7a940ca19d`). They may populate a
+persistent atlas, so dropping them can leave text permanently incomplete.
+
+### Reproducing the comparison
+
 Start a fresh process with `EDEN_NX2_DLSS_CONTRACT_TRACE=1` and log filter
 `*:Info HW.GPU:Debug Shader:Debug Render.Vulkan:Debug`.
-Leave `EDEN_NX2_DLSS_REPLACEMENT` unset for the spatial candidate. Star Fox always
+Leave `EDEN_NX2_DLSS_REPLACEMENT` unset for the spatial workaround. Star Fox always
 uses the spatial path, even if `fsr` or `dlss` is requested; its temporal resource
 contract has not been validated. Set `EDEN_NX2_DLSS_REPLACEMENT=native` in a second
 fresh process to retain the original output for comparison.
