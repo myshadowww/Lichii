@@ -95,7 +95,8 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
         // textures) with fixed headroom, so on an 8 GB GPU the collector ran every frame once a
         // title 1 course was loaded, and the downloads were ~2.7% of the GPU thread.
         const Buffer& buffer = slot_buffers[buffer_id];
-        if (!aggressive_gc && gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
+        if (!aggressive_gc && !buffer.IsHostOnly() &&
+            gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
             return false;
         }
         evicted.push_back(buffer_id);
@@ -2980,8 +2981,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
-            ++buffer_deletions;
-            slot_buffers.erase(inline_buffer_id);
+            DeleteBuffer(inline_buffer_id, true);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -3504,6 +3504,9 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     bool has_stream_leap = false;
     auto expand_begin = [&](DAddr add_value) {
         static constexpr DAddr min_page = CACHING_PAGESIZE + Core::DEVICE_PAGESIZE;
+        if (begin <= min_page) {
+            return;
+        }
         if (add_value > begin - min_page) {
             begin = min_page;
             device_addr = Core::DEVICE_PAGESIZE;
@@ -3520,14 +3523,6 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         }
         end += add_value;
     };
-    if (begin == 0) {
-        return OverlapResult{
-            .ids = std::move(overlap_ids),
-            .begin = begin,
-            .end = end,
-            .has_stream_leap = has_stream_leap,
-        };
-    }
     for (; device_addr >> CACHING_PAGEBITS < Common::DivCeil(end, CACHING_PAGESIZE);
          device_addr += CACHING_PAGESIZE) {
         const BufferId overlap_id = page_table[device_addr >> CACHING_PAGEBITS];
@@ -3599,14 +3594,20 @@ template <class P>
 BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
                                       bool sparse_compatible) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferCreate};
+    const bool host_only = device_addr == 0;
     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
-    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+    const OverlapResult overlap =
+        host_only ? OverlapResult{.begin = device_addr, .end = device_addr_end}
+                  : ResolveOverlaps(device_addr, wanted_size);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
     auto& new_buffer = slot_buffers[new_buffer_id];
+    if (host_only) {
+        new_buffer.MarkHostOnly();
+    }
     const size_t size_bytes = new_buffer.SizeBytes();
     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
     new_buffer.MarkUsage(0, size_bytes);
@@ -3643,6 +3644,10 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
         lru_cache.Free(buffer.getLRUID());
     }
     const DAddr device_addr_begin = buffer.CpuAddr();
+    // Inline indices have no guest address; their host allocation must not cover guest pages.
+    if (buffer.IsHostOnly()) {
+        return;
+    }
     const DAddr device_addr_end = device_addr_begin + size;
     const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
     const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
@@ -3895,6 +3900,9 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     u64 total_size_bytes = 0;
     for (const BufferId buffer_id : buffer_ids) {
         Buffer& buffer = slot_buffers[buffer_id];
+        if (buffer.IsHostOnly()) {
+            continue;
+        }
         const DAddr buffer_addr = buffer.CpuAddr();
         memory_tracker.ForEachDownloadRangeAndClear(
             buffer_addr, buffer.SizeBytes(), [&](u64 device_addr_out, u64 range_size) {
@@ -3944,6 +3952,9 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
 
 template <class P>
 void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
+    if (buffer.IsHostOnly()) {
+        return;
+    }
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
@@ -4031,12 +4042,17 @@ template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferDelete};
     ++buffer_deletions;
+    if (inline_buffer_id == buffer_id) {
+        inline_buffer_id = NULL_BUFFER_ID;
+    }
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
-    read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
-                                 slot_buffers[buffer_id].SizeBytes());
-    cpu_read_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(), slot_buffers[buffer_id].SizeBytes());
+    Buffer& buffer = slot_buffers[buffer_id];
+    if (!buffer.IsHostOnly()) {
+        read_trapped_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
+        cpu_read_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
+    }
     bool dirty_index{false};
     boost::container::small_vector<u64, NUM_VERTEX_BUFFERS> dirty_vertex_buffers;
     const auto scalar_replace = [buffer_id](Binding& binding) {
@@ -4072,8 +4088,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     InvalidateMultiRangeSegments(std::span{compute_segments}, buffer_id);
 
     // Mark the whole buffer as CPU written to stop tracking CPU writes
-    if (!do_not_mark) {
-        Buffer& buffer = slot_buffers[buffer_id];
+    if (!do_not_mark && !buffer.IsHostOnly()) {
         memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
     }
 

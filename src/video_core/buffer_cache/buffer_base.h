@@ -22,6 +22,7 @@ enum class BufferFlagBits {
     Picked = 1 << 0,
     CachedWrites = 1 << 1,
     PreemtiveDownload = 1 << 2,
+    HostOnly = 1 << 3,
 };
 DECLARE_ENUM_FLAG_OPERATORS(BufferFlagBits)
 
@@ -60,6 +61,15 @@ public:
 
     void MarkPreemtiveDownload() noexcept {
         flags |= BufferFlagBits::PreemtiveDownload;
+    }
+
+    /// Host allocations such as inline indices have no backing guest address range.
+    void MarkHostOnly() noexcept {
+        flags |= BufferFlagBits::HostOnly;
+    }
+
+    [[nodiscard]] bool IsHostOnly() const noexcept {
+        return True(flags & BufferFlagBits::HostOnly);
     }
 
     /// Unmark buffer as picked

@@ -263,6 +263,49 @@ using KeepCache = VideoCommon::BufferCache<KeepPolicy>;
 namespace VideoCommon {
 
 struct BufferCacheTestAccess {
+    static BufferId InlineIndices(Cache& cache, BufferCacheChannelInfo& channel, u32 bytes) {
+        cache.channel_state = &channel;
+        cache.maxwell3d = &channel.maxwell3d;
+        cache.gpu_memory = &channel.gpu_memory;
+        channel.maxwell3d.draw_manager.draw_state.inline_index_draw_indexes.resize(bytes);
+        channel.maxwell3d.dirty.flags[Dirty::IndexBuffer] = true;
+        cache.UpdateIndexBuffer();
+        return channel.index_buffer.buffer_id;
+    }
+    static void Delete(Cache& cache, BufferId id) {
+        cache.DeleteBuffer(id);
+    }
+    static std::vector<BufferId> RegisteredBuffers(Cache& cache) {
+        std::vector<BufferId> result;
+        cache.lru_cache.ForEachItemBelow(1000, [&](BufferId id) { result.push_back(id); });
+        return result;
+    }
+    static u64 BufferBytes(const Cache& cache) {
+        return cache.buffer_bytes;
+    }
+    static BufferId Find(Cache& cache, DAddr address, u32 size) {
+        return cache.FindBuffer(address, size, false);
+    }
+    static void DownloadBuffer(Cache& cache, BufferId id, bool batch) {
+        if (batch) {
+            cache.DownloadBuffersMemory(std::span{&id, 1});
+        } else {
+            cache.DownloadBufferMemory(cache.slot_buffers[id]);
+        }
+    }
+    static void CollectExcept(Cache& cache, BufferId keep, bool aggressive) {
+        cache.frame_tick = 200;
+        cache.TouchBuffer(cache.slot_buffers[keep], keep);
+        cache.RunGarbageCollector(aggressive);
+    }
+    static void TrapRead(Cache& cache, DAddr address, u64 size) {
+        cache.read_trapped_ranges.Arm(address, size);
+        cache.cpu_read_ranges.Add(address, size);
+    }
+    static bool HasReadTracking(Cache& cache, DAddr address, u64 size) {
+        return !cache.read_trapped_ranges.Arm(address, size) &&
+               cache.cpu_read_ranges.Intersects(address, size);
+    }
     static Binding Bind(Cache& cache, Tegra::MemoryManager& memory, GPUVAddr descriptor,
                         bool written = false, bool native = false, bool table = false,
                         bool compute = false) {
@@ -442,6 +485,165 @@ struct BasicFixture {
 };
 
 using Fixture = BasicFixture<Runtime, Cache>;
+
+TEST_CASE("Growing inline indices retires their old cache registration", "[buffer_ports][inline_indices]") {
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    Access::InlineIndices(*f.cache, channel, 16);
+    const auto grown = Access::InlineIndices(*f.cache, channel, 0x10004);
+    REQUIRE(Access::Get(*f.cache, grown).SizeBytes() == 0x20000);
+    REQUIRE(Access::BufferBytes(*f.cache) == 0x20000);
+    REQUIRE(Access::RegisteredBuffers(*f.cache) == std::vector{grown});
+}
+
+TEST_CASE("Evicted inline indices cannot reuse a different buffer's slot", "[buffer_ports][inline_indices]") {
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    const auto first = Access::InlineIndices(*f.cache, channel, 16);
+    Access::Delete(*f.cache, first);
+    const auto scene = Access::Add(*f.cache, 0x20000, 0x10000);
+    REQUIRE(scene == first);
+    const auto next = Access::InlineIndices(*f.cache, channel, 16);
+    REQUIRE(next != scene);
+    REQUIRE(Access::Get(*f.cache, next).CpuAddr() == 0);
+    REQUIRE(Access::Get(*f.cache, scene).CpuAddr() == 0x20000);
+    REQUIRE(Access::RegisteredBuffers(*f.cache).size() == 2);
+}
+
+TEST_CASE("Host inline indices never shadow guest address ranges", "[buffer_ports][inline_indices]") {
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    const auto scene = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto indices = Access::InlineIndices(*f.cache, channel, 0x30000);
+    REQUIRE(Access::Find(*f.cache, 0x20000, 16) == scene);
+    Access::Delete(*f.cache, indices);
+    REQUIRE(Access::Find(*f.cache, 0x20000, 16) == scene);
+}
+
+TEST_CASE("Inline index downloads preserve overlapping guest writes",
+          "[buffer_ports][inline_indices]") {
+    const bool batch = GENERATE(false, true);
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    const auto scene = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto indices = Access::InlineIndices(*f.cache, channel, 0x30000);
+    std::ranges::fill(Access::Get(*f.cache, scene).bytes, 0xa5);
+    std::ranges::fill(Access::Get(*f.cache, indices).bytes, 0xcc);
+    Access::MarkWritten(*f.cache, scene, 0x20000, 0x100);
+    Access::DownloadBuffer(*f.cache, indices, batch);
+    REQUIRE(f.bytes[0x10000] == 0);
+    REQUIRE(f.cache->IsRegionGpuModified(0x20000, 0x100));
+    REQUIRE(f.runtime.downloads == 0);
+    Access::DownloadBuffer(*f.cache, scene, batch);
+    REQUIRE(f.bytes[0x10000] == 0xa5);
+    REQUIRE_FALSE(f.cache->IsRegionGpuModified(0x20000, 0x100));
+}
+
+TEST_CASE("Retiring inline indices preserves guest read tracking",
+          "[buffer_ports][inline_indices]") {
+    const bool grow = GENERATE(false, true);
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    const auto scene = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto indices = Access::InlineIndices(*f.cache, channel, 0x30000);
+    Access::TrapRead(*f.cache, 0x20000, 0x100);
+    const auto cpu_marks = Access::CpuMarks(*f.cache);
+    if (grow) {
+        Access::InlineIndices(*f.cache, channel, 0x40000);
+    } else {
+        Access::Delete(*f.cache, indices);
+    }
+    REQUIRE(Access::HasReadTracking(*f.cache, 0x20000, 0x100));
+    REQUIRE(Access::CpuMarks(*f.cache) == cpu_marks);
+    REQUIRE(Access::Find(*f.cache, 0x20000, 0x100) == scene);
+}
+
+TEST_CASE("Inline index garbage collection leaves live guest buffers intact",
+          "[buffer_ports][inline_indices]") {
+    const bool aggressive = GENERATE(false, true);
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    const auto scene = Access::Add(*f.cache, 0x20000, 0x10000);
+    const auto indices = Access::InlineIndices(*f.cache, channel, 0x30000);
+    std::ranges::fill(Access::Get(*f.cache, indices).bytes, 0xcc);
+    Access::MarkWritten(*f.cache, scene, 0x20000, 0x100);
+    Access::TrapRead(*f.cache, 0x20000, 0x100);
+    const auto cpu_marks = Access::CpuMarks(*f.cache);
+    Access::CollectExcept(*f.cache, scene, aggressive);
+    REQUIRE(Access::RegisteredBuffers(*f.cache) == std::vector{scene});
+    REQUIRE(Access::BufferBytes(*f.cache) == 0x10000);
+    REQUIRE(f.bytes[0x10000] == 0);
+    REQUIRE(f.cache->IsRegionGpuModified(0x20000, 0x100));
+    REQUIRE(Access::HasReadTracking(*f.cache, 0x20000, 0x100));
+    REQUIRE(Access::CpuMarks(*f.cache) == cpu_marks);
+    REQUIRE(Access::Find(*f.cache, 0x20000, 0x100) == scene);
+    REQUIRE(Access::InlineIndices(*f.cache, channel, 16) != scene);
+}
+
+TEST_CASE("Low guest addresses remain registered after alignment to zero",
+          "[buffer_ports][inline_indices]") {
+    Fixture f;
+    f.device.Map(0x1000, 0x10000, 0x1000, f.asid);
+    const auto scene = Access::Find(*f.cache, 0x1000, 0x100);
+    REQUIRE(Access::Get(*f.cache, scene).CpuAddr() == 0);
+    REQUIRE(Access::Find(*f.cache, 0x1000, 0x100) == scene);
+    Access::Upload(*f.cache, scene, 0x1000, 0x100);
+    std::ranges::fill(Access::Get(*f.cache, scene).bytes, 0xa5);
+    Access::MarkWritten(*f.cache, scene, 0x1000, 0x100);
+    Access::DownloadBuffer(*f.cache, scene, true);
+    REQUIRE(f.bytes[0] == 0xa5);
+    REQUIRE_FALSE(f.cache->IsRegionGpuModified(0x1000, 0x100));
+    f.device.Unmap(0x1000, 0x1000);
+}
+
+TEST_CASE("Growing low guest buffers joins overlaps without losing GPU data",
+          "[buffer_ports][inline_indices]") {
+    const int stream_score = GENERATE(0, 17);
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    VideoCommon::BufferCacheChannelInfo channel{state};
+    const auto indices = Access::InlineIndices(*f.cache, channel, 0x30000);
+    const auto low = Access::Find(*f.cache, 0x1000, 0x100);
+    const auto high = Access::Add(*f.cache, 0x20000, 0x30000);
+    std::ranges::fill(Access::Get(*f.cache, low).bytes, 0xa5);
+    std::ranges::fill(Access::Get(*f.cache, high).bytes, 0xbc);
+    Access::Get(*f.cache, high).IncreaseStreamScore(stream_score);
+    Access::MarkWritten(*f.cache, low, 0x1000, 0x100);
+    Access::MarkWritten(*f.cache, high, 0x20000, 0x100);
+    const auto joined = Access::Find(*f.cache, 0x1000, 0x30000);
+    const auto& buffer = Access::Get(*f.cache, joined);
+    REQUIRE(buffer.CpuAddr() == 0);
+    REQUIRE(buffer.SizeBytes() == 0x50000);
+    REQUIRE(buffer.bytes[0x1000] == 0xa5);
+    REQUIRE(buffer.bytes[0x20000] == 0xbc);
+    REQUIRE(Access::Find(*f.cache, 0x1000, 0x100) == joined);
+    REQUIRE(Access::Find(*f.cache, 0x20000, 0x100) == joined);
+    REQUIRE(Access::RegisteredBuffers(*f.cache).size() == 2);
+    REQUIRE(Access::BufferBytes(*f.cache) == 0x80000);
+    REQUIRE(f.cache->IsRegionGpuModified(0x1000, 0x100));
+    REQUIRE(f.cache->IsRegionGpuModified(0x20000, 0x100));
+    REQUIRE(Access::InlineIndices(*f.cache, channel, 16) == indices);
+}
 
 void SetEnv(const char* name, const char* value) {
 #ifdef _WIN32
