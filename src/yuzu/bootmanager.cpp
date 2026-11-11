@@ -64,6 +64,9 @@
 #include "video_core/renderer_base.h"
 #include "yuzu/bootmanager.h"
 #include "yuzu/main_window.h"
+#if defined(__linux__) && !defined(__ANDROID__)
+#include "yuzu/separate_window_geometry.h"
+#endif
 
 #include "qt_common/render/context.h"
 #include "qt_common/render/emu_thread.h"
@@ -193,18 +196,35 @@ void GRenderWindow::OnFramebufferSizeChanged() {
 }
 
 void GRenderWindow::BackupGeometry() {
+#if defined(__linux__) && !defined(__ANDROID__)
+    SeparateWindowGeometry::Backup(*this, geometry);
+#else
     geometry = QWidget::saveGeometry();
+#endif
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+void GRenderWindow::RestoreGeometry(QScreen* default_screen) {
+    const QScreen* screen = default_screen ? default_screen : QGuiApplication::primaryScreen();
+    if (screen) {
+        SeparateWindowGeometry::Restore(*this, geometry, screen->availableGeometry());
+    }
+}
+#else
 void GRenderWindow::RestoreGeometry() {
     // We don't want to back up the geometry here (obviously)
     QWidget::restoreGeometry(geometry);
 }
+#endif
 
 void GRenderWindow::restoreGeometry(const QByteArray& geometry_) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    SeparateWindowGeometry::Load(*this, geometry, geometry_);
+#else
     // Make sure users of this class don't need to deal with backing up the geometry themselves
     QWidget::restoreGeometry(geometry_);
     BackupGeometry();
+#endif
 }
 
 QByteArray GRenderWindow::saveGeometry() {

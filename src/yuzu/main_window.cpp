@@ -3703,12 +3703,22 @@ void MainWindow::ToggleWindowMode() {
 
     } else {
         // Render in a separate window...
+#if defined(__linux__) && !defined(__ANDROID__)
+        const bool was_embedded = render_window->parentWidget() != nullptr;
+#endif
         ui->horizontalLayout->removeWidget(render_window);
         render_window->setParent(nullptr);
         render_window->setFocusPolicy(Qt::NoFocus);
+#if defined(__linux__) && !defined(__ANDROID__)
+        if (was_embedded) {
+            render_window->RestoreGeometry(screen());
+        }
+#endif
         if (emulation_running) {
             render_window->setVisible(true);
+#if !defined(__linux__) || defined(__ANDROID__)
             render_window->RestoreGeometry();
+#endif
             game_list->show();
         }
     }
