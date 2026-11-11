@@ -253,6 +253,9 @@ public:
 
     bool IsNativeMode() const { return native_mode; }
     bool ProcessGameDlss(u64 program_id, u64 native_key);
+    bool IsStarFoxFinalUpscale() const {
+        return starfox_final_upscale;
+    }
     /// Ocarina of Time with anti-aliasing at No sharpening (oot_network.h): true when this
     /// dispatch of the game's network is skipped, or its output pass replaced by a copy of the
     /// tonemapped image.
@@ -300,7 +303,7 @@ private:
     /// the game's own network output is shown instead of the replacement upscale.
     struct DlssChain {
         bool active{};
-        bool spatial_only{};
+        bool star_fox{};
         bool output_pass{};
         u32 rejected{};
         u32 clean_evaluations{};
@@ -349,6 +352,7 @@ private:
     bool native_mme_dumped{};
     std::optional<u32> native_executing_macro_logged;
     bool native_mode{};
+    bool starfox_final_upscale{};
     NativeMacroContext* native_context{};
     bool native_compute_uploaded{};
     MacroEngine* native_macro{};

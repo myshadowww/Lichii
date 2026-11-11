@@ -17,6 +17,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/fire_emblem_upscale.h"
 #include "video_core/renderer_vulkan/pipeline_build_failure.h"
 #include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
@@ -888,7 +889,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         ReportTextureMemo();
     }
-    if (RecordingSampledTextures()) {
+    const bool starfox_scene_copy =
+        key.unique_hashes[1] == VideoCommon::FireEmblemUpscale::StarFoxSceneCopyVertex &&
+        key.unique_hashes[5] == VideoCommon::FireEmblemUpscale::StarFoxSceneCopyFragment;
+    if (RecordingSampledTextures() || starfox_scene_copy) {
         sampled_images.clear();
         size_t view_index{};
         size_t sampler_index{};

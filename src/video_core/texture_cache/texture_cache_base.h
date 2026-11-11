@@ -275,6 +275,11 @@ public:
     /// Return a reference to the given image view id
     [[nodiscard]] ImageView& GetImageView(ImageViewId id) noexcept;
 
+    /// A tracked view may have been removed by a later resolve in the same frame.
+    [[nodiscard]] ImageView* TryGetImageView(ImageViewId id) noexcept {
+        return slot_image_views.contains(id) ? &slot_image_views[id] : nullptr;
+    }
+
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 
@@ -377,7 +382,7 @@ public:
                          const Tegra::Engines::Fermi2D::Surface& src,
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool use_history);
+                         std::array<f32, 2> motion_scale, bool use_history, bool reset_history);
 
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.

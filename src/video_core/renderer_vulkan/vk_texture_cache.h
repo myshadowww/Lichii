@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #ifdef EGLANTINE_NVIDIA_DLSS
 #include "video_core/renderer_vulkan/vk_nvidia_dlss.h"
+#include "video_core/renderer_vulkan/vk_starfox_dlss.h"
 #endif
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -146,13 +147,18 @@ public:
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool use_history);
+                         std::array<f32, 2> motion_scale, bool use_history, bool reset_history);
 
     /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
     /// True while TemporalUpscale would use NVIDIA DLSS (on, Streamline running, not failed).
     [[nodiscard]] bool UsesNvidiaDlss() const;
+
+    /// Completes a validated Star Fox 4K scene before the game draws its HUD.
+    bool WriteStarFoxUpscale(ImageView& input, ImageView& output);
+    bool RecordStarFoxGameplay(ImageView& input, ImageView& output, ImageView& motion,
+                               ImageView& depth, std::array<f32, 2> jitter);
 
     /// Records a health check of a game's DLSS network output against its input (both sampled in
     /// the GENERAL layout) and returns an earlier check's result once the GPU has finished it.
@@ -283,6 +289,8 @@ public:
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool reset);
     std::unique_ptr<NvidiaDlssUpscaler> dlss_upscaler;
+    std::unique_ptr<StarFoxDlss> starfox_dlss;
+    GPUVAddr starfox_color_address{};
     bool dlss_unsupported{};
 #endif
 

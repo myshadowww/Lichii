@@ -552,7 +552,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
     }
 
-    if (RecordingSampledTextures() || deferred_bind) {
+    if (RecordingSampledTextures() || deferred_bind || kepler_compute.IsStarFoxFinalUpscale()) {
         sampled_images.clear();
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);

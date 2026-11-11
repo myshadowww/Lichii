@@ -110,6 +110,11 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_4k_reference.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_effects.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/ocarina_dlss_bias.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/starfox_dlss_decode.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/starfox_dlss_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/starfox_dlss_color.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/starfox_dlss_output.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/starfox_dlss_present.comp
 )
 
 if (HAIKUOS)
