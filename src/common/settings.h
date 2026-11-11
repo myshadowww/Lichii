@@ -67,6 +67,7 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(NeuralRendering, false);
+SWITCHABLE(NvidiaDlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -422,6 +423,9 @@ struct Values {
     };
     SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{
         linkage, NvidiaDlssQuality::Automatic, "nvidia_dlss_quality", Category::Renderer,
+        Specialization::Default, true, true};
+    SwitchableSetting<NvidiaDlssPreset> nvidia_dlss_preset{
+        linkage, NvidiaDlssPreset::M, "nvidia_dlss_preset", Category::Renderer,
         Specialization::Default, true, true};
     SwitchableSetting<NeuralRendering> neural_rendering{linkage, NeuralRendering::Off,
                                                         "neural_rendering", Category::Renderer,
@@ -1050,10 +1054,7 @@ struct Values {
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
-    // The recommended settings offer (common/recommended_settings.h): whether the user has
-    // answered it, and the values its settings held before they were applied.
-    Setting<bool> recommended_settings_prompt_shown{
-        linkage, false, "recommended_settings_prompt_shown", Category::Miscellaneous};
+    // The values the recommended settings (common/recommended_settings.h) replaced.
     Setting<std::string> recommended_settings_backup{
         linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
 
@@ -1087,6 +1088,7 @@ struct NvidiaDlssRuntimeSettings {
     u32 tone = 100;
     u32 structure = 100;
     bool enabled = false;
+    NvidiaDlssPreset preset = NvidiaDlssPreset::M;
 };
 
 /// Publish the selected DLSS options from the settings thread for use by renderer threads.

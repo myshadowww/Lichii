@@ -13,11 +13,11 @@
 #include <atomic>
 #include <compare>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <string_view>
 #include <type_traits>
-#include <deque>
 #include <fmt/core.h>
 
 #include "common/settings_enums.h"
@@ -50,6 +50,7 @@ SWITCHABLE(AntiAliasing, false);
 SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(NeuralRendering, false);
+SWITCHABLE(NvidiaDlssPreset, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -102,7 +103,7 @@ void RefreshNvidiaDlssRuntimeSettings() {
     const auto enabled = static_cast<u64>(values.nvidia_dlss.GetValue());
     nvidia_dlss_runtime_options.store(
         quality | (neural << 8) | (strength << 16) | (tone << 24) | (structure << 32) |
-            (enabled << 40),
+            (enabled << 40) | (static_cast<u64>(values.nvidia_dlss_preset.GetValue()) << 48),
         std::memory_order_relaxed);
 }
 
@@ -114,7 +115,8 @@ NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
             static_cast<u32>((options >> 16) & 0xff),
             static_cast<u32>((options >> 24) & 0xff),
             static_cast<u32>((options >> 32) & 0xff),
-            ((options >> 40) & 1) != 0};
+            ((options >> 40) & 1) != 0,
+            static_cast<NvidiaDlssPreset>((options >> 48) & 0xff)};
 }
 
 std::string GetTimeZoneString(TimeZone time_zone) {

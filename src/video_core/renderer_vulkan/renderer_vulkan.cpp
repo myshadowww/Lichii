@@ -45,6 +45,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #ifdef EGLANTINE_NVIDIA_DLSS
 #include "video_core/vulkan_common/nvidia_dlss.h"
+#include "video_core/renderer_vulkan/vk_nvidia_dlss.h"
 #endif
 #ifdef __ANDROID__
 #include <jni.h>
@@ -425,5 +426,11 @@ void RendererVulkan::RenderAppletCaptureLayer(
     blit_applet.DrawToFrame(device, rasterizer, &applet_frame, capture_layers, VideoCore::Capture::Layout, 1,
                             CaptureFormat);
 }
+
+#ifdef EGLANTINE_NVIDIA_DLSS
+VideoCore::DlssStatus RendererVulkan::GetDlssStatus() const {
+    return NvidiaDlssUpscaler::Status();
+}
+#endif
 
 } // namespace Vulkan

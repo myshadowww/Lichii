@@ -223,6 +223,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
     std::map<u32, QWidget*> hold_graphics;
     std::vector<QWidget*> hold_api;
     QCheckBox* frame_gen_checkbox = nullptr;
+    QCheckBox* nvidia_dlss_checkbox = nullptr;
 
     for (const auto setting : Settings::values.linkage.by_category[Settings::Category::Renderer]) {
 #ifndef HAS_RESHADE
@@ -233,7 +234,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #ifndef EGLANTINE_NVIDIA_DLSS
         // Only builds with a platform NVIDIA runtime backend can use it.
         if (setting->Id() == Settings::values.nvidia_dlss.Id() ||
-            setting->Id() == Settings::values.nvidia_dlss_quality.Id()) {
+            setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+            setting->Id() == Settings::values.nvidia_dlss_preset.Id()) {
             continue;
         }
 #endif
@@ -271,6 +273,12 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
         if (!widget->Valid()) {
             widget->deleteLater();
             continue;
+        }
+
+        if (nvidia_dlss_checkbox && (setting->Id() == Settings::values.nvidia_dlss_quality.Id() ||
+                                     setting->Id() == Settings::values.nvidia_dlss_preset.Id())) {
+            widget->setVisible(nvidia_dlss_checkbox->isChecked());
+            connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget, &QWidget::setVisible);
         }
 
         if (setting->Id() == Settings::values.renderer_backend.Id()) {
@@ -352,6 +360,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
 #endif
 #ifdef EGLANTINE_NVIDIA_DLSS
         } else if (setting->Id() == Settings::values.nvidia_dlss.Id()) {
+            nvidia_dlss_checkbox = widget->checkbox;
             // NVIDIA's files and a download button under the checkbox.
             QWidget* group = new QWidget(this);
             QVBoxLayout* group_layout = new QVBoxLayout(group);
@@ -490,6 +499,8 @@ void ConfigureGraphics::ApplyConfiguration() {
     }
 
     UpdateVsyncSetting();
+
+    Settings::RefreshNvidiaDlssRuntimeSettings();
 
     Settings::values.vulkan_device.SetGlobal(true);
     auto const index = Settings::EnumMetadata<Settings::RendererBackend>::Index();

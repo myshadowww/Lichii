@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -197,7 +198,7 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // The same CPU range is often mapped twice (at its own address and in a sparse region), so
     // reuse its SMMU mapping.
     Nx2DeviceRange range{};
-    bool fresh = false;
+    bool fresh = false; ///< Mapped to the current pages just now
     if (const auto it = nx2_device_ranges.find({cpu_address, size}); it != nx2_device_ranges.end()) {
         range = it->second;
     } else if (session->has_preallocated_area && session->mapper->IsInBounds(cpu_address, size)) {
@@ -232,15 +233,18 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
-    // A destroyed CPU range can return with new physical pages at the same address. Check reused
-    // backing in GPU order before installing the GMMU mapping (Lichii #1221).
-    auto* const memory = fresh ? nullptr : &session->process->GetMemory();
+    // A reused range is checked there too, before the GMMU map, against the pages the CPU range
+    // has now (Nx2RefreshBacking).
+    auto process = fresh ? nullptr
+                         : std::make_shared<Kernel::KScopedAutoObject<Kernel::KProcess>>(
+                               system.Kernel(), session->process);
     system.GPU().MapInOrder(
         gpu_address, size,
-        [gmmu = gmmu.get(), &smmu = system.Host1x().MemoryManager(), memory, asid = session->asid,
-         gpu_address, cpu_address, device_address, size] {
-            if (memory != nullptr) {
-                Nx2RefreshBacking(smmu, *memory, asid, device_address, cpu_address, size);
+        [gmmu = gmmu.get(), &smmu = system.Host1x().MemoryManager(), process = std::move(process),
+         asid = session->asid, gpu_address, cpu_address, device_address, size] {
+            if (process) {
+                Nx2RefreshBacking(smmu, process->GetPointerUnsafe()->GetMemory(), asid,
+                                  device_address, cpu_address, size);
             }
             gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
         });
