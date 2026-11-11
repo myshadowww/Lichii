@@ -153,6 +153,10 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 `Common::g_build_fullname` and `g_scm_rev`, and `System::IsPaused`. It measures fps from
 `Core::g_nx2_present_count` (`src/core/core.cpp:78`) over a short window. It does not call
 `GetAndResetPerfStats`, which would reset the Qt status bar's counters.
+Linux NGX builds also return `nvidia_dlss` (`available`, `successful_evaluations`, `error`)
+and `neural_rendering` (`ready`, `submitted_frames`, `error`). These are read-only runtime
+snapshots: compare successive counts to verify activity. Successful NGX API evaluations and
+recorded NR submissions do not prove GPU completion, presentation or image quality.
 
 **`frame_times`** `{seconds?, refresh_hz?}` waits for `seconds` (default 5, > 0, at most 60),
 interruptible on shutdown like `status`. It measures intervals between guest presents inside
