@@ -1,0 +1,19 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D dlss_color;
+layout(binding = 1, rgba16f) uniform image2D guest_color;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(guest_color)))) {
+        return;
+    }
+    vec3 color = textureLod(dlss_color, (vec2(pixel) + 0.5) / vec2(imageSize(guest_color)), 0).rgb;
+    if (any(isnan(color)) || any(isinf(color))) {
+        return; // This frame's spatial repair is already in the destination.
+    }
+    float alpha = imageLoad(guest_color, pixel).a;
+    imageStore(guest_color, pixel, vec4(max(color, vec3(0.0)), alpha));
+}

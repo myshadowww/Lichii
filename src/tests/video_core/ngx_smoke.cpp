@@ -24,6 +24,8 @@
 #define VMA_IMPLEMENTATION
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/renderer_vulkan/vk_nvidia_dlss.h"
+#include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_starfox_dlss.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/vulkan_common/ngx_dlss.h"
 #include "video_core/vulkan_common/ngx_api.h"
@@ -49,8 +51,9 @@ struct InputImage {
     NvidiaDlssUpscaler::Image resource;
 };
 
-InputImage MakeInput(const Device &device, MemoryAllocator &allocator, VkFormat format,
-                     VkImageAspectFlags aspect, VkExtent2D extent) {
+InputImage MakeInput(const Device& device, MemoryAllocator& allocator, VkFormat format,
+                     VkImageAspectFlags aspect, VkExtent2D extent,
+                     VkImageUsageFlags extra_usage = 0, VkImageAspectFlags barrier_aspect = 0) {
     InputImage result;
     result.image = allocator.CreateImage({
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -61,7 +64,7 @@ InputImage MakeInput(const Device &device, MemoryAllocator &allocator, VkFormat 
         .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extra_usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     });
@@ -73,8 +76,267 @@ InputImage MakeInput(const Device &device, MemoryAllocator &allocator, VkFormat 
         .format = format,
         .subresourceRange = range,
     });
-    result.resource = {*result.view, *result.image, format, range, aspect};
+    result.resource = {*result.view, *result.image, format, range,
+                       barrier_aspect ? barrier_aspect : aspect};
     return result;
+}
+
+/// Exercise the Star Fox adapter's captured formats, history lifecycle and same-frame fallback.
+void StarFoxCases(const Device& device, bool super_resolution) {
+    MemoryAllocator allocator{device};
+    StateTracker tracker;
+    Scheduler scheduler{device, tracker};
+    DescriptorPool pool{device, scheduler};
+    ComputePassDescriptorQueue queue{device,
+                                     ComputePassDescriptorQueue::COMPUTE_FRAME_PAYLOAD_SIZE};
+    StarFoxDlss adapter{device, scheduler, allocator, pool, queue};
+    Settings::values.nvidia_dlss_quality = super_resolution ? Settings::NvidiaDlssQuality::Automatic
+                                                            : Settings::NvidiaDlssQuality::Native;
+    Settings::values.nvidia_dlss_preset = Settings::NvidiaDlssPreset::NvidiaDefault;
+    Settings::values.neural_rendering = Settings::NeuralRendering::Off;
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+
+    auto& api = const_cast<Ngx::Api&>(Ngx::GetApi());
+    const auto evaluate = api.evaluate;
+    // Forward successful evaluations to the real GPU backend while observing its reset input.
+    // The scheduler is drained before these test-only variables are read or changed.
+    static decltype(api.evaluate) forward_evaluate;
+    static bool inject_failure;
+    static int observed_reset;
+    static u32 evaluate_calls;
+    forward_evaluate = evaluate;
+    SCOPE_EXIT {
+        api.evaluate = evaluate;
+    };
+    api.evaluate = [](VkCommandBuffer cmd, const NVSDK_NGX_Handle* feature,
+                      const NVSDK_NGX_Parameter* parameters,
+                      PFN_NVSDK_NGX_ProgressCallback progress) {
+        ++evaluate_calls;
+        parameters->Get(NVSDK_NGX_Parameter_Reset, &observed_reset);
+        if (inject_failure) {
+            return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+        }
+        return forward_evaluate(cmd, feature, parameters, progress);
+    };
+    constexpr std::array<u8, 4> encoded{128, 64, 192, 255};
+    constexpr std::array<float, 4> fallback{0.75f, 0.125f, 0.875f, 0.375f};
+    constexpr std::array<float, 4> scene_fallback{0.0f, 1.0f, 0.0f, 0.4f};
+    constexpr std::array<u8, 4> scene_fallback_bytes{0, 255, 0, 102};
+    const auto linear = [](u8 byte) {
+        const double value = byte / 255.0;
+        return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+    };
+    const auto neural_before = VideoCore::NeuralRendering::GetStatus().submitted_frames;
+    for (u32 frame = 0; frame < 7; ++frame) {
+        // Repeated frame, explicit reset, skipped evaluation, resize, guest reset, failure.
+        if (frame == 2) {
+            adapter.ResetHistory();
+        }
+        if (frame == 3) {
+            adapter.TickFrame();
+        }
+        const VkExtent2D extent = frame < 4 ? VkExtent2D{320, 180} : VkExtent2D{384, 216};
+        const VkExtent2D output_extent =
+            super_resolution ? VkExtent2D{extent.width * 2, extent.height * 2} : extent;
+        const size_t pixels = size_t{extent.width} * extent.height;
+        const size_t scene_pixels = size_t{output_extent.width} * output_extent.height;
+        auto color = MakeInput(device, allocator, VK_FORMAT_R8G8B8A8_SRGB,
+                               VK_IMAGE_ASPECT_COLOR_BIT, extent);
+        auto depth =
+            MakeInput(device, allocator, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                      extent, 0, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+        auto motion = MakeInput(device, allocator, VK_FORMAT_R16G16_SFLOAT,
+                                VK_IMAGE_ASPECT_COLOR_BIT, extent);
+        auto target =
+            MakeInput(device, allocator, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
+                      extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        auto scene =
+            MakeInput(device, allocator, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
+                      output_extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        auto scene_readback = allocator.CreateBuffer(
+            {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = scene_pixels * 4,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            MemoryUsage::Download);
+        auto upload = allocator.CreateBuffer(
+            {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = pixels * encoded.size(),
+                .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            MemoryUsage::Upload);
+        for (size_t pixel = 0; pixel < pixels; ++pixel) {
+            std::memcpy(upload.Mapped().data() + pixel * encoded.size(), encoded.data(),
+                        encoded.size());
+        }
+        upload.Flush();
+        auto readback = allocator.CreateBuffer(
+            {
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = pixels * 8,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            },
+            MemoryUsage::Download);
+        scheduler.Record([&](vk::CommandBuffer cmd) {
+            for (const auto& image : {color.resource, depth.resource, motion.resource,
+                                      target.resource, scene.resource}) {
+                auto range = image.range;
+                range.aspectMask = image.barrier_aspect;
+                cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                                    VkImageMemoryBarrier{
+                                        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .image = image.image,
+                                        .subresourceRange = range,
+                                    });
+            }
+            // Upload encoded bytes: a Vulkan sRGB clear would encode the clear value itself.
+            cmd.CopyBufferToImage(
+                *upload, *color.image, VK_IMAGE_LAYOUT_GENERAL,
+                VkBufferImageCopy{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageExtent = {extent.width, extent.height, 1}});
+            cmd.ClearColorImage(*motion.image, VK_IMAGE_LAYOUT_GENERAL, {}, motion.resource.range);
+            VkClearColorValue clear{};
+            std::copy(fallback.begin(), fallback.end(), clear.float32);
+            cmd.ClearColorImage(*target.image, VK_IMAGE_LAYOUT_GENERAL, clear,
+                                target.resource.range);
+            std::copy(scene_fallback.begin(), scene_fallback.end(), clear.float32);
+            cmd.ClearColorImage(*scene.image, VK_IMAGE_LAYOUT_GENERAL, clear, scene.resource.range);
+            const VkClearDepthStencilValue clear_depth{0.5f, 0};
+            auto depth_range = depth.resource.range;
+            depth_range.aspectMask = depth.resource.barrier_aspect;
+            const auto clear_fn = reinterpret_cast<PFN_vkCmdClearDepthStencilImage>(
+                device.GetDispatchLoader().vkGetDeviceProcAddr(*device.GetLogical(),
+                                                               "vkCmdClearDepthStencilImage"));
+            clear_fn(*cmd, *depth.image, VK_IMAGE_LAYOUT_GENERAL, &clear_depth, 1, &depth_range);
+        });
+        inject_failure = frame == 6;
+        observed_reset = -1;
+        evaluate_calls = 0;
+        const auto before = NvidiaDlssUpscaler::Status().evaluations;
+        const NvidiaDlssUpscaler::Inputs inputs{color.resource,
+                                                depth.resource,
+                                                motion.resource,
+                                                extent,
+                                                output_extent,
+                                                {0.125f, 0.2777778f},
+                                                {-0.5f * extent.width, 0.5f * extent.height},
+                                                frame == 5,
+                                                true,
+                                                true};
+        Require(adapter.Record(inputs, *target.view), "Star Fox adapter refused a valid frame");
+        Require(!adapter.WriteUpscaledOutput(*scene.view,
+                                             {output_extent.width + 8, output_extent.height}),
+                "Star Fox adapter accepted a mismatched scene extent");
+        const bool scene_queued = adapter.WriteUpscaledOutput(*scene.view, output_extent);
+        if (!inject_failure) {
+            Require(scene_queued == super_resolution,
+                    "Star Fox scene output did not follow the native/SR extent contract");
+        }
+        // Failure may already have reached the worker here. Whether refused immediately or
+        // queued and skipped there, the current native scene must remain intact.
+
+        scheduler.Record([&](vk::CommandBuffer cmd) {
+            cmd.PipelineBarrier(
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                VkMemoryBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT});
+            cmd.CopyImageToBuffer(
+                *target.image, VK_IMAGE_LAYOUT_GENERAL, *readback,
+                VkBufferImageCopy{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageExtent = {extent.width, extent.height, 1}});
+            cmd.CopyImageToBuffer(
+                *scene.image, VK_IMAGE_LAYOUT_GENERAL, *scene_readback,
+                VkBufferImageCopy{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageExtent = {output_extent.width, output_extent.height, 1}});
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                                VkMemoryBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                                VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                VK_ACCESS_HOST_READ_BIT});
+        });
+        scheduler.Finish();
+        Require(evaluate_calls == 1, "Star Fox adapter did not invoke NGX exactly once");
+        Require(NvidiaDlssUpscaler::Status().evaluations == before + !inject_failure,
+                "Star Fox adapter failed a real evaluation or counted an injected failure");
+        if (frame == 0 || (frame >= 2 && frame <= 5)) {
+            Require(observed_reset == 1,
+                    "Star Fox adapter lost a lifecycle or guest history reset");
+        }
+        // Slow first-time shader compilation may trigger the adapter's wall-clock reset on
+        // an otherwise consecutive frame; do not assume that evaluation finishes within 250 ms.
+        Require(observed_reset == 0 || observed_reset == 1, "NGX did not receive a reset value");
+        readback.Invalidate();
+        std::array<double, 3> sums{};
+        const auto bytes = readback.Mapped();
+        for (size_t pixel = 0; pixel < pixels; ++pixel) {
+            for (size_t channel = 0; channel < 4; ++channel) {
+                _Float16 half;
+                std::memcpy(&half, bytes.data() + (pixel * 4 + channel) * 2, sizeof(half));
+                const float value = static_cast<float>(half);
+                Require(std::isfinite(value), "Star Fox adapter produced a non-finite component");
+                if (channel == 3 || inject_failure) {
+                    Require(value == fallback[channel],
+                            "Star Fox adapter changed alpha or overwrote same-frame fallback");
+                }
+                if (channel < 3) {
+                    sums[channel] += value;
+                }
+            }
+        }
+        if (!inject_failure) {
+            for (size_t channel = 0; channel < sums.size(); ++channel) {
+                Require(std::abs(sums[channel] / pixels - linear(encoded[channel])) < 0.025,
+                        "Star Fox sRGB input was not decoded to linear DLSS output");
+            }
+        } else {
+            Require(!adapter.Record(inputs, *target.view),
+                    "Failed Star Fox adapter did not retain spatial fallback on following frames");
+        }
+        scene_readback.Invalidate();
+        const auto scene_bytes = scene_readback.Mapped();
+        std::array<double, 3> scene_sums{};
+        for (size_t pixel = 0; pixel < scene_pixels; ++pixel) {
+            for (size_t channel = 0; channel < 4; ++channel) {
+                const auto value = scene_bytes[pixel * 4 + channel];
+                if (!super_resolution || inject_failure) {
+                    Require(value == scene_fallback_bytes[channel],
+                            "Star Fox scene fallback RGB/alpha was overwritten");
+                } else if (channel == 3) {
+                    Require(value == 255, "Star Fox scene output did not write opaque alpha");
+                }
+                if (channel < 3) {
+                    scene_sums[channel] += value;
+                }
+            }
+        }
+        if (super_resolution && !inject_failure) {
+            for (size_t channel = 0; channel < scene_sums.size(); ++channel) {
+                Require(std::abs(scene_sums[channel] / scene_pixels - encoded[channel]) < 3.0,
+                        "Star Fox scene output did not apply exactly one sRGB encoding");
+            }
+        }
+        Require(VideoCore::NeuralRendering::GetStatus().submitted_frames == neural_before,
+                "Star Fox adapter smoke unexpectedly enabled neural rendering");
+        adapter.TickFrame();
+        Require(!adapter.WriteUpscaledOutput(*scene.view, output_extent),
+                "Star Fox adapter accepted a stale scene from the previous frame");
+        queue.TickFrame();
+        std::printf(
+            "PASS Star Fox frame %u: %ux%u -> %ux%u, reset=%d, fallback=%d; RGB %.4f %.4f %.4f; "
+            "alpha preserved\n",
+            frame, extent.width, extent.height, output_extent.width, output_extent.height,
+            observed_reset, inject_failure, sums[0] / pixels, sums[1] / pixels, sums[2] / pixels);
+    }
 }
 
 /// Check live neural controls, quality, history resets, rebinding and failures with concurrent submits.
@@ -367,6 +629,8 @@ int main(int argc, char **argv) try {
                 Require(!VideoCore::NeuralRendering::GetStatus().error.empty(),
                         "Missing neural model was not diagnosed");
             }
+            StarFoxCases(device, false);
+            StarFoxCases(device, true);
         }
         Require(!NvidiaDlss::IsAvailable(), "Device teardown left NGX active");
         std::printf("PASS device lifecycle %d\n", run + 1);

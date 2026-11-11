@@ -17,6 +17,17 @@ constexpr bool ValidColorFormats(VideoCore::Surface::PixelFormat input,
             output == PixelFormat::R16G16B16A16_FLOAT);
 }
 
+constexpr bool StarFoxFormats(VideoCore::Surface::PixelFormat input,
+                              VideoCore::Surface::PixelFormat output) {
+    using VideoCore::Surface::PixelFormat;
+    return input == PixelFormat::A8B8G8R8_SRGB && output == PixelFormat::R16G16B16A16_FLOAT;
+}
+
+constexpr bool ValidDepthFormat(VideoCore::Surface::PixelFormat depth, bool star_fox) {
+    using VideoCore::Surface::PixelFormat;
+    return depth == (star_fox ? PixelFormat::D32_FLOAT_S8_UINT : PixelFormat::D32_FLOAT);
+}
+
 constexpr std::uint64_t FastFusionProgramId = 0x040041E0212AE000ULL;
 constexpr std::array FastFusionCandidates{0xb8ed9b1cd5c24e6dULL, 0x7f0f03c0529ca569ULL,
                                           0x7a06618494a29bcdULL};

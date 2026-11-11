@@ -8,6 +8,17 @@
 
 namespace DC = VideoCommon::DlssContract;
 
+TEST_CASE("Star Fox depth-stencil input is isolated from the Fire Emblem contract",
+          "[dlss_contract]") {
+    using VideoCore::Surface::PixelFormat;
+    REQUIRE(DC::StarFoxFormats(PixelFormat::A8B8G8R8_SRGB, PixelFormat::R16G16B16A16_FLOAT));
+    REQUIRE_FALSE(DC::StarFoxFormats(PixelFormat::A8B8G8R8_UNORM, PixelFormat::R16G16B16A16_FLOAT));
+    REQUIRE(DC::ValidDepthFormat(PixelFormat::D32_FLOAT_S8_UINT, true));
+    REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::D32_FLOAT, true));
+    REQUIRE(DC::ValidDepthFormat(PixelFormat::D32_FLOAT, false));
+    REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::D32_FLOAT_S8_UINT, false));
+}
+
 TEST_CASE("Spatial cutscene replacement decodes sRGB into float without temporal history",
           "[dlss_contract]") {
     using VideoCore::Surface::PixelFormat;

@@ -168,10 +168,10 @@ TEST_CASE("Star Fox captured passes use the validated colour and jitter slots", 
     REQUIRE(starfox);
     REQUIRE(starfox->prepass == 0xd686ca0b9fad9e6dULL);
     REQUIRE(starfox->output == 0x7d3764ff101bec27ULL);
-    REQUIRE(starfox->spatial_only);
+    REQUIRE(starfox->star_fox);
     const auto fire_emblem = FE::CapturedPasses(FE::ProgramId);
     REQUIRE(fire_emblem);
-    REQUIRE_FALSE(fire_emblem->spatial_only);
+    REQUIRE_FALSE(fire_emblem->star_fox);
     REQUIRE_FALSE(FE::CapturedPasses(0x040074A01BF12000ULL));
 }
 
@@ -192,6 +192,19 @@ TEST_CASE("Star Fox cutscene prepass opens the existing spatial replacement chai
     REQUIRE_FALSE(passes->IsPrepass(FE::PrepassProgramKey));
     REQUIRE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(FE::PrepassProgramKey));
     REQUIRE_FALSE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(0));
+}
+
+TEST_CASE("Star Fox scene output requires its captured title and native program",
+          "[starfox_upscale]") {
+    REQUIRE(FE::IsStarFoxFinalUpscale(FE::StarFoxProgramId, FE::StarFoxFinalUpscaleProgramKey));
+    for (unsigned bit = 0; bit < 64; ++bit) {
+        REQUIRE_FALSE(FE::IsStarFoxFinalUpscale(FE::StarFoxProgramId ^ (1ULL << bit),
+                                                FE::StarFoxFinalUpscaleProgramKey));
+        REQUIRE_FALSE(FE::IsStarFoxFinalUpscale(FE::StarFoxProgramId,
+                                                FE::StarFoxFinalUpscaleProgramKey ^ (1ULL << bit)));
+    }
+    REQUIRE_FALSE(FE::IsStarFoxFinalUpscale(FE::ProgramId, FE::StarFoxFinalUpscaleProgramKey));
+    REQUIRE_FALSE(FE::IsStarFoxFinalUpscale(FE::StarFoxProgramId, 0xa2884a1f4cd841e7ULL));
 }
 
 TEST_CASE("Star Fox logged native-resolution cutscene colour pair is accepted", "[starfox_upscale]") {
@@ -249,4 +262,58 @@ TEST_CASE("Star Fox logged native-resolution cutscene colour pair is accepted", 
     alias.address_low = input.address_low;
     alias.address_high.Assign(input.address_high);
     REQUIRE_FALSE(FE::ValidPair(input, alias, true));
+}
+
+TEST_CASE("Star Fox temporal inputs retain captured motion and depth interpretation",
+          "[starfox_upscale]") {
+    const auto color =
+        std::bit_cast<TICEntry>(std::array<u32, 8>{0x58d24908, 0x26f62000, 0x00600081, 0x00070020,
+                                                   0xe8c0077f, 0x80000437, 0x03000000, 0x00000000});
+    const auto motion =
+        std::bit_cast<TICEntry>(std::array<u32, 8>{0x70d7ff8c, 0x31fd2000, 0x00600081, 0x00070020,
+                                                   0xe880077f, 0x80000437, 0x03000000, 0x00000000});
+    const auto depth =
+        std::bit_cast<TICEntry>(std::array<u32, 8>{0x701253b0, 0x230f2000, 0x00600081, 0x00070020,
+                                                   0xe880077f, 0x80000437, 0x03000000, 0x00000000});
+    REQUIRE(FE::ValidStarFoxMotionDepth(color, motion, depth));
+    for (const bool alter_depth : {false, true}) {
+        const auto rejected = [&](auto mutate) {
+            auto mv = motion;
+            auto z = depth;
+            mutate(alter_depth ? z : mv);
+            REQUIRE_FALSE(FE::ValidStarFoxMotionDepth(color, mv, z));
+        };
+        rejected([](auto& image) { image.width_minus_one.Assign(1279); });
+        rejected([](auto& image) { image.height_minus_1.Assign(719); });
+        rejected([](auto& image) { image.texture_type.Assign(TextureType::Texture2DArray); });
+        rejected([](auto& image) { image.max_mip_level.Assign(1); });
+        rejected([](auto& image) { image.res_min_mip_level.Assign(1); });
+        rejected([](auto& image) { image.msaa_mode.Assign(MsaaMode::Msaa2x2); });
+        rejected([](auto& image) { image.is_sparse.Assign(1); });
+        rejected([&](auto& image) { image.address_low = color.address_low; });
+        rejected([](auto& image) { image.srgb_conversion.Assign(1); });
+    }
+    auto signed_motion = motion;
+    signed_motion.r_type.Assign(ComponentType::SNORM);
+    REQUIRE_FALSE(FE::ValidStarFoxMotionDepth(color, signed_motion, depth));
+    auto swapped_motion = motion;
+    swapped_motion.x_source.Assign(SwizzleSource::G);
+    REQUIRE_FALSE(FE::ValidStarFoxMotionDepth(color, swapped_motion, depth));
+    auto wrong_depth = depth;
+    wrong_depth.format.Assign(TextureFormat::Z32);
+    REQUIRE_FALSE(FE::ValidStarFoxMotionDepth(color, motion, wrong_depth));
+    REQUIRE_FALSE(FE::ValidStarFoxMotionDepth(color, depth, motion));
+}
+
+TEST_CASE("Star Fox history reset belongs to the captured frame", "[starfox_upscale]") {
+    FE::FrameJitter state;
+    state.Capture(0x1000, 1920, 1080, {-0.4375f, 0.38888896f}, true);
+    const auto first = state.Take();
+    REQUIRE(first);
+    REQUIRE(first->reset);
+    REQUIRE_FALSE(state.Take());
+    state.Capture(0x1000, 1920, 1080, {0.125f, -0.277778f});
+    const auto next = state.Take();
+    REQUIRE(next);
+    REQUIRE_FALSE(next->reset);
 }

@@ -2243,6 +2243,14 @@ void RasterizerVulkan::DispatchCompute() {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
+    if (kepler_compute->IsStarFoxFinalUpscale() && !byte_addressed_shadow) {
+        const auto sampled = pipeline->SampledImages();
+        const auto written = pipeline->WrittenImages();
+        if (sampled.size() == 1 && written.size() == 1 && sampled[0].id && written[0]) {
+            texture_cache_runtime.WriteStarFoxUpscale(texture_cache.GetImageView(sampled[0].id),
+                                                      texture_cache.GetImageView(written[0]));
+        }
+    }
     buffer_cache.NoteWorkRecorded(true);
     SubmitNx2ListCopies();
     publish_collision_map();
@@ -3393,10 +3401,11 @@ std::optional<VideoCore::GameDlssProbe> RasterizerVulkan::ProbeGameDlssOutput(
 bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
-    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history) {
+    std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history,
+    bool reset_history) {
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
-                                          use_history);
+                                         use_history, reset_history);
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {

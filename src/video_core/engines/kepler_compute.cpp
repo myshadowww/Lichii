@@ -570,6 +570,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
     dlss_chain.output_pass = false;
+    starfox_final_upscale = false;
     // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
     // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
     constexpr u32 max_dispatches = 64;
@@ -777,15 +778,17 @@ constexpr u32 DLSS_CHECK_MISMATCH_PERCENT = 3;
 
 bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     using namespace VideoCommon::FireEmblemUpscale;
+    starfox_final_upscale =
+        VideoCommon::FireEmblemUpscale::IsStarFoxFinalUpscale(program_id, native_key);
     const auto passes = CapturedPasses(program_id);
     if (!passes) {
         return false;
     }
-    if (passes->spatial_only && (passes->IsPrepass(native_key) || native_key == passes->output)) {
+    if (passes->star_fox && (passes->IsPrepass(native_key) || native_key == passes->output)) {
         TraceDlssContract(native_key, false);
     }
     if (passes->IsPrepass(native_key)) {
-        dlss_chain.spatial_only = passes->spatial_only;
+        dlss_chain.star_fox = passes->star_fox;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
@@ -797,7 +800,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     }
     dlss_chain.pending.insert(native_key);
     dlss_chain.output_pass = native_key == passes->output;
-    if (dlss_chain.spatial_only) {
+    if (dlss_chain.star_fox) {
         return false;
     }
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
@@ -967,7 +970,7 @@ void KeplerCompute::UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReaso
 bool KeplerCompute::FinishDlssEvaluation() {
     dlss_chain.active = false;
     dlss_chain.output_pass = false;
-    if (dlss_chain.spatial_only) {
+    if (dlss_chain.star_fox) {
         dlss_chain.pending.clear();
         using namespace VideoCommon::FireEmblemUpscale;
         if (UseReplacement(StarFoxProgramId, StarFoxOutputProgramKey,
@@ -1230,7 +1233,8 @@ void KeplerCompute::RememberDlssMotionVectors() {
         return GetTICEntry(tic_index);
     };
     const auto color = image(0x278), motion = image(0x290);
-    if (!color || !motion || color->format != Texture::TextureFormat::B10G11R11 ||
+    if (!color || !motion ||
+        !VideoCommon::FireEmblemUpscale::ValidInput(*color, dlss_chain.star_fox) ||
         motion->format != Texture::TextureFormat::R16G16 || motion->Address() == 0 ||
         motion->Width() != color->Width() || motion->Height() != color->Height() ||
         !motion->IsBlockLinear())
@@ -1238,7 +1242,14 @@ void KeplerCompute::RememberDlssMotionVectors() {
     dlss_motion_vectors = *motion;
     dlss_motion_color = color->Address();
     const auto depth = cbuf.size.Value() >= 0x29c ? image(0x298) : std::nullopt;
-    if (depth && depth->format == Texture::TextureFormat::Z32 && depth->Address() != 0 &&
+    if (dlss_chain.star_fox && (!depth || !VideoCommon::FireEmblemUpscale::ValidStarFoxMotionDepth(
+                                              *color, *motion, *depth))) {
+        dlss_motion_vectors.reset();
+        return;
+    }
+    const auto depth_format =
+        dlss_chain.star_fox ? Texture::TextureFormat::Z32_X24S8 : Texture::TextureFormat::Z32;
+    if (depth && depth->format == depth_format && depth->Address() != 0 &&
         depth->Width() == color->Width() && depth->Height() == color->Height() &&
         depth->IsBlockLinear()) {
         dlss_depth = *depth;
@@ -1264,15 +1275,15 @@ void KeplerCompute::CaptureFireEmblemJitter() {
         return;
     }
     const auto color = GetTICEntry(index);
-    if (!ValidInput(color, dlss_chain.spatial_only)) {
+    if (!ValidInput(color, dlss_chain.star_fox)) {
         return;
     }
-    fe_upscale_jitter.Capture(color.Address(), color.Width(), color.Height(),
+    fe_upscale_jitter.Capture(
+        color.Address(), color.Width(), color.Height(),
         {std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset)),
-         std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))});
-    if (!dlss_chain.spatial_only) {
-        RememberDlssMotionVectors();
-    }
+         std::bit_cast<f32>(memory_manager.Read<u32>(address + JitterOffset + sizeof(f32)))},
+        dlss_chain.star_fox && memory_manager.Read<u32>(address + 0x1d0) != 0);
+    RememberDlssMotionVectors();
 }
 
 void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
@@ -1333,8 +1344,8 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
     }();
     const bool use_history = allow_history && requested_history;
-    const size_t game_index = dlss_chain.spatial_only ? 1 : 0;
-    const char* const game = dlss_chain.spatial_only ? "Star Fox" : "Fire Emblem";
+    const size_t game_index = dlss_chain.star_fox ? 1 : 0;
+    const char* const game = dlss_chain.star_fox ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
     const auto motion = std::exchange(dlss_motion_vectors, std::nullopt);
     const auto depth = std::exchange(dlss_depth, std::nullopt);
@@ -1363,9 +1374,10 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     };
     const auto input = image(OutputColorInputOffset);
     const auto output = image(OutputColorOffset);
-    if (!input || !output || !ValidPair(*input, *output, dlss_chain.spatial_only) ||
-        jitter->color != input->Address() || (use_history && dlss_motion_color != input->Address()) ||
-        jitter->width != input->Width() || jitter->height != input->Height()) {
+    if (!input || !output || !ValidPair(*input, *output, dlss_chain.star_fox) ||
+        jitter->color != input->Address() ||
+        (use_history && dlss_motion_color != input->Address()) || jitter->width != input->Width() ||
+        jitter->height != input->Height()) {
         return false;
     }
     const auto surface = [](const Texture::TICEntry& tic, Tegra::RenderTargetFormat format) {
@@ -1382,21 +1394,33 @@ bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
-    const auto input_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::A8B8G8R8_SRGB
-                                                     : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
-    const auto output_format = dlss_chain.spatial_only ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
-                                                      : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    const auto input_format = dlss_chain.star_fox ? Tegra::RenderTargetFormat::A8B8G8R8_SRGB
+                                                  : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
+    const auto output_format = dlss_chain.star_fox ? Tegra::RenderTargetFormat::R16G16B16A16_FLOAT
+                                                   : Tegra::RenderTargetFormat::B10G11R11_FLOAT;
     const bool done = rasterizer->AccelerateTemporalUpscale(
         surface(*input, input_format), surface(*output, output_format),
         use_history ? surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT) : Fermi2D::Surface{},
         use_history ? &*depth : nullptr, jitter->offset,
         use_history ? std::array{1.0f, 1.0f} : std::array{0.0f, 0.0f}, use_history);
+    bool starfox_temporal = false;
+    if (done && dlss_chain.star_fox && motion && depth && dlss_motion_color == input->Address() &&
+        Settings::GetNvidiaDlssRuntimeSettings().enabled) {
+        // Keep the spatial repair ready for this frame if asynchronous DLSS evaluation fails.
+        starfox_temporal = rasterizer->AccelerateTemporalUpscale(
+            surface(*input, input_format), surface(*output, output_format),
+            surface(*motion, Tegra::RenderTargetFormat::R16G16_FLOAT), &*depth, jitter->offset,
+            {-0.5f, 0.5f}, true, jitter->reset);
+    }
     static std::array<u32, 2> logged{};
     if (logged[game_index]++ < 8) {
-        LOG_INFO(HW_GPU, "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
-                 game, done ? "applied" : "unavailable; retaining native dispatch", use_history,
-                 input->Address(), input->Width(), input->Height(), output->Address(),
-                 output->Width(), output->Height(), jitter->offset[0], jitter->offset[1]);
+        LOG_INFO(
+            HW_GPU,
+            "{} DLSS replacement: {} temporal={} input={:#x} {}x{} output={:#x} {}x{} jitter={},{}",
+            game, done ? "applied" : "unavailable; retaining native dispatch",
+            use_history || starfox_temporal, input->Address(), input->Width(), input->Height(),
+            output->Address(), output->Width(), output->Height(), jitter->offset[0],
+            jitter->offset[1]);
     }
     return done;
 }

@@ -51,6 +51,7 @@
 #include "video_core/dlss_contract.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #ifdef EGLANTINE_NVIDIA_DLSS
+#include "video_core/renderer_vulkan/vk_starfox_dlss.h"
 #include "video_core/vulkan_common/nvidia_dlss.h"
 #endif
 #include "video_core/vulkan_common/unbacked_fallback.h"
@@ -2079,7 +2080,8 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& input_color, ImageView& motion_vectors,
                                           ImageView* depth, std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool use_history) {
+                                          std::array<f32, 2> motion_scale, bool use_history,
+                                          bool reset_history) {
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
@@ -2098,13 +2100,15 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
         return VideoCommon::DlssContract::FitsExtent(requested, extent);
     };
     const VkExtent2D output_extent = dst_framebuffer->RenderArea();
+    const bool star_fox = VideoCommon::DlssContract::StarFoxFormats(input_color.format, dst.format);
     if (!plain(dst) || !plain(input_color) || !fits(input_color, render_size) ||
         !fits(dst, {output_extent.width, output_extent.height}) ||
-        !VideoCommon::DlssContract::ValidColorFormats(input_color.format, dst.format, use_history) ||
+        (!VideoCommon::DlssContract::ValidColorFormats(input_color.format, dst.format,
+                                                       use_history) &&
+         !(star_fox && use_history)) ||
         input_color.ImageHandle() == dst.ImageHandle() ||
-        !VideoCommon::DlssContract::ValidGeometry(render_size,
-                                                 {output_extent.width, output_extent.height},
-                                                 jitter, motion_scale)) {
+        !VideoCommon::DlssContract::ValidGeometry(
+            render_size, {output_extent.width, output_extent.height}, jitter, motion_scale)) {
         return false;
     }
     if (use_history && (!plain(motion_vectors) || !fits(motion_vectors, render_size) ||
@@ -2113,10 +2117,84 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                         input_color.size.height != motion_vectors.size.height)) {
         return false;
     }
-    if (use_history && depth && (!plain(*depth) || !fits(*depth, render_size) ||
-                                depth->format != PixelFormat::D32_FLOAT ||
-                                input_color.size.width != depth->size.width ||
-                                input_color.size.height != depth->size.height)) {
+    if (use_history && depth &&
+        (!plain(*depth) || !fits(*depth, render_size) ||
+         !VideoCommon::DlssContract::ValidDepthFormat(depth->format, star_fox) ||
+         input_color.size.width != depth->size.width ||
+         input_color.size.height != depth->size.height)) {
+        return false;
+    }
+    if (star_fox && use_history) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+        if (!UsesNvidiaDlss() || !depth || render_size[0] != output_extent.width ||
+            render_size[1] != output_extent.height || input_color.IsRescaled() ||
+            dst.IsRescaled()) {
+            if (starfox_dlss) {
+                starfox_dlss->ResetHistory();
+            }
+            return false;
+        }
+        if (!dst.BackingImage() ||
+            !(dst.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT)) {
+            return false;
+        }
+        const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
+            return NvidiaDlssUpscaler::Image{
+                .view = handle,
+                .image = view.ImageHandle(),
+                .format =
+                    MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format)
+                        .format,
+                .range = {aspect, 0, 1, 0, 1},
+                .barrier_aspect = ImageAspectMask(view.format),
+            };
+        };
+        try {
+            const auto target =
+                dst.StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
+            if (!target) {
+                return false;
+            }
+            if (!starfox_dlss) {
+                starfox_dlss =
+                    std::make_unique<StarFoxDlss>(device, scheduler, memory_allocator,
+                                                  descriptor_pool, compute_pass_descriptor_queue);
+            }
+            const bool native_resolution = Settings::GetNvidiaDlssRuntimeSettings().quality ==
+                                           Settings::NvidiaDlssQuality::Native;
+            const VkExtent2D dlss_extent =
+                !native_resolution && render_size == std::array<u32, 2>{1920, 1080}
+                    ? VkExtent2D{3840, 2160}
+                    : output_extent;
+            const bool recorded = starfox_dlss->Record(
+                {
+                    .color = image(input_color, input_color.Handle(Shader::TextureType::Color2D),
+                                   VK_IMAGE_ASPECT_COLOR_BIT),
+                    .depth = image(*depth, depth->DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+                    .motion_vectors =
+                        image(motion_vectors, motion_vectors.Handle(Shader::TextureType::Color2D),
+                              VK_IMAGE_ASPECT_COLOR_BIT),
+                    .render_size = {render_size[0], render_size[1]},
+                    .upscale_size = dlss_extent,
+                    .jitter = jitter,
+                    .motion_vector_scale = {motion_scale[0] * render_size[0],
+                                            motion_scale[1] * render_size[1]},
+                    .reset = reset_history,
+                    .depth_inverted = true,
+                    .hdr = true,
+                },
+                target);
+            if (recorded) {
+                starfox_color_address = input_color.gpu_addr;
+            }
+            return recorded;
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan,
+                        "Star Fox NVIDIA DLSS unavailable ({}); retaining spatial repair",
+                        exception.what());
+            dlss_unsupported = true;
+        }
+#endif
         return false;
     }
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
@@ -2131,7 +2209,7 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
     // mantissa bits) a frame's small share of the blend rounded away, so the history never
     // converged on the detail the jittered frames add.
     constexpr VkFormat history_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    bool reset = false;
+    bool reset = reset_history;
     if (!temporal_history.images[0] || temporal_history.format != format ||
         temporal_history.extent.width != extent.width ||
         temporal_history.extent.height != extent.height) {
@@ -2301,6 +2379,32 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
     }
     temporal_history.current = write_index;
     return true;
+}
+
+bool TextureCacheRuntime::WriteStarFoxUpscale(ImageView& input, ImageView& output) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (!starfox_dlss || input.gpu_addr != starfox_color_address ||
+        input.format != PixelFormat::A8B8G8R8_SRGB || output.format != input.format ||
+        input.size.width != 1920 || input.size.height != 1080 || output.size.width != 3840 ||
+        output.size.height != 2160 || input.IsRescaled() || output.IsRescaled() ||
+        input.Samples() != VK_SAMPLE_COUNT_1_BIT || output.Samples() != VK_SAMPLE_COUNT_1_BIT ||
+        input.range != SubresourceRange{} || output.range != SubresourceRange{} ||
+        input.ImageHandle() == output.ImageHandle() || !output.BackingImage() ||
+        !(output.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT)) {
+        return false;
+    }
+    try {
+        // The shader writes encoded RGB to rgba8 storage; an sRGB storage view is invalid.
+        const auto target = output.ColorView();
+        if (target) {
+            return starfox_dlss->WriteUpscaledOutput(target, {3840, 2160});
+        }
+    } catch (const vk::Exception& exception) {
+        LOG_WARNING(Render_Vulkan, "Star Fox 4K output unavailable ({}); retaining guest upscale",
+                    exception.what());
+    }
+#endif
+    return false;
 }
 
 void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
@@ -2957,10 +3061,20 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 }
 
 void TextureCacheRuntime::TickFrame() {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (starfox_dlss) {
+        starfox_dlss->TickFrame();
+    }
+#endif
     const bool dlss_enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
     if (dlss_enabled != last_dlss_enabled) {
         dlss_history_reset = true;
         fsr3_last_evaluation.reset();
+#ifdef EGLANTINE_NVIDIA_DLSS
+        if (starfox_dlss) {
+            starfox_dlss->ResetHistory();
+        }
+#endif
         last_dlss_enabled = dlss_enabled;
     }
     while (!pending_byte_addressed_shadows.empty() &&

@@ -635,6 +635,8 @@ if (ENABLE_NVIDIA_DLSS)
     target_sources(video_core PRIVATE
         renderer_vulkan/vk_nvidia_dlss.cpp
         renderer_vulkan/vk_nvidia_dlss.h
+        renderer_vulkan/vk_starfox_dlss.cpp
+        renderer_vulkan/vk_starfox_dlss.h
         vulkan_common/nvidia_dlss.h)
     target_compile_definitions(video_core PUBLIC EGLANTINE_NVIDIA_DLSS)
 endif()

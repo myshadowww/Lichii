@@ -34,6 +34,41 @@ dispatches, capped at one million. Logs include exact shader identity, QMD launc
 bounded constant-buffer words and raw texture descriptors. They contain guest addresses
 and should remain private. No shaders are skipped or game files changed by this capture.
 
+## Star Fox
+
+Star Fox (`0400E88025B1A000`, tested with update v131072) uses its own scene motion,
+depth and jitter for NVIDIA DLSS on Vulkan. Enable **Use NVIDIA DLSS in place of a
+game's DLSS**, with resolution scale **1x** and the NVIDIA runtime installed.
+**Native** runs DLAA at the captured 1920x1080 render size. Other quality settings request
+3840x2160 output for that input size; **Automatic** selects the supported mode for the
+actual 2:1 ratio. The quality setting does not change the game's internal render resolution.
+Neural rendering uses the same existing controls as the other NVIDIA paths.
+
+The title and native prepass/output hashes gate extraction. The captured contract is sRGB
+RGBA8 scene color, RG16F unjittered motion, reversed D32_FLOAT_S8_UINT depth, pixel jitter
+at CB0+0x1b0, and a history-reset flag at CB0+0x1d0. Motion converts to previous-frame pixel
+offsets with scale `(-width/2, +height/2)`. Sampling the input decodes sRGB into an RGBA16F
+linear image. DLSS uses HDR auto exposure; the guest's exposure textures are not passed to
+NGX. Non-finite jitter, unexpected formats, subresources, aliasing and rescaled color are
+rejected. History resets on first use, resize, guest reset, enable changes, skipped frames
+and evaluation gaps longer than 250 ms.
+
+All native network dispatches still execute, including writes to secondary history images.
+The spatial repair is recorded first. DLSS then replaces RGB in the native RGBA16F output
+while preserving its alpha; asynchronous evaluation failure leaves this frame's spatial
+result intact. In 4K mode this writeback is downsampled, while the full-resolution DLSS
+image is retained until native scene upscale `4027797e061f5eb4`. After that dispatch, the
+validated 4K scene target receives one sRGB encoding through a UNORM storage view. The
+game draws its HUD and subsequent color processing normally. Missing or stale temporal
+results retain the guest upscale. This path does not use Ocarina's HUD-difference composition.
+
+Disabling NVIDIA DLSS, missing runtime support, or an unsupported contract retains Star
+Fox's existing spatial repair. Star Fox does not opt into the Fire Emblem FSR path.
+`ngx_smoke` exercises both native AA and super resolution with sRGB input, D32S8 depth,
+alpha preservation, resets/resizes, stale-frame rejection, output encoding and injected
+NGX evaluation failure. Captured hashes and dimensions deliberately limit support to the
+verified game path; future updates must be checked again.
+
 ## Ocarina of Time
 
 The Legend of Zelda: Ocarina of Time (`0400486024DEC000`) has no DLSS of its own. Its

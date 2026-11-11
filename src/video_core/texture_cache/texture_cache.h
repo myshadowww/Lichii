@@ -27,6 +27,7 @@
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/dlss_contract.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
@@ -1656,7 +1657,7 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                       const Tegra::Texture::TICEntry* depth,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
-                                      bool use_history) {
+                                      bool use_history, bool reset_history) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return false;
     } else {
@@ -1702,7 +1703,10 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         if (depth_id) {
             PrepareImage(depth_id, false, false);
             if (slot_images[depth_id].info.num_samples != 1 ||
-                slot_images[depth_id].info.format != PixelFormat::D32_FLOAT) {
+                !VideoCommon::DlssContract::ValidDepthFormat(
+                    slot_images[depth_id].info.format,
+                    VideoCommon::DlssContract::StarFoxFormats(result->src_format,
+                                                              result->dst_format))) {
                 return false;
             }
         }
@@ -1763,7 +1767,8 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
             if (const std::optional base = slot_images[depth_id].TryFindBase(depth->Address())) {
                 const SubresourceRange range{.base = *base, .extent = {1, 1}};
                 depth_view = FindOrEmplaceImageView(
-                    depth_id, ImageViewInfo(ImageViewType::e2D, PixelFormat::D32_FLOAT, range));
+                    depth_id,
+                    ImageViewInfo(ImageViewType::e2D, slot_images[depth_id].info.format, range));
             }
             if (!depth_view) {
                 return false;
@@ -1774,8 +1779,8 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         return runtime.TemporalUpscale(
             dst_framebuffer, slot_image_views[dst_view->second], slot_image_views[src_view->second],
             slot_image_views[motion_view->second],
-            depth_view ? &slot_image_views[depth_view] : nullptr, render_size, jitter,
-            motion_scale, use_history);
+            depth_view ? &slot_image_views[depth_view] : nullptr, render_size, jitter, motion_scale,
+            use_history, reset_history);
     }
 }
 
