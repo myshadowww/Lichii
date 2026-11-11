@@ -207,6 +207,13 @@ NVIDIA app's signed DLSS model. The UI and Windows loading path require Windows 
 
 ## Provenance
 
+The Linux NGX path includes thanosipsis's synchronization workaround from
+[`500c6cde069c`](https://github.com/thanosipsis/Lichii-linux-dlss/commit/500c6cde069c7daa18ab762eb7986a14adfc3cad).
+It extends matching NGX image barriers to cover transfer writes, addressing internal image-clear
+hazards observed with DLSS 310.9.16. Only barriers obtained through NGX's device-procedure callback
+are wrapped. This compatibility workaround has been validated on NVIDIA driver 620.70.06;
+other driver/runtime combinations need validation. The separate early-allocation patch is not included.
+
 This backport is AI-assisted and requires human review and testing before distribution.
 It carries upstream work by Duck912 from Eglantine commits `08dbcc7e3b3d`, `11cebf56014a`
 and PR #434 through `f9d0c802e8e4`, plus Jonas's warning fix `537c1f4e173a`. The empty-extension requirement
