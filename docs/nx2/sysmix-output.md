@@ -3,7 +3,7 @@
 The November 11 Star Fox desktop investigation reproduced brief audio gaps with
 48 kHz stereo output and SDL/PipeWire callbacks requesting 1024 frames. A steady
 cutscene callback requested 1024 frames but received only 1008 queue-backed frames,
-inserting 16 samples of silence (0.333 ms). Host timer lateness stayed below 1 ms
+inserting 16 frames of silence (0.333 ms). Host timer lateness stayed below 1 ms
 and guest PCM remained available, so this did not require a missed 5 ms timer tick.
 
 ## Cause and repair
