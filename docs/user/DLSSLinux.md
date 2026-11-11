@@ -16,7 +16,7 @@ locally. Lichii does not bundle the model, DLSS5VKLayer, or a Wine helper.
   Install it through your distribution's NVIDIA driver packages.
 - Neural rendering additionally needs Vulkan 1.3 and the FP8/cooperative-matrix
   and CUDA-kernel-launch extensions checked at game startup. It has been tested
-  on an RTX PRO 6000 Blackwell with Linux driver 615.78.08. This is a tested
+  on an RTX PRO 6000 Blackwell with Linux drivers 615.78.08 and 620.70.06. This is a tested
   configuration, not a minimum driver version or a promise of support on every
   RTX GPU. Ordinary DLSS remains usable when neural rendering is unsupported.
 
@@ -60,15 +60,20 @@ CUDA toolkit is required at runtime.
    game's DLSS (experimental)**.
 3. Click **Download NVIDIA DLSS…**, review the license, and accept the download.
    Alternatively, import the supported Linux `.so` listed above.
-4. Set **NVIDIA DLSS quality** to **Automatic (upscaling)** for the game's normal
+4. Set **NVIDIA DLSS quality** to **Automatic (game resolution)** for the game's normal
    output resolution, or **Native (DLAA)** to keep the game's render resolution.
+   Quality, Balanced, Performance and Ultra Performance are also available. An
+   explicit mode is used only when NVIDIA reports support for the game's input
+   and output sizes; otherwise the backend selects a supported mode and logs the
+   fallback. These choices do not change the game's internal render resolution.
    For Ocarina's 1440p render mode, Native means **2560×1440 → 2560×1440**;
    it does not change the render resolution to match a 4K display.
 5. For neural rendering, click **Import neural rendering model…** and select
    `nvngx_dlssnr.dll`. Choose **Standard**, **Natural**, or **Cinematic** in
    **DLSS neural rendering**. Leave it **Off** for ordinary DLSS/DLAA.
 6. Apply the settings and start the game. While playing, reopen Graphics, change
-   **NVIDIA DLSS quality**, **DLSS neural rendering**, or the neural controls
+   the **NVIDIA DLSS** checkbox, **NVIDIA DLSS quality**, **NVIDIA DLSS model preset**,
+   **DLSS neural rendering**, or the neural controls
    below, and click **Apply** or **OK**. These settings take effect without
    restarting and support per-game overrides. If a per-game override is active,
    change it in the running game's
@@ -78,8 +83,19 @@ You can switch between Off, Standard, Natural, and Cinematic in the same session
 Style changes reset neural history to avoid mixing the previous look into the new
 one. Off releases the neural model's GPU resources while ordinary DLSS/DLAA
 continues. Turning it back on or changing quality can briefly pause rendering
-while model resources are prepared. The main NVIDIA DLSS checkbox, renderer,
-and GPU selection still require restarting the game.
+while model resources are prepared. The main NVIDIA DLSS checkbox can also be
+switched during gameplay on Linux, including when the game started with it off.
+Switches drain pending renderer work and reset temporal history. Install the
+runtime files before starting the game; renderer and GPU selection still require
+a restart. Windows retains its startup-only master checkbox.
+
+**NVIDIA DLSS model preset** selects the SR/DLAA reconstruction model: M (the
+DLSS 4.5 default), NVIDIA default, E, F, J, K or L. It is separate from the
+optional DLSS neural-rendering model and its Standard/Natural/Cinematic styles.
+Changing the reconstruction preset does not disable neural rendering. See the
+[DLSS guide](DLSS.md) for preset tradeoffs. While successful evaluations are
+occurring, the status bar and overlay show the evaluated quality and selected
+preset, including a quality fallback when applicable.
 
 Neural controls range from **0–100%** and default to **100%**, preserving the
 existing appearance:
@@ -116,7 +132,7 @@ This feature does not add frame generation or ray reconstruction.
 ## Installed locations and troubleshooting
 
 The **Open folder** button opens the active profile's `ngx` directory. In a
-default Linux profile this is `${XDG_DATA_HOME:-$HOME/.local/share}/eden/ngx`:
+default Linux profile this is `${XDG_DATA_HOME:-$HOME/.local/share}/lichii/ngx`:
 
 ```text
 ngx/
@@ -180,8 +196,9 @@ build/bin/ngx_smoke /path/to/linux/dlss/runtime/directory 0 1 /path/to/ngx/nr/31
 
 The numeric arguments are the Vulkan GPU index and image scale (1–8). Scale 8
 uses 2560×1440 input and 3840×2160 upscaled output. The test covers device
-lifecycle, SR/DLAA readback, reset, resize, HDR/depth modes, motion-view rebinding,
-live style/Off/quality changes, strength blending (including zero-strength HDR),
+lifecycle (including initially disabled DLSS), SR/DLAA readback, reset, resize,
+HDR/depth modes, motion-view rebinding, live quality/preset/status changes,
+style/Off changes, strength blending (including zero-strength HDR),
 tone/structure history resets, and injected NGX failure. Use `missing` instead of
 the NR model path to check missing-model fallback. It is excluded from `ctest`
 because it requires the GPU and separately supplied models. Disable external

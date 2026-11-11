@@ -214,7 +214,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Re-renders the scene after NVIDIA DLSS using the Standard, Natural or Cinematic "
               "style.\n"
               "Requires a supported NVIDIA GPU and an imported neural rendering model. "
-              "Runs natively on Linux.\nStart the game with NVIDIA DLSS enabled, then apply style "
+              "Runs natively on Linux.\nEnable NVIDIA DLSS and apply style "
               "changes while playing. Off disables neural rendering. First activation may briefly "
               "pause rendering while the model loads."));
     INSERT(Settings, neural_rendering_strength, tr("Neural rendering strength:"),
