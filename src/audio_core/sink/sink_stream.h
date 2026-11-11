@@ -291,6 +291,10 @@ private:
     /// EDEN_NX2_AUDIO_LEVEL meter state.
     s32 level_peak{};
     u64 level_frames{};
+    u64 level_rendered_frames{};
+    u64 level_callbacks{};
+    u64 level_underrun_callbacks{};
+    u64 level_max_missing_frames{};
     /// Number of buffers waiting to be played
     std::atomic<u32> queued_buffers{};
     /// Largest number of frames the host device has asked for in one callback (sysmix streams)
