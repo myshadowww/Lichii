@@ -1,10 +1,14 @@
-# User Handbook
+# Lichii User Handbook
 
 The "FAQ".
 
 This handbook is primarily aimed at the end-user - baking useful knowledge for enhancing their emulation experience.
 
-A copy of this handbook is [available online](https://git.eden-emu.dev/eden-emu/eden/src/branch/master/docs/user/README.md).
+For this fork's downloads and launch instructions, start with
+[Linux AppImage releases](../linux-releases.md). Report problems at
+[myshadowww/Lichii issues](https://github.com/myshadowww/Lichii/issues).
+The general guides below are inherited from upstream and may still describe Eden
+names, downloads or services; this fork's release notes and Linux guide take precedence.
 
 ## Basics
 

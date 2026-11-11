@@ -1,4 +1,4 @@
-# Eden Build Documentation
+# Lichii Linux Fork Documentation
 
 Are you just a casual user? Take a look at our [User Handbook](./user) then!
 
@@ -7,6 +7,7 @@ To contribute to this fork, see [CONTRIBUTING.md](../CONTRIBUTING.md).
 This contains documentation created by developers, build instructions, guidelines, instructions/layouts for [cool stuff we made](./CPMUtil.md), and more.
 
 - **[General Build Instructions](./Build.md)**
+- **[Linux AppImage Releases and Builds](./linux-releases.md)**
 - **[CMake Options](./Options.md)**
 - **[Cross Compiling](./CrossCompile.md)**
 - **[Development Guidelines](./Development.md)**

@@ -6,33 +6,35 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-> **Linux desktop fork:** this repository focuses on native Linux DLSS, neural rendering,
-> and Linux desktop compatibility. Download our AppImages from
-> [myshadowww/Lichii releases](https://github.com/myshadowww/Lichii/releases).
-> The original Lichii project is [zortos293/Lichii](https://github.com/zortos293/Lichii).
-
 <p align="center">
   <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
 </p>
 
-# Lichii
+# Lichii — myshadowww's Linux fork
 
-Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++. It builds on Eglantine, Eden, yuzu and Sudachi, preserving their contributions while developing this fork's game compatibility and renderer fixes.
+This is [myshadowww's independently maintained fork of Lichii](https://github.com/myshadowww/Lichii), focused on **Linux desktop support, native Linux DLSS, neural rendering, and game compatibility fixes**. Lichii is an experimental, open-source Nintendo Switch and Switch 2 emulator written in C++.
 
-This is an independent fork, not an official release of those upstream projects. Lichii is not affiliated with Nintendo.
+**[Download our releases](https://github.com/myshadowww/Lichii/releases)** · **[Report an issue here](https://github.com/myshadowww/Lichii/issues)** · **[Linux build and packaging guide](docs/linux-releases.md)**
 
-Visit the [Lichii game compatibility website](https://lichii.zortos.me) to find games and compare community compatibility reports.
+The `desktop` branch contains this fork's Linux integration. Dated `desktop-*` tags identify the source used for our AppImage releases. Please bring problems with these builds to this repository; upstream maintainers are not responsible for supporting this fork. Upstream projects and contributors are credited below.
+
+Lichii is not affiliated with Nintendo.
 
 ## Downloads and setup
 
-Download the Linux x86_64 `.AppImage` and `SHA256SUMS` from
-[this fork's releases](https://github.com/myshadowww/Lichii/releases). Each release
-records its source commit and minimum glibc version. Qt is bundled.
-Choose the standard `linux-x86_64.AppImage` for compatibility, or
-`linux-x86_64-avx512.AppImage` if your CPU and OS support x86-64-v4. AVX-512 may
-improve some workloads; a game-performance gain is not guaranteed.
+Our downloads are published at **[myshadowww/Lichii releases](https://github.com/myshadowww/Lichii/releases)**. Choose one Linux x86_64 AppImage:
+
+| Build | Filename suffix | CPU requirement |
+| --- | --- | --- |
+| Standard / portable | `linux-x86_64.AppImage` | No AVX-512 requirement; choose this if unsure |
+| AVX-512 | `linux-x86_64-avx512.AppImage` | CPU and OS support for x86-64-v4 |
+
+Each release records its source commit, minimum glibc version and validation results. Qt is bundled. AVX-512 may improve some workloads; a game-performance gain is not guaranteed.
+
+Download one AppImage, its build record (`build-info.json` or `build-info-avx512.json`), and `SHA256SUMS` into the same directory:
 
 ```sh
+sha256sum --check --ignore-missing SHA256SUMS
 chmod +x Lichii-*.AppImage
 ./Lichii-*.AppImage
 ```
@@ -53,66 +55,29 @@ On the first non-portable GUI launch, Lichii offers to import Eden and other det
 
 Compatibility and performance vary by game, hardware and driver. Rendering errors, stutters and crashes remain possible. Passing automated tests does not establish that a game renders correctly, and this project makes no universal frame-rate guarantee.
 
-Browse [community compatibility reports](https://lichii.zortos.me/reports) for results with each player's build and setup.
+Search [this fork's issues](https://github.com/myshadowww/Lichii/issues) before opening a [bug report or support question](https://github.com/myshadowww/Lichii/issues/new/choose). Include:
 
-Desktop reporting requires a build containing [PR #303](https://github.com/zortos293/Lichii/pull/303) and is not available in build 88. In builds that include it, play and stop a Switch 2 game, then right-click that game and choose **Submit compatibility report**. Only the latest session in the current Lichii process is eligible.
-
-Confirm the matching website catalog entry and review the editable machine, game, setup, and enabled add-on details prefilled where available. Check the public preview and give explicit consent before submitting. Nothing uploads automatically, and the native v1 reporter does not read or upload logs or files.
-
-When [reporting an issue](https://github.com/zortos293/Eglantine/issues), include:
-
-- The exact build, game version, CPU, GPU and driver version.
+- The release tag or source commit and whether you used the standard or AVX-512 AppImage.
+- Your Linux distribution, game version, CPU, GPU and driver version.
 - Relevant settings and steps to reproduce the problem.
 - A screenshot and the log from the affected session, after checking it for personal information.
 
 Do not upload game files, keys, firmware or private account information.
 
+The inherited **Submit compatibility report** option in the application connects to an upstream service. Use this fork's GitHub issue tracker for reports about our builds.
+
 ## Building and contributing
 
-See the [build guide](docs/Build.md), [user documentation](docs/user/README.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
+Start with the [Linux AppImage build guide](docs/linux-releases.md) for our release configuration. See also the [general build guide](docs/Build.md), [user documentation](docs/user/README.md), [contribution guide](CONTRIBUTING.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
 
-Keep changes focused and distinguish code-level checks from actual gameplay testing.
+Open pull requests against this repository's `desktop` branch. Bug reports with reproduction steps, Linux testing, documentation improvements and code contributions all help. Keep changes focused and distinguish code-level checks from actual gameplay testing.
 
 ## Artwork
 Art created by YOB (yobslab)
 The supplied Lichii logo, icon and library artwork are in [dist/branding](dist/branding). Windows, Linux and macOS icon resources are generated from that artwork by [Generate-LichiiIcons.ps1](tools/Generate-LichiiIcons.ps1).
 
-## Support Lichii
-
-Lichii is free and stays free. If you want to help, you can donate in crypto. Donations help pay for the AI tools and build machines used to develop this open-source project faster.
-
-**Solana (SOL)**
-```text
-JepEjfyWjGjhJvHSrqj52KtLjcbbbmUh1iGqerYBF4w
-```
-
-**Ethereum (ETH)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Bitcoin (BTC)**
-```text
-bc1qcvxdpf4qvdhqp8ee4s355cjmxrzsphsdwpl8w4
-```
-
-**BNB Smart Chain (BNB)**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-**Polygon**
-```text
-0x055ABa1b80Bc35C836Ce7E9F47c2b3d6C75b5534
-```
-
-Send each coin on its matching network. Coins sent on the wrong network can't be recovered.
-
-> [!NOTE]
-> Donations are voluntary gifts and are non-refundable. A donation does not buy any product, service, perk, early access, exclusive build, priority support or say in the project. Every release stays free and public for everyone.
-
 ## Credits and license
 
-Lichii inherits the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
+This fork builds on [zortos293/Lichii](https://github.com/zortos293/Lichii) and the work of the Eglantine, Eden, yuzu and Sudachi projects and their contributors, including Eglantine's original developer Camille LaVey. Original copyright notices and third-party licenses are retained.
 
 See [LICENSE.txt](LICENSE.txt) and the source files for applicable license terms.

@@ -1,4 +1,8 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
-  - name: Eden Discord
-    url: https://discord.gg/HstXbPch7X
+  - name: Linux AppImage downloads
+    url: https://github.com/myshadowww/Lichii/releases
+    about: Download this fork's standard or AVX-512 Linux build and check its release notes.
+  - name: Linux release documentation
+    url: https://github.com/myshadowww/Lichii/blob/desktop/docs/linux-releases.md
+    about: CPU requirements, checksums, launch instructions and build documentation for this fork.
