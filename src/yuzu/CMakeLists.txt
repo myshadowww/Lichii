@@ -85,6 +85,7 @@ add_executable(yuzu
     configuration/nvidia_dlss_panel.cpp
     configuration/nvidia_dlss_panel_linux.cpp
     configuration/nvidia_dlss_panel.h
+    configuration/neural_model_sources.h
     configuration/configure_graphics.ui
     configuration/configure_graphics_advanced.cpp
     configuration/configure_graphics_advanced.h

@@ -27,10 +27,13 @@ private:
 #ifdef EGLANTINE_NGX
     void Import();
     void ImportNeuralModel();
+    void CheckNeuralModel(bool browse_if_missing = false);
+    void BrowseNeuralModel();
     QPushButton* import_button{};
     QPushButton* neural_import_button{};
     QLabel* neural_status_label{};
     bool driver_present{};
+    bool neural_model_checking{};
     bool neural_model_checked{};
     bool neural_model_valid{};
     bool neural_importing{};
