@@ -253,6 +253,8 @@ private:
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
     bool OcarinaTemporalEnabled() const;
     void TrackOcarinaCamera();
+    void TrackStarFoxDraw(const GraphicsPipeline& pipeline);
+    bool TryStarFoxGameplay(VideoCommon::ImageViewId input, VideoCommon::ImageViewId output);
     /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
     /// sub-pixel amount that changes every frame while FSR replaces the game's upscale, so FSR
     /// gets new sample positions each frame (the game renders without jitter). The offset goes to
@@ -296,6 +298,21 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    struct StarFoxGameplayTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{};
+        u64 map_serial{};
+        VideoCommon::ImageViewId motion{};
+        VideoCommon::ImageViewId depth{};
+        VideoCommon::ImageViewId color{};
+        VkImage motion_image{};
+        VkImage depth_image{};
+        VkImage color_image{};
+        GPUVAddr motion_address{};
+        GPUVAddr depth_address{};
+        GPUVAddr color_address{};
+        std::array<f32, 2> jitter{};
+    } starfox_gameplay;
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
     struct OcarinaMotionTrace {

@@ -6,6 +6,8 @@
 
 #include "common/logging.h"
 #include "video_core/host_shaders/starfox_dlss_color_comp_spv.h"
+#include "video_core/host_shaders/starfox_dlss_decode_comp_spv.h"
+#include "video_core/host_shaders/starfox_dlss_motion_comp_spv.h"
 #include "video_core/host_shaders/starfox_dlss_output_comp_spv.h"
 #include "video_core/host_shaders/starfox_dlss_present_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -69,6 +71,10 @@ StarFoxDlss::StarFoxDlss(const Device& device_, Scheduler& scheduler_, MemoryAll
       color_pass{std::make_unique<ColorPass>(device, scheduler, pool, STARFOX_DLSS_COLOR_COMP_SPV)},
       output_pass{
           std::make_unique<ColorPass>(device, scheduler, pool, STARFOX_DLSS_OUTPUT_COMP_SPV)},
+      decode_pass{
+          std::make_unique<ColorPass>(device, scheduler, pool, STARFOX_DLSS_DECODE_COMP_SPV)},
+      motion_pass{
+          std::make_unique<ColorPass>(device, scheduler, pool, STARFOX_DLSS_MOTION_COMP_SPV)},
       present_pass{
           std::make_unique<ColorPass>(device, scheduler, pool, STARFOX_DLSS_PRESENT_COMP_SPV)},
       upscaler{device, scheduler, allocator} {}
@@ -86,9 +92,13 @@ void StarFoxDlss::TickFrame() {
     recorded = false;
 }
 
-bool StarFoxDlss::Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target) {
-    if (upscaler.Failed()) {
+bool StarFoxDlss::Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target, InputMode mode) {
+    if (upscaler.Failed() || (!target && mode == InputMode::Cinematic)) {
         return false;
+    }
+    if (mode != input_mode) {
+        reset = true;
+        input_mode = mode;
     }
     if (!color || extent.width != inputs.render_size.width ||
         extent.height != inputs.render_size.height) {
@@ -96,6 +106,8 @@ bool StarFoxDlss::Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target) 
             scheduler.Finish();
         }
         extent = inputs.render_size;
+        motion_view.reset();
+        motion.reset();
         color_view.reset();
         color = allocator.CreateImage(VkImageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -137,7 +149,51 @@ bool StarFoxDlss::Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target) 
     queue.Acquire(scheduler, 2);
     queue.AddSampledImage(inputs.color.view, upscaler.PointSampler());
     queue.AddImage(*color_view);
-    color_pass->Record(scheduler, queue.UpdateData(), extent);
+    (mode == InputMode::Gameplay ? decode_pass : color_pass)
+        ->Record(scheduler, queue.UpdateData(), extent);
+    if (mode == InputMode::Gameplay) {
+        if (!motion) {
+            motion = allocator.CreateImage(VkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = VK_FORMAT_R16G16_SFLOAT,
+                .extent = {extent.width, extent.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            });
+            motion_view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = *motion,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = VK_FORMAT_R16G16_SFLOAT,
+                .subresourceRange = COLOR_RANGE,
+            });
+            scheduler.Record([image = *motion](vk::CommandBuffer cmd) {
+                const VkImageMemoryBarrier barrier{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = image,
+                    .subresourceRange = COLOR_RANGE,
+                };
+                cmd.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, {}, {}, barrier);
+            });
+        }
+        queue.Acquire(scheduler, 2);
+        queue.AddSampledImage(inputs.motion_vectors.view, upscaler.PointSampler());
+        queue.AddImage(*motion_view);
+        motion_pass->Record(scheduler, queue.UpdateData(), extent);
+        inputs.motion_vectors = {*motion_view, *motion, VK_FORMAT_R16G16_SFLOAT, COLOR_RANGE,
+                                 VK_IMAGE_ASPECT_COLOR_BIT};
+    }
 
     const auto now = std::chrono::steady_clock::now();
     inputs.reset |= reset || now - last_evaluation > std::chrono::milliseconds{250};
@@ -147,18 +203,21 @@ bool StarFoxDlss::Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target) 
         scheduler.InvalidateState();
         return false;
     }
-    queue.Acquire(scheduler, 2);
-    queue.AddSampledImage(upscaler.OutputView(), upscaler.LinearSampler());
-    queue.AddImage(target);
-    output_pass->Record(scheduler, queue.UpdateData(), extent, &upscaler);
+    if (target) {
+        queue.Acquire(scheduler, 2);
+        queue.AddSampledImage(upscaler.OutputView(), upscaler.LinearSampler());
+        queue.AddImage(target);
+        output_pass->Record(scheduler, queue.UpdateData(), extent, &upscaler);
+    }
     scheduler.InvalidateState();
     if (evaluations++ % 120 == 0 || inputs.reset) {
-        LOG_INFO(
-            Render_Vulkan,
-            "Star Fox NVIDIA DLSS queued: {}x{} -> {}x{}, jitter={},{} motion_scale={},{} reset={}",
-            extent.width, extent.height, inputs.upscale_size.width, inputs.upscale_size.height,
-            inputs.jitter[0], inputs.jitter[1], inputs.motion_vector_scale[0],
-            inputs.motion_vector_scale[1], inputs.reset);
+        LOG_INFO(Render_Vulkan,
+                 "Star Fox NVIDIA DLSS queued: {}x{} -> {}x{}, jitter={},{} motion_scale={},{} "
+                 "reset={} path={}",
+                 extent.width, extent.height, inputs.upscale_size.width, inputs.upscale_size.height,
+                 inputs.jitter[0], inputs.jitter[1], inputs.motion_vector_scale[0],
+                 inputs.motion_vector_scale[1], inputs.reset,
+                 mode == InputMode::Gameplay ? "gameplay" : "cinematic");
     }
     last_evaluation = now;
     output_extent = inputs.upscale_size;
@@ -168,20 +227,26 @@ bool StarFoxDlss::Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target) 
 }
 
 bool StarFoxDlss::WriteUpscaledOutput(VkImageView target, VkExtent2D target_extent) {
-    if (!recorded || upscaler.Failed() || output_extent.width != target_extent.width ||
-        output_extent.height != target_extent.height || output_extent.width <= extent.width ||
-        output_extent.height <= extent.height) {
+    const bool native_gameplay =
+        input_mode == InputMode::Gameplay && output_extent.width == extent.width &&
+        output_extent.height == extent.height && target_extent.width == extent.width * 2 &&
+        target_extent.height == extent.height * 2;
+    const bool super_resolution = output_extent.width == target_extent.width &&
+                                  output_extent.height == target_extent.height &&
+                                  output_extent.width > extent.width &&
+                                  output_extent.height > extent.height;
+    if (!recorded || upscaler.Failed() || !target || (!native_gameplay && !super_resolution)) {
         return false;
     }
     scheduler.RequestOutsideRenderPassOperationContext();
     queue.Acquire(scheduler, 2);
-    queue.AddSampledImage(upscaler.OutputView(), upscaler.PointSampler());
+    queue.AddSampledImage(upscaler.OutputView(), upscaler.LinearSampler());
     queue.AddImage(target);
-    present_pass->Record(scheduler, queue.UpdateData(), output_extent, &upscaler);
+    present_pass->Record(scheduler, queue.UpdateData(), target_extent, &upscaler);
     scheduler.InvalidateState();
     if (evaluations % 120 == 1) {
         LOG_INFO(Render_Vulkan, "Star Fox NVIDIA DLSS scene output queued: {}x{} before guest UI",
-                 output_extent.width, output_extent.height);
+                 target_extent.width, target_extent.height);
     }
     return true;
 }

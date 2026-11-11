@@ -275,6 +275,11 @@ public:
     /// Return a reference to the given image view id
     [[nodiscard]] ImageView& GetImageView(ImageViewId id) noexcept;
 
+    /// A tracked view may have been removed by a later resolve in the same frame.
+    [[nodiscard]] ImageView* TryGetImageView(ImageViewId id) noexcept {
+        return slot_image_views.contains(id) ? &slot_image_views[id] : nullptr;
+    }
+
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 

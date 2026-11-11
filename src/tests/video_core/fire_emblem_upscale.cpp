@@ -317,3 +317,89 @@ TEST_CASE("Star Fox history reset belongs to the captured frame", "[starfox_upsc
     REQUIRE(next);
     REQUIRE_FALSE(next->reset);
 }
+
+TEST_CASE("Star Fox gameplay jitter requires unjittered current and previous motion projections",
+          "[starfox_upscale]") {
+    // Captured training cb7: current view/projection/VP, previous VP and previous view.
+    std::array<u32, 0x200 / 4> fragment_camera{
+        0x3bae1f57U, 0x3def9f67U, 0xbf7e3cf0U, 0x00000000U, 0xbf7fff07U, 0xba278e9fU, 0xbbb1cb4bU,
+        0x00000000U, 0xbaa66971U, 0x3f7e3ddcU, 0x3def9cb3U, 0x00000000U, 0xc315bd66U, 0xc545c939U,
+        0x46b4ac49U, 0x3f800000U, 0x3fadd2c7U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
+        0x401a8278U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0xbf800000U,
+        0x00000000U, 0x00000000U, 0x40a00000U, 0x00000000U, 0x3bec7516U, 0x3e90a003U, 0x00000000U,
+        0x3f7e3cf0U, 0xbfadd21eU, 0xbaca4261U, 0x00000000U, 0x3bb1cb4bU, 0xbae1fc8aU, 0x401972c9U,
+        0x00000000U, 0xbdef9cb3U, 0xc34b588fU, 0xc5eebfb2U, 0x40a00000U, 0xc6b4ac49U, 0x00000000U,
+        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
+        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
+        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
+        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
+        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
+        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U,
+        0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x00000000U, 0x3bed7200U, 0x3e90a4dbU,
+        0x00000000U, 0x3f7e3cd0U, 0xbfadd21cU, 0xbacb1fc5U, 0x00000000U, 0x3bb289b1U, 0xbae2f4f9U,
+        0x401972b6U, 0x00000000U, 0xbdefa4b7U, 0xc34be8c6U, 0xc5ee9abfU, 0x40a00000U, 0xc6b485a1U,
+        0x3baed995U, 0x3defa76dU, 0xbf7e3cd0U, 0x00000000U, 0xbf7fff04U, 0xba284607U, 0xbbb289b1U,
+        0x00000000U, 0xbaa72062U, 0x3f7e3dbcU, 0x3defa4b7U, 0x00000000U, 0xc3162798U, 0xc545aa9dU,
+        0x46b485a1U, 0x3f800000U,
+    };
+    std::array<u32, 0xc0 / 4> projection{};
+    std::copy_n(fragment_camera.begin(), projection.size(), projection.begin());
+    std::array<u32, 0x11c / 4> object{};
+    std::array<u32, 0x12c / 4> fragment_object{};
+    std::array<u32, 0x394 / 4> camera{};
+    object[0x118 / 4] = fragment_object[0x118 / 4] = fragment_object[0x128 / 4] =
+        std::bit_cast<u32>(1.0f);
+    camera[0x370 / 4] = std::bit_cast<u32>(0.0002604166802484542f);
+    camera[0x374 / 4] = std::bit_cast<u32>(-0.00046296295477077365f);
+    camera[0x378 / 4] = std::bit_cast<u32>(-0.0002604166802484542f);
+    camera[0x37c / 4] = std::bit_cast<u32>(0.00046296295477077365f);
+    const auto accepted = [&] {
+        return FE::StarFoxGameplayJitter(object, camera, fragment_object, projection,
+                                         fragment_camera);
+    };
+    const auto jitter = accepted();
+    REQUIRE(jitter);
+    REQUIRE((*jitter)[0] == 0.25f);
+    REQUIRE((*jitter)[1] == 0.25f);
+
+    const auto reject_word = [&](auto& buffer, u32 offset, u32 value) {
+        const u32 old = std::exchange(buffer[offset / 4], value);
+        REQUIRE_FALSE(accepted());
+        buffer[offset / 4] = old;
+    };
+    for (const u32 offset : {0x7c, 0xac}) {
+        reject_word(object, offset, 1);
+    }
+    for (const u32 offset : {0x334, 0x390}) {
+        reject_word(camera, offset, 1);
+    }
+    for (const u32 offset : {0x110, 0x114, 0x118}) {
+        reject_word(object, offset, std::bit_cast<u32>(0.5f));
+        reject_word(fragment_object, offset, std::bit_cast<u32>(0.5f));
+    }
+    for (const u32 offset : {0x120, 0x124, 0x128}) {
+        reject_word(fragment_object, offset, std::bit_cast<u32>(0.5f));
+    }
+    for (const u32 offset : {0x40, 0x54, 0x78}) {
+        reject_word(projection, offset, std::bit_cast<u32>(std::numeric_limits<f32>::infinity()));
+        reject_word(projection, offset, 0);
+    }
+    reject_word(projection, 0x60, camera[0x370 / 4]);
+    reject_word(fragment_camera, 0x180, std::bit_cast<u32>(0.01f));
+    reject_word(fragment_camera, 0x80, std::bit_cast<u32>(0.01f));
+    reject_word(fragment_camera, 0x1c0, std::bit_cast<u32>(std::numeric_limits<f32>::infinity()));
+    for (const u32 offset : {0x370, 0x374, 0x378, 0x37c}) {
+        reject_word(camera, offset, std::bit_cast<u32>(std::numeric_limits<f32>::quiet_NaN()));
+        reject_word(camera, offset, std::bit_cast<u32>(std::numeric_limits<f32>::infinity()));
+        reject_word(camera, offset, std::bit_cast<u32>(0.01f));
+    }
+    std::array<std::span<const u32>, 5> buffers{object, camera, fragment_object, projection,
+                                                fragment_camera};
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        auto truncated = buffers;
+        truncated[i] = truncated[i].first(truncated[i].size() - 1);
+        REQUIRE_FALSE(FE::StarFoxGameplayJitter(truncated[0], truncated[1], truncated[2],
+                                                truncated[3], truncated[4]));
+    }
+    REQUIRE(accepted());
+}

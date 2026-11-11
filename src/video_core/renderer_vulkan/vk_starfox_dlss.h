@@ -19,7 +19,12 @@ public:
                 DescriptorPool& pool, ComputePassDescriptorQueue& queue);
     ~StarFoxDlss();
 
-    bool Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target);
+    enum class InputMode { Cinematic, Gameplay };
+    bool Record(NvidiaDlssUpscaler::Inputs inputs, VkImageView target,
+                InputMode mode = InputMode::Cinematic);
+    bool HasRecordedFrame() const {
+        return recorded;
+    }
     /// Replace the later scene upscale before the guest adds UI. Only this frame's result is used.
     bool WriteUpscaledOutput(VkImageView target, VkExtent2D target_extent);
     void ResetHistory();
@@ -33,9 +38,14 @@ private:
     ComputePassDescriptorQueue& queue;
     std::unique_ptr<ColorPass> color_pass;
     std::unique_ptr<ColorPass> output_pass;
+    std::unique_ptr<ColorPass> decode_pass;
+    std::unique_ptr<ColorPass> motion_pass;
     std::unique_ptr<ColorPass> present_pass;
     vk::Image color;
     vk::ImageView color_view;
+    vk::Image motion;
+    vk::ImageView motion_view;
+    InputMode input_mode = InputMode::Cinematic;
     VkExtent2D extent{};
     VkExtent2D output_extent{};
     bool reset = true;

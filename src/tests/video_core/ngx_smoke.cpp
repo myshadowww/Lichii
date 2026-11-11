@@ -82,7 +82,7 @@ InputImage MakeInput(const Device& device, MemoryAllocator& allocator, VkFormat 
 }
 
 /// Exercise the Star Fox adapter's captured formats, history lifecycle and same-frame fallback.
-void StarFoxCases(const Device& device, bool super_resolution) {
+void StarFoxCases(const Device& device, bool super_resolution, bool exercise_gameplay = false) {
     MemoryAllocator allocator{device};
     StateTracker tracker;
     Scheduler scheduler{device, tracker};
@@ -104,6 +104,7 @@ void StarFoxCases(const Device& device, bool super_resolution) {
     static bool inject_failure;
     static int observed_reset;
     static u32 evaluate_calls;
+    static VkFormat observed_motion_format;
     forward_evaluate = evaluate;
     SCOPE_EXIT {
         api.evaluate = evaluate;
@@ -113,6 +114,12 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                       PFN_NVSDK_NGX_ProgressCallback progress) {
         ++evaluate_calls;
         parameters->Get(NVSDK_NGX_Parameter_Reset, &observed_reset);
+        void* resource{};
+        parameters->Get(NVSDK_NGX_Parameter_MotionVectors, &resource);
+        observed_motion_format =
+            resource
+                ? static_cast<const NVSDK_NGX_Resource_VK*>(resource)->Resource.ImageViewInfo.Format
+                : VK_FORMAT_UNDEFINED;
         if (inject_failure) {
             return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
         }
@@ -127,7 +134,12 @@ void StarFoxCases(const Device& device, bool super_resolution) {
         return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
     };
     const auto neural_before = VideoCore::NeuralRendering::GetStatus().submitted_frames;
-    for (u32 frame = 0; frame < 7; ++frame) {
+    const u32 failure_frame = exercise_gameplay ? 8 : 6;
+    for (u32 frame = 0; frame <= failure_frame; ++frame) {
+        // A cinematic between two gameplay evaluations also exercises both mode transitions.
+        const bool gameplay = exercise_gameplay && frame != 6;
+        const auto mode =
+            gameplay ? StarFoxDlss::InputMode::Gameplay : StarFoxDlss::InputMode::Cinematic;
         // Repeated frame, explicit reset, skipped evaluation, resize, guest reset, failure.
         if (frame == 2) {
             adapter.ResetHistory();
@@ -138,21 +150,26 @@ void StarFoxCases(const Device& device, bool super_resolution) {
         const VkExtent2D extent = frame < 4 ? VkExtent2D{320, 180} : VkExtent2D{384, 216};
         const VkExtent2D output_extent =
             super_resolution ? VkExtent2D{extent.width * 2, extent.height * 2} : extent;
+        const VkExtent2D scene_extent =
+            gameplay ? VkExtent2D{extent.width * 2, extent.height * 2} : output_extent;
+        const bool writes_scene = gameplay || super_resolution;
         const size_t pixels = size_t{extent.width} * extent.height;
-        const size_t scene_pixels = size_t{output_extent.width} * output_extent.height;
-        auto color = MakeInput(device, allocator, VK_FORMAT_R8G8B8A8_SRGB,
+        const size_t scene_pixels = size_t{scene_extent.width} * scene_extent.height;
+        auto color = MakeInput(device, allocator,
+                               gameplay ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_SRGB,
                                VK_IMAGE_ASPECT_COLOR_BIT, extent);
         auto depth =
             MakeInput(device, allocator, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_IMAGE_ASPECT_DEPTH_BIT,
                       extent, 0, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-        auto motion = MakeInput(device, allocator, VK_FORMAT_R16G16_SFLOAT,
+        auto motion = MakeInput(device, allocator,
+                                gameplay ? VK_FORMAT_R16G16_SNORM : VK_FORMAT_R16G16_SFLOAT,
                                 VK_IMAGE_ASPECT_COLOR_BIT, extent);
         auto target =
             MakeInput(device, allocator, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT,
                       extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         auto scene =
             MakeInput(device, allocator, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT,
-                      output_extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                      scene_extent, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         auto scene_readback = allocator.CreateBuffer(
             {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -161,17 +178,26 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             },
             MemoryUsage::Download);
+        const size_t color_pixel_bytes = gameplay ? 8 : 4;
         auto upload = allocator.CreateBuffer(
             {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                .size = pixels * encoded.size(),
+                .size = pixels * color_pixel_bytes,
                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
             },
             MemoryUsage::Upload);
         for (size_t pixel = 0; pixel < pixels; ++pixel) {
-            std::memcpy(upload.Mapped().data() + pixel * encoded.size(), encoded.data(),
-                        encoded.size());
+            if (gameplay) {
+                for (size_t channel = 0; channel < encoded.size(); ++channel) {
+                    const _Float16 value = static_cast<_Float16>(encoded[channel] / 255.0f);
+                    std::memcpy(upload.Mapped().data() + pixel * color_pixel_bytes + channel * 2,
+                                &value, sizeof(value));
+                }
+            } else {
+                std::memcpy(upload.Mapped().data() + pixel * color_pixel_bytes, encoded.data(),
+                            encoded.size());
+            }
         }
         upload.Flush();
         auto readback = allocator.CreateBuffer(
@@ -205,8 +231,11 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                 *upload, *color.image, VK_IMAGE_LAYOUT_GENERAL,
                 VkBufferImageCopy{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                   .imageExtent = {extent.width, extent.height, 1}});
-            cmd.ClearColorImage(*motion.image, VK_IMAGE_LAYOUT_GENERAL, {}, motion.resource.range);
             VkClearColorValue clear{};
+            clear.float32[0] = gameplay ? 0.125f : 0.0f;
+            clear.float32[1] = gameplay ? -0.125f : 0.0f;
+            cmd.ClearColorImage(*motion.image, VK_IMAGE_LAYOUT_GENERAL, clear,
+                                motion.resource.range);
             std::copy(fallback.begin(), fallback.end(), clear.float32);
             cmd.ClearColorImage(*target.image, VK_IMAGE_LAYOUT_GENERAL, clear,
                                 target.resource.range);
@@ -220,8 +249,9 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                                                                "vkCmdClearDepthStencilImage"));
             clear_fn(*cmd, *depth.image, VK_IMAGE_LAYOUT_GENERAL, &clear_depth, 1, &depth_range);
         });
-        inject_failure = frame == 6;
+        inject_failure = frame == failure_frame;
         observed_reset = -1;
+        observed_motion_format = VK_FORMAT_UNDEFINED;
         evaluate_calls = 0;
         const auto before = NvidiaDlssUpscaler::Status().evaluations;
         const NvidiaDlssUpscaler::Inputs inputs{color.resource,
@@ -234,13 +264,15 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                                                 frame == 5,
                                                 true,
                                                 true};
-        Require(adapter.Record(inputs, *target.view), "Star Fox adapter refused a valid frame");
+        const auto lowres_target = gameplay ? VK_NULL_HANDLE : *target.view;
+        Require(adapter.Record(inputs, lowres_target, mode),
+                "Star Fox adapter refused a valid frame");
         Require(!adapter.WriteUpscaledOutput(*scene.view,
-                                             {output_extent.width + 8, output_extent.height}),
+                                             {scene_extent.width + 8, scene_extent.height}),
                 "Star Fox adapter accepted a mismatched scene extent");
-        const bool scene_queued = adapter.WriteUpscaledOutput(*scene.view, output_extent);
+        const bool scene_queued = adapter.WriteUpscaledOutput(*scene.view, scene_extent);
         if (!inject_failure) {
-            Require(scene_queued == super_resolution,
+            Require(scene_queued == writes_scene,
                     "Star Fox scene output did not follow the native/SR extent contract");
         }
         // Failure may already have reached the worker here. Whether refused immediately or
@@ -258,7 +290,7 @@ void StarFoxCases(const Device& device, bool super_resolution) {
             cmd.CopyImageToBuffer(
                 *scene.image, VK_IMAGE_LAYOUT_GENERAL, *scene_readback,
                 VkBufferImageCopy{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                                  .imageExtent = {output_extent.width, output_extent.height, 1}});
+                                  .imageExtent = {scene_extent.width, scene_extent.height, 1}});
             cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
                                 VkMemoryBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                                 VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -268,7 +300,10 @@ void StarFoxCases(const Device& device, bool super_resolution) {
         Require(evaluate_calls == 1, "Star Fox adapter did not invoke NGX exactly once");
         Require(NvidiaDlssUpscaler::Status().evaluations == before + !inject_failure,
                 "Star Fox adapter failed a real evaluation or counted an injected failure");
-        if (frame == 0 || (frame >= 2 && frame <= 5)) {
+        Require(observed_motion_format == VK_FORMAT_R16G16_SFLOAT,
+                "Star Fox motion did not reach NGX as RG16F");
+        if (frame == 0 || (frame >= 2 && frame <= 5) ||
+            (exercise_gameplay && frame >= 6 && frame <= 7)) {
             Require(observed_reset == 1,
                     "Star Fox adapter lost a lifecycle or guest history reset");
         }
@@ -284,7 +319,7 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                 std::memcpy(&half, bytes.data() + (pixel * 4 + channel) * 2, sizeof(half));
                 const float value = static_cast<float>(half);
                 Require(std::isfinite(value), "Star Fox adapter produced a non-finite component");
-                if (channel == 3 || inject_failure) {
+                if (channel == 3 || inject_failure || gameplay) {
                     Require(value == fallback[channel],
                             "Star Fox adapter changed alpha or overwrote same-frame fallback");
                 }
@@ -293,13 +328,13 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                 }
             }
         }
-        if (!inject_failure) {
+        if (!inject_failure && !gameplay) {
             for (size_t channel = 0; channel < sums.size(); ++channel) {
                 Require(std::abs(sums[channel] / pixels - linear(encoded[channel])) < 0.025,
                         "Star Fox sRGB input was not decoded to linear DLSS output");
             }
-        } else {
-            Require(!adapter.Record(inputs, *target.view),
+        } else if (inject_failure) {
+            Require(!adapter.Record(inputs, lowres_target, mode),
                     "Failed Star Fox adapter did not retain spatial fallback on following frames");
         }
         scene_readback.Invalidate();
@@ -308,7 +343,7 @@ void StarFoxCases(const Device& device, bool super_resolution) {
         for (size_t pixel = 0; pixel < scene_pixels; ++pixel) {
             for (size_t channel = 0; channel < 4; ++channel) {
                 const auto value = scene_bytes[pixel * 4 + channel];
-                if (!super_resolution || inject_failure) {
+                if (!writes_scene || inject_failure) {
                     Require(value == scene_fallback_bytes[channel],
                             "Star Fox scene fallback RGB/alpha was overwritten");
                 } else if (channel == 3) {
@@ -319,7 +354,7 @@ void StarFoxCases(const Device& device, bool super_resolution) {
                 }
             }
         }
-        if (super_resolution && !inject_failure) {
+        if (writes_scene && !inject_failure) {
             for (size_t channel = 0; channel < scene_sums.size(); ++channel) {
                 Require(std::abs(scene_sums[channel] / scene_pixels - encoded[channel]) < 3.0,
                         "Star Fox scene output did not apply exactly one sRGB encoding");
@@ -328,14 +363,15 @@ void StarFoxCases(const Device& device, bool super_resolution) {
         Require(VideoCore::NeuralRendering::GetStatus().submitted_frames == neural_before,
                 "Star Fox adapter smoke unexpectedly enabled neural rendering");
         adapter.TickFrame();
-        Require(!adapter.WriteUpscaledOutput(*scene.view, output_extent),
+        Require(!adapter.WriteUpscaledOutput(*scene.view, scene_extent),
                 "Star Fox adapter accepted a stale scene from the previous frame");
         queue.TickFrame();
         std::printf(
-            "PASS Star Fox frame %u: %ux%u -> %ux%u, reset=%d, fallback=%d; RGB %.4f %.4f %.4f; "
+            "PASS Star Fox %s frame %u: %ux%u -> %ux%u, reset=%d, fallback=%d; RGB %.4f %.4f %.4f; "
             "alpha preserved\n",
-            frame, extent.width, extent.height, output_extent.width, output_extent.height,
-            observed_reset, inject_failure, sums[0] / pixels, sums[1] / pixels, sums[2] / pixels);
+            gameplay ? "gameplay" : "cinematic", frame, extent.width, extent.height,
+            output_extent.width, output_extent.height, observed_reset, inject_failure,
+            sums[0] / pixels, sums[1] / pixels, sums[2] / pixels);
     }
 }
 
@@ -631,6 +667,8 @@ int main(int argc, char **argv) try {
             }
             StarFoxCases(device, false);
             StarFoxCases(device, true);
+            StarFoxCases(device, false, true);
+            StarFoxCases(device, true, true);
         }
         Require(!NvidiaDlss::IsAvailable(), "Device teardown left NGX active");
         std::printf("PASS device lifecycle %d\n", run + 1);

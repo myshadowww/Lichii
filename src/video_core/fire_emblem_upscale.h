@@ -2,9 +2,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <utility>
 #include "common/common_types.h"
@@ -25,6 +28,88 @@ constexpr u64 StarFoxFinalUpscaleProgramKey = 0x4027797e061f5eb4ULL;
 constexpr bool IsStarFoxFinalUpscale(u64 program_id, u64 native_key) {
     return program_id == StarFoxProgramId && native_key == StarFoxFinalUpscaleProgramKey;
 }
+// Lowered hashes of the captured skinned scene geometry; the fragment stage writes unjittered
+// current-minus-previous NDC into SNORM RG. The vertex adds cb6[370/374] only to raster position.
+constexpr u64 StarFoxGameplayVertex = 0x7d855f8f8f931fd9ULL;
+constexpr u64 StarFoxGameplayFragment = 0xd77cd49b720c0e8eULL;
+constexpr u64 StarFoxSceneCopyVertex = 0x0b00888463c45ad4ULL;
+constexpr u64 StarFoxSceneCopyFragment = 0xd1e9123209ee3c2dULL;
+
+inline std::optional<std::array<f32, 2>> StarFoxGameplayJitter(
+    std::span<const u32> vertex_object, std::span<const u32> camera,
+    std::span<const u32> fragment_object, std::span<const u32> projection,
+    std::span<const u32> fragment_camera) {
+    if (vertex_object.size_bytes() < 0x11c || camera.size_bytes() < 0x394 ||
+        fragment_object.size_bytes() < 0x12c || projection.size_bytes() < 0xc0 ||
+        fragment_camera.size_bytes() < 0x200) {
+        return std::nullopt;
+    }
+    const auto f = [](std::span<const u32> words, u32 offset) {
+        return std::bit_cast<f32>(words[offset / sizeof(u32)]);
+    };
+    if (vertex_object[0x7c / 4] != 0 || vertex_object[0xac / 4] != 0 || camera[0x334 / 4] != 0 ||
+        camera[0x390 / 4] != 0) {
+        return std::nullopt;
+    }
+    for (const auto object : {vertex_object, fragment_object}) {
+        if (f(object, 0x110) != 0 || f(object, 0x114) != 0 || f(object, 0x118) != 1) {
+            return std::nullopt;
+        }
+    }
+    if (f(fragment_object, 0x120) != 0 || f(fragment_object, 0x124) != 0 ||
+        f(fragment_object, 0x128) != 1) {
+        return std::nullopt;
+    }
+    // Perspective projection has no jitter baked in; the known vertex shader adds it separately.
+    for (const u32 offset :
+         {0x44, 0x48, 0x4c, 0x50, 0x58, 0x5c, 0x60, 0x64, 0x68, 0x70, 0x74, 0x7c}) {
+        if (f(projection, offset) != 0) {
+            return std::nullopt;
+        }
+    }
+    for (const u32 offset : {0x40, 0x54, 0x78}) {
+        if (!std::isfinite(f(projection, offset)) || f(projection, offset) <= 0) {
+            return std::nullopt;
+        }
+    }
+    if (f(projection, 0x6c) != -1) {
+        return std::nullopt;
+    }
+    for (u32 i = 0; i < 0xc0 / 4; ++i) {
+        if (projection[i] != fragment_camera[i] ||
+            !std::isfinite(std::bit_cast<f32>(projection[i]))) {
+            return std::nullopt;
+        }
+    }
+    // Both fragment VP matrices must be formed from that unjittered projection. This also
+    // rejects a previous projection that changed or incorporated the previous raster jitter.
+    for (const auto [view, vp] : {std::pair{0U, 0x80U}, std::pair{0x1c0U, 0x180U}}) {
+        for (u32 column = 0; column < 4; ++column) {
+            for (u32 row = 0; row < 4; ++row) {
+                f32 expected{};
+                for (u32 k = 0; k < 4; ++k) {
+                    expected += f(projection, 0x40 + (k * 4 + row) * 4) *
+                                f(fragment_camera, view + (column * 4 + k) * 4);
+                }
+                const f32 actual = f(fragment_camera, vp + (column * 4 + row) * 4);
+                const f32 tolerance = std::max(1.0f, std::abs(expected)) * 0.000001f;
+                if (!std::isfinite(expected) || !std::isfinite(actual) ||
+                    std::abs(expected - actual) > tolerance) {
+                    return std::nullopt;
+                }
+            }
+        }
+    }
+    std::array<f32, 2> jitter{f(camera, 0x370) * 960.0f, f(camera, 0x374) * -540.0f};
+    for (u32 i = 0; i < 4; ++i) {
+        const f32 value = f(camera, 0x370 + i * 4) * (i % 2 == 0 ? 960.0f : -540.0f);
+        if (!std::isfinite(value) || std::abs(value) > 0.5f) {
+            return std::nullopt;
+        }
+    }
+    return jitter;
+}
+
 constexpr u32 PrepassColorOffset = 0x278;
 constexpr u32 JitterOffset = 0x1b0;
 constexpr u32 OutputColorInputOffset = 0x328;

@@ -2407,6 +2407,82 @@ bool TextureCacheRuntime::WriteStarFoxUpscale(ImageView& input, ImageView& outpu
     return false;
 }
 
+/// Training bypasses the native DLSS chain: adapt its final encoded scene and geometry motion.
+bool TextureCacheRuntime::RecordStarFoxGameplay(ImageView& input, ImageView& output,
+                                                ImageView& motion, ImageView& depth,
+                                                std::array<f32, 2> jitter) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    const auto plain = [](const ImageView& view, u32 width, u32 height) {
+        return view.BackingImage() && view.size.width == width && view.size.height == height &&
+               view.size.depth == 1 && !view.IsRescaled() &&
+               view.type == VideoCommon::ImageViewType::e2D && view.HasIdentitySwizzle() &&
+               view.Samples() == VK_SAMPLE_COUNT_1_BIT && view.range == SubresourceRange{};
+    };
+    if (!UsesNvidiaDlss() || (starfox_dlss && starfox_dlss->HasRecordedFrame()) ||
+        input.format != PixelFormat::R16G16B16A16_FLOAT ||
+        output.format != PixelFormat::A8B8G8R8_SRGB || motion.format != PixelFormat::R16G16_SNORM ||
+        depth.format != PixelFormat::D32_FLOAT_S8_UINT || !plain(input, 1920, 1080) ||
+        !plain(motion, 1920, 1080) || !plain(depth, 1920, 1080) || !plain(output, 3840, 2160) ||
+        input.ImageHandle() == output.ImageHandle() ||
+        input.ImageHandle() == motion.ImageHandle() || input.ImageHandle() == depth.ImageHandle() ||
+        output.ImageHandle() == motion.ImageHandle() ||
+        output.ImageHandle() == depth.ImageHandle() ||
+        motion.ImageHandle() == depth.ImageHandle() ||
+        !(output.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        !VideoCommon::DlssContract::ValidGeometry({1920, 1080}, {3840, 2160}, jitter,
+                                                  {-0.5f, 0.5f})) {
+        return false;
+    }
+    try {
+        if (!starfox_dlss) {
+            starfox_dlss =
+                std::make_unique<StarFoxDlss>(device, scheduler, memory_allocator, descriptor_pool,
+                                              compute_pass_descriptor_queue);
+        }
+        const auto target = output.ColorView();
+        if (!target) {
+            return false;
+        }
+        const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
+            return NvidiaDlssUpscaler::Image{
+                .view = handle,
+                .image = view.ImageHandle(),
+                .format =
+                    MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format)
+                        .format,
+                .range = {aspect, 0, 1, 0, 1},
+                .barrier_aspect = ImageAspectMask(view.format),
+            };
+        };
+        const bool native =
+            Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
+        const bool recorded = starfox_dlss->Record(
+            {
+                .color = image(input, input.Handle(Shader::TextureType::Color2D),
+                               VK_IMAGE_ASPECT_COLOR_BIT),
+                .depth = image(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+                .motion_vectors = image(motion, motion.Handle(Shader::TextureType::Color2D),
+                                        VK_IMAGE_ASPECT_COLOR_BIT),
+                .render_size = {1920, 1080},
+                .upscale_size = native ? VkExtent2D{1920, 1080} : VkExtent2D{3840, 2160},
+                .jitter = jitter,
+                .motion_vector_scale = {-960.0f, 540.0f},
+                .reset = false,
+                .depth_inverted = true,
+                .hdr = true,
+            },
+            VK_NULL_HANDLE, StarFoxDlss::InputMode::Gameplay);
+        return recorded && starfox_dlss->WriteUpscaledOutput(target, {3840, 2160});
+    } catch (const vk::Exception& exception) {
+        LOG_WARNING(Render_Vulkan,
+                    "Star Fox gameplay DLSS unavailable ({}); retaining guest upscale",
+                    exception.what());
+        dlss_unsupported = true;
+    }
+#endif
+    return false;
+}
+
 void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,

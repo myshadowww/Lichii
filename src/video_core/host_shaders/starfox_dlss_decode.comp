@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D guest_color;
+layout(binding = 1, rgba16f) uniform writeonly image2D dlss_color;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(dlss_color)))) {
+        return;
+    }
+    // Gameplay's final RGBA16F scene contains the guest's explicit sRGB encoding.
+    vec3 encoded = clamp(texelFetch(guest_color, pixel, 0).rgb, 0.0, 1.0);
+    vec3 linear_color = mix(pow((encoded + 0.055) / 1.055, vec3(2.4)),
+                            encoded / 12.92, lessThanEqual(encoded, vec3(0.04045)));
+    imageStore(dlss_color, pixel, vec4(linear_color, 1.0));
+}

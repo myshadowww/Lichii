@@ -10,7 +10,7 @@ void main() {
     if (any(greaterThanEqual(pixel, imageSize(guest_color)))) {
         return;
     }
-    vec3 color = texelFetch(dlss_color, pixel, 0).rgb;
+    vec3 color = textureLod(dlss_color, (vec2(pixel) + 0.5) / vec2(imageSize(guest_color)), 0).rgb;
     if (any(isnan(color)) || any(isinf(color))) {
         return;
     }

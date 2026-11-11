@@ -62,12 +62,22 @@ validated 4K scene target receives one sRGB encoding through a UNORM storage vie
 game draws its HUD and subsequent color processing normally. Missing or stale temporal
 results retain the guest upscale. This path does not use Ocarina's HUD-difference composition.
 
+Flight training bypasses that native DLSS chain. Its separate entry point tracks the
+captured scene draw and final encoded RGBA16F copy, with matching same-frame GPU resources
+and validated constant buffers. It reads the actual raster jitter (the captured training
+sequence alternates quarter-pixel offsets), converts unjittered RG16_SNORM motion to RG16F,
+and decodes the final scene before DLSS. It writes the 4K scene target before the HUD;
+Native quality reconstructs 1080p and scales that result to the target. Switching between
+the cinematic and gameplay input paths resets history. Unexpected shader variants, camera
+layouts, resource changes, or unreadable constants retain the game's own scene upscale.
+
 Disabling NVIDIA DLSS, missing runtime support, or an unsupported contract retains Star
-Fox's existing spatial repair. Star Fox does not opt into the Fire Emblem FSR path.
+Fox's existing spatial repair or native gameplay upscale. Star Fox does not opt into the
+Fire Emblem FSR path.
 `ngx_smoke` exercises both native AA and super resolution with sRGB input, D32S8 depth,
-alpha preservation, resets/resizes, stale-frame rejection, output encoding and injected
-NGX evaluation failure. Captured hashes and dimensions deliberately limit support to the
-verified game path; future updates must be checked again.
+alpha preservation, resets/resizes, stale-frame rejection, output encoding, gameplay's
+encoded float color and SNORM motion, mode transitions, and injected NGX evaluation failure. Captured hashes and dimensions
+deliberately limit support to the verified game path; future updates must be checked again.
 
 ## Ocarina of Time
 

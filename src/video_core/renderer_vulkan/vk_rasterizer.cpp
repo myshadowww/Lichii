@@ -29,27 +29,27 @@
 
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
-#include "shader_recompiler/exception.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/buffer_cache/buffer_cache.h"
-#include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
-#include "video_core/native_query_trace.h"
-#include "video_core/native_indirect_reset.h"
-#include "video_core/render_trace.h"
-#include "video_core/indirect_reset.h"
-#include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/fire_emblem_upscale.h"
+#include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/indirect_reset.h"
+#include "video_core/native_indirect_reset.h"
+#include "video_core/native_query_trace.h"
+#include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
-#include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
+#include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #ifdef EGLANTINE_NVIDIA_DLSS
 #include "video_core/renderer_vulkan/vk_nvidia_dlss.h"
 #include "video_core/vulkan_common/nvidia_dlss.h"
@@ -1123,6 +1123,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
     const auto hashes = pipeline->ShaderHashes();
+    TrackStarFoxDraw(*pipeline);
     if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
         std::ranges::find(hashes, final_vertex) != hashes.end()) {
         const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
@@ -2247,8 +2248,11 @@ void RasterizerVulkan::DispatchCompute() {
         const auto sampled = pipeline->SampledImages();
         const auto written = pipeline->WrittenImages();
         if (sampled.size() == 1 && written.size() == 1 && sampled[0].id && written[0]) {
-            texture_cache_runtime.WriteStarFoxUpscale(texture_cache.GetImageView(sampled[0].id),
-                                                      texture_cache.GetImageView(written[0]));
+            if (!texture_cache_runtime.WriteStarFoxUpscale(
+                    texture_cache.GetImageView(sampled[0].id),
+                    texture_cache.GetImageView(written[0]))) {
+                TryStarFoxGameplay(sampled[0].id, written[0]);
+            }
         }
     }
     buffer_cache.NoteWorkRecorded(true);
@@ -2818,6 +2822,167 @@ void RasterizerVulkan::TracePendingCpuWrites(bool compute, std::span<const u64> 
                  storage ? "ssbo" : "cbuf", index, written ? " written" : "", binding.gpu_addr,
                  binding.device_addr, bound_size);
     });
+}
+
+/// Remember only the captured scene geometry and its later explicitly encoded fullscreen copy.
+void RasterizerVulkan::TrackStarFoxDraw(const GraphicsPipeline& pipeline) {
+    using namespace VideoCommon::FireEmblemUpscale;
+    using VideoCore::Surface::PixelFormat;
+    if (program_id != StarFoxProgramId || !Settings::GetNvidiaDlssRuntimeSettings().enabled) {
+        return;
+    }
+    const auto& hashes = pipeline.ShaderHashes();
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (!targets.color_buffer_ids[0]) {
+        return;
+    }
+    const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    const auto plain_scene = [](const ImageView& view) {
+        return view.size.width == 1920 && view.size.height == 1080 && view.size.depth == 1 &&
+               view.Samples() == VK_SAMPLE_COUNT_1_BIT && !view.IsRescaled() &&
+               view.type == ImageViewType::e2D && view.HasIdentitySwizzle() &&
+               view.range == VideoCommon::SubresourceRange{};
+    };
+    if (!plain_scene(color)) {
+        return;
+    }
+    if (hashes[1] == StarFoxGameplayVertex && hashes[5] == StarFoxGameplayFragment &&
+        color.format == PixelFormat::B10G11R11_FLOAT && targets.color_buffer_ids[1] &&
+        targets.depth_buffer_id) {
+        starfox_gameplay = {};
+        const auto& motion = texture_cache.GetImageView(targets.color_buffer_ids[1]);
+        const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+        if (!plain_scene(motion) || !plain_scene(depth) ||
+            motion.format != PixelFormat::R16G16_SNORM ||
+            depth.format != PixelFormat::D32_FLOAT_S8_UINT ||
+            motion.ImageHandle() == color.ImageHandle() ||
+            depth.ImageHandle() == color.ImageHandle()) {
+            return;
+        }
+        std::array<u32, 0x11c / 4> object{};
+        std::array<u32, 0x394 / 4> camera{};
+        std::array<u32, 0x12c / 4> fragment_object{};
+        std::array<u32, 0xc0 / 4> projection{};
+        std::array<u32, 0x200 / 4> fragment_camera{};
+        std::array<bool, 5> read{};
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                   const auto& binding, u32 bound_size, const auto*,
+                                                   u32) {
+            if (storage) {
+                return;
+            }
+            std::span<u32> words;
+            size_t slot{};
+            if (stage == 0 && index == 4) {
+                words = object;
+            } else if (stage == 0 && index == 6) {
+                words = camera;
+                slot = 1;
+            } else if (stage == 4 && index == 4) {
+                words = fragment_object;
+                slot = 2;
+            } else if (stage == 0 && index == 7) {
+                words = projection;
+                slot = 3;
+            } else if (stage == 4 && index == 7) {
+                words = fragment_camera;
+                slot = 4;
+            } else {
+                return;
+            }
+            if (bound_size < words.size_bytes() ||
+                buffer_cache.IsRegionGpuModified(binding.device_addr, words.size_bytes())) {
+                return;
+            }
+            device_memory.ReadBlockUnsafe(binding.device_addr, words.data(), words.size_bytes());
+            read[slot] = true;
+        });
+        if (!std::ranges::all_of(read, [](bool value) { return value; })) {
+            return;
+        }
+        const auto jitter =
+            StarFoxGameplayJitter(object, camera, fragment_object, projection, fragment_camera);
+        if (!jitter) {
+            return;
+        }
+        starfox_gameplay = {
+            .channel = gpu_memory,
+            .frame = render_trace_frame,
+            .map_serial = gpu_memory->MapSerial(),
+            .motion = targets.color_buffer_ids[1],
+            .depth = targets.depth_buffer_id,
+            .motion_image = motion.ImageHandle(),
+            .depth_image = depth.ImageHandle(),
+            .motion_address = motion.gpu_addr,
+            .depth_address = depth.gpu_addr,
+            .jitter = *jitter,
+        };
+    }
+    if (hashes[1] != StarFoxSceneCopyVertex || hashes[5] != StarFoxSceneCopyFragment ||
+        color.format != PixelFormat::R16G16B16A16_FLOAT || !starfox_gameplay.motion ||
+        starfox_gameplay.frame != render_trace_frame || starfox_gameplay.channel != gpu_memory ||
+        starfox_gameplay.map_serial != gpu_memory->MapSerial()) {
+        return;
+    }
+    starfox_gameplay.color = {};
+    const auto sampled = pipeline.SampledImages();
+    if (sampled.size() != 1 || !sampled[0].id) {
+        return;
+    }
+    const auto& source = texture_cache.GetImageView(sampled[0].id);
+    if (!plain_scene(source) || source.format != PixelFormat::A8B8G8R8_SRGB ||
+        source.ImageHandle() == color.ImageHandle()) {
+        return;
+    }
+    bool encoded = false;
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                               const auto& binding, u32 bound_size, const auto*,
+                                               u32) {
+        std::array<u32, 12> words{};
+        if (stage != 4 || storage || index != 6 || bound_size < sizeof(words) ||
+            buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(words))) {
+            return;
+        }
+        device_memory.ReadBlockUnsafe(binding.device_addr, words.data(), sizeof(words));
+        encoded = words[10] == 0x480 && std::bit_cast<f32>(words[4]) == 1920.0f &&
+                  std::bit_cast<f32>(words[5]) == 1080.0f && std::bit_cast<f32>(words[8]) == 1.0f &&
+                  std::bit_cast<f32>(words[9]) == 1.0f;
+    });
+    if (encoded) {
+        starfox_gameplay.color = targets.color_buffer_ids[0];
+        starfox_gameplay.color_image = color.ImageHandle();
+        starfox_gameplay.color_address = color.gpu_addr;
+    }
+}
+
+/// The final network has already written a fallback; replace only a complete same-frame scene.
+bool RasterizerVulkan::TryStarFoxGameplay(VideoCommon::ImageViewId input,
+                                          VideoCommon::ImageViewId output) {
+    if (program_id != VideoCommon::FireEmblemUpscale::StarFoxProgramId || !starfox_gameplay.color ||
+        starfox_gameplay.channel != gpu_memory || starfox_gameplay.frame != render_trace_frame ||
+        starfox_gameplay.map_serial != gpu_memory->MapSerial()) {
+        return false;
+    }
+    auto* color = texture_cache.TryGetImageView(input);
+    auto* produced = texture_cache.TryGetImageView(starfox_gameplay.color);
+    auto* motion = texture_cache.TryGetImageView(starfox_gameplay.motion);
+    auto* depth = texture_cache.TryGetImageView(starfox_gameplay.depth);
+    auto* target = texture_cache.TryGetImageView(output);
+    if (!color || !produced || !motion || !depth || !target ||
+        color->ImageHandle() != starfox_gameplay.color_image ||
+        produced->ImageHandle() != starfox_gameplay.color_image ||
+        color->gpu_addr != starfox_gameplay.color_address ||
+        produced->gpu_addr != starfox_gameplay.color_address || color->range != produced->range ||
+        motion->ImageHandle() != starfox_gameplay.motion_image ||
+        motion->gpu_addr != starfox_gameplay.motion_address ||
+        depth->ImageHandle() != starfox_gameplay.depth_image ||
+        depth->gpu_addr != starfox_gameplay.depth_address) {
+        return false;
+    }
+    const bool recorded = texture_cache_runtime.RecordStarFoxGameplay(
+        *color, *target, *motion, *depth, starfox_gameplay.jitter);
+    starfox_gameplay.color = {};
+    return recorded;
 }
 
 bool RasterizerVulkan::OcarinaTemporalEnabled() const {

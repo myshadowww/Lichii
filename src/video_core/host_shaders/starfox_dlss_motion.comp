@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D guest_motion;
+layout(binding = 1, rg16f) uniform writeonly image2D dlss_motion;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(dlss_motion)))) {
+        return;
+    }
+    // Sampling performs the captured SNORM normalization; motion excludes raster jitter.
+    imageStore(dlss_motion, pixel, vec4(texelFetch(guest_motion, pixel, 0).rg, 0.0, 0.0));
+}

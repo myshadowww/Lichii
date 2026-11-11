@@ -157,6 +157,8 @@ public:
 
     /// Completes a validated Star Fox 4K scene before the game draws its HUD.
     bool WriteStarFoxUpscale(ImageView& input, ImageView& output);
+    bool RecordStarFoxGameplay(ImageView& input, ImageView& output, ImageView& motion,
+                               ImageView& depth, std::array<f32, 2> jitter);
 
     /// Records a health check of a game's DLSS network output against its input (both sampled in
     /// the GENERAL layout) and returns an earlier check's result once the GPU has finished it.
