@@ -3,7 +3,7 @@
 The November 11 Star Fox desktop investigation reproduced brief audio gaps with
 48 kHz stereo output and SDL/PipeWire callbacks requesting 1024 frames. A steady
 cutscene callback requested 1024 frames but received only 1008 queue-backed frames,
-inserting 16 samples of silence (0.333 ms). Host timer lateness stayed below 1 ms
+inserting 16 frames of silence (0.333 ms). Host timer lateness stayed below 1 ms
 and guest PCM remained available, so this did not require a missed 5 ms timer tick.
 
 ## Cause and repair
@@ -20,7 +20,10 @@ queue cap. It snapshots the available slots before the loop, so concurrent host
 consumption cannot extend a timing callback indefinitely. The initial cap remains
 three blocks; a 1024-frame host callback raises it to six. Full queues return
 before rereading or converting guest samples. Each admitted block retains the
-existing cursor checks and notification handling.
+existing cursor checks and notification handling. The null output sink has no host
+callback or queued audio to consume, so it limits each pump to one block. This
+preserves 240 frames per 5 ms tick and prevents early guest-space notifications
+when audio output is disabled.
 
 A partial guest tail is deferred while queued audio remains. The existing
 empty-host path can pad a real underrun, but the refill never invents extra silent
@@ -32,8 +35,10 @@ The queue remains bounded by both its existing block limit and sample-ring capac
 The regression checks ordered stereo PCM across guest-ring wrap with no producer
 jitter, 0.667 ms lateness, and 5.667 ms lateness with the missed deadline skipped.
 A separate case drains the host during admission and checks that the original
-refill budget still bounds the loop. Existing partial-block, ownership, fault,
-notification and microphone tests also pass.
+refill budget still bounds the loop. A real null-sink regression checks one-block
+consumption, read-cursor publication and notification thresholds across six ticks.
+Existing partial-block, ownership, fault, notification and microphone tests also
+pass.
 
 Run the focused tests with:
 
@@ -53,7 +58,8 @@ queue underrun; correlate it with these counters.
 The sysmix `full` counter now includes routine ticks that find the deliberately
 filled queue. `retried` remains zero for these ticks because no PCM was copied.
 
-Local desktop validation with the refill fix recorded 120 seconds of the opening
+Local desktop validation on an integration based on `e860139f53`, also containing
+separate rendering fixes, recorded 120 seconds of the opening
 cutscene and 60 seconds of flight training at 48 kHz. Both recordings had no
 stereo zero runs of at least four samples, no held runs of at least twelve samples,
 and no clipped samples after the recording startup exclusion. Full two-second

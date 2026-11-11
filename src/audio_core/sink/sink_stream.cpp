@@ -205,6 +205,7 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
     }
 }
 
+/// Render queued PCM with the stream's underrun policy and optional two-second diagnostics.
 void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::size_t num_frames) {
     if (num_frames == 0) {
         return;

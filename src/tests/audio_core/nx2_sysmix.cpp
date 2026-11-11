@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "audio_core/sink/null_sink.h"
 #include "common/atomic_ops.h"
 #include "common/scope_exit.h"
 #include "core/core_timing.h"
@@ -660,4 +661,32 @@ TEST_CASE("sysmix refill budget stays bounded while the host consumes concurrent
     REQUIRE(ReadCursor(context) == 720);
     REQUIRE(context.sink.last->GetQueueSize() == 0);
     REQUIRE(stream.GetCounters().padded_frames == 0);
+}
+
+TEST_CASE("sysmix null output preserves PCM cadence and notification timing", "[sysmix]") {
+    Context context;
+    AudioCore::Sink::NullSink sink{"auto"};
+    Cursor(context, 0, 1440);
+    std::vector<float> pcm(1440 * 2, 0.25f);
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, pcm.data(),
+                                        pcm.size() * sizeof(float)));
+    SysmixOutput stream{context.system, *context.process, sink, 1,
+                        Context::Base,  Context::Size,    0x24};
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    REQUIRE(stream.SetDataNotification(2, 1100).IsSuccess());
+    REQUIRE_FALSE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()));
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    for (u32 tick = 1; tick <= 6; ++tick) {
+        CAPTURE(tick);
+        stream.Pump();
+        REQUIRE(ReadCursor(context) == tick * 240);
+        REQUIRE(stream.GetCounters().accepted_frames == tick * 240);
+        REQUIRE(stream.GetCounters().nonzero_frames == tick * 240);
+        REQUIRE(stream.GetCounters().admitted_blocks == tick);
+        REQUIRE(stream.GetCounters().padded_frames == 0);
+        // Initial free space is 608 frames. The 1100-frame threshold must first be reached
+        // after three 5 ms ticks, just as when the original pump admitted one block per tick.
+        REQUIRE(stream.GetDataEvent()->IsSignaled(context.system.Kernel()) == (tick >= 3));
+        REQUIRE(stream.GetDataEvent()->Clear(context.system.Kernel()).IsSuccess());
+    }
 }
