@@ -57,6 +57,12 @@ def main():
     source = args.source_dir.resolve() if args.source_dir else repo
     app = args.app_root.resolve()
     info = json.loads((app / "build-info.json").read_text())
+    variant = info.get("cpu_variant", "generic")
+    targets = {"generic": "x86-64", "avx512": "x86-64-v4"}
+    if variant not in targets:
+        parser.error("Unknown CPU variant in build-info.json")
+    if info.get("compiler_target", targets[variant]) != targets[variant]:
+        parser.error("CPU variant does not match the recorded compiler target")
     revision = info["head"]
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", info["date"]):
         parser.error("build-info.json must record its build date as YYYY-MM-DD")
@@ -148,6 +154,8 @@ def main():
         command += ["--exclude-library", library]
     with (output / "linuxdeploy.log").open("w") as log:
         subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+    if variant == "avx512":
+        (appdir / "required-isa").write_text("x86-64-v4\n")
     licenses = appdir / "usr/share/licenses/lichii"
     licenses.mkdir(parents=True)
     shutil.copy2(source / "LICENSE.txt", licenses / "LICENSE.txt")
@@ -208,6 +216,9 @@ def main():
         "input_executable_sha256": info["sha256"],
         "packaged_executable_sha256": sha256(bindir / "lichii"),
         "minimum_glibc": minimum_glibc, "elf_isa_requirements": sorted(isa),
+        "cpu_variant": variant, "compiler_target": targets[variant],
+        "required_cpu_isa": targets[variant],
+        "ctest": info.get("ctest", "not_recorded"),
         "qt_version": qt_version,
         "configuration": info.get("configuration", "See the source revision's build instructions"),
         "linuxdeploy_sha256": LINUXDEPLOY_SHA256,
@@ -216,10 +227,11 @@ def main():
         "executable_text_sha256": code_hash, "distribution_packages": package_records,
         "packaging_note": "ELF library search paths changed by linuxdeploy; executable code was not rebuilt.",
     }
-    metadata = output / "build-info.json"
+    suffix = "-avx512" if variant == "avx512" else ""
+    metadata = output / f"build-info{suffix}.json"
     metadata.write_text(json.dumps(manifest, indent=2) + "\n")
     shutil.copy2(metadata, appdir / "build-info.json")
-    filename = f"Lichii-desktop-{info['date']}-{revision[:10]}-linux-x86_64.AppImage"
+    filename = f"Lichii-desktop-{info['date']}-{revision[:10]}-linux-x86_64{suffix}.AppImage"
     env.update(LDAI_VERSION=f"desktop-{info['date']}-{revision[:10]}",
                LDAI_OUTPUT=str(output / filename), OUTPUT=str(output / filename))
     with (output / "appimage.log").open("w") as log:

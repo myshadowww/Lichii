@@ -17,7 +17,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package", type=Path)
     parser.add_argument("--ubuntu-baseline", action="store_true",
-                        help="Require glibc <= 2.39 and generic x86_64 ELF requirements")
+                        help="Require glibc <= 2.39 and ELF requirements within the declared CPU target")
+    parser.add_argument("--allow-unsupported-cpu", action="store_true",
+                        help="Check the package and launcher guard but skip GUI execution on an unsupported CPU")
+    parser.add_argument("--report", type=Path, help="Write the validation result as JSON")
     args = parser.parse_args()
     package = args.package.resolve()
     images = list(package.glob("*.AppImage"))
@@ -25,11 +28,27 @@ def main():
         parser.error("Expected exactly one AppImage")
     image = images[0]
     subprocess.run(["sha256sum", "--check", "SHA256SUMS"], cwd=package, check=True)
-    manifest = json.loads((package / "build-info.json").read_text())
+    metadata = list(package.glob("build-info*.json"))
+    if len(metadata) != 1:
+        parser.error("Expected exactly one build record")
+    manifest = json.loads(metadata[0].read_text())
+    variant = manifest.get("cpu_variant", "generic")
+    if variant not in ("generic", "avx512"):
+        raise RuntimeError("Unknown CPU variant")
+    target = "x86-64-v4" if variant == "avx512" else "x86-64"
+    if manifest.get("required_cpu_isa", target) != target:
+        raise RuntimeError("CPU variant and instruction-set requirement disagree")
+    cpu_supported = True
+    if variant == "avx512":
+        loader = subprocess.check_output(["/lib64/ld-linux-x86-64.so.2", "--help"],
+                                         env={**os.environ, "LC_ALL": "C"}, text=True)
+        cpu_supported = "x86-64-v4 (supported, searched)" in loader
+        if not cpu_supported and not args.allow_unsupported_cpu:
+            raise RuntimeError("AVX-512 startup validation requires an x86-64-v4 CPU")
     if args.ubuntu_baseline:
         if tuple(map(int, manifest["minimum_glibc"].split("."))) > (2, 39):
             raise RuntimeError("Package exceeds the Ubuntu 24.04 glibc baseline")
-        if any("x86-64-v" in value for value in manifest["elf_isa_requirements"]):
+        if variant == "generic" and any("x86-64-v" in value for value in manifest["elf_isa_requirements"]):
             raise RuntimeError("Package contains libraries requiring a newer x86_64 instruction set")
     with tempfile.TemporaryDirectory(prefix="lichii-appimage-check-") as temporary:
         root = Path(temporary)
@@ -38,6 +57,12 @@ def main():
         extracted = root / "squashfs-root"
         if json.loads((extracted / "build-info.json").read_text()) != manifest:
             raise RuntimeError("Embedded build record differs from the release record")
+        marker = extracted / "required-isa"
+        if variant == "avx512":
+            if marker.read_text().strip() != target:
+                raise RuntimeError("AVX-512 launcher CPU guard is missing or incorrect")
+        elif marker.exists():
+            raise RuntimeError("Standard build must not require AVX-512")
         with (extracted / "usr/bin/lichii").open("rb") as binary:
             digest = hashlib.file_digest(binary, "sha256").hexdigest()
         if digest != manifest["packaged_executable_sha256"]:
@@ -74,6 +99,15 @@ def main():
         env.update(XDG_RUNTIME_DIR=str(runtime), QT_QPA_PLATFORM="offscreen",
                    QT_DEBUG_PLUGINS="1", QT_OPENGL="software", DLSSNR_DISABLE="1",
                    VK_LOADER_LAYERS_DISABLE="*")
+        if variant == "avx512":
+            denied_env = {**env, "GLIBC_TUNABLES": "glibc.cpu.hwcaps=-AVX512F"}
+            denied = subprocess.run([str(extracted / "AppRun")], env=denied_env,
+                                    text=True, capture_output=True, timeout=10)
+            if denied.returncode != 78 or "requires an x86-64-v4 CPU" not in denied.stderr:
+                raise RuntimeError("AVX-512 launcher did not reject an unsupported CPU")
+        if not cpu_supported:
+            report_result(args, manifest, variant, "skipped_unsupported_cpu")
+            return
         bundled_qt_loaded = False
         with tempfile.TemporaryFile(mode="w+") as log:
             process = subprocess.Popen([str(image), "--appimage-extract-and-run"],
@@ -120,10 +154,19 @@ def main():
                         "Could not load the Qt platform plugin"):
             if failure in startup:
                 raise RuntimeError("GUI startup failed:\n" + startup[-6000:])
-    print(json.dumps({"source_commit": manifest["source_commit"],
-                      "checksums": "passed", "embedded_manifest": "passed",
-                      "dependencies": "passed", "offscreen_startup": "passed",
-                      "gameplay_tested": False}, indent=2))
+    report_result(args, manifest, variant, "passed")
+
+
+def report_result(args, manifest, variant, startup):
+    report = {"source_commit": manifest["source_commit"], "cpu_variant": variant,
+              "checksums": "passed", "embedded_manifest": "passed",
+              "dependencies": "passed", "offscreen_startup": startup,
+              "unsupported_cpu_guard": "passed" if variant == "avx512" else "not_required",
+              "gameplay_tested": False}
+    rendered = json.dumps(report, indent=2) + "\n"
+    if args.report:
+        args.report.write_text(rendered)
+    print(rendered, end="")
 
 
 if __name__ == "__main__":

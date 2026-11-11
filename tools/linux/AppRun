@@ -3,6 +3,17 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+# Ask glibc about CPU and OS support before loading any optimized libraries.
+if [ -f "$APPDIR/required-isa" ]; then
+    if [ "$(cat "$APPDIR/required-isa")" != x86-64-v4 ]; then
+        echo 'Lichii: unknown CPU requirement in this AppImage.' >&2
+        exit 78
+    fi
+    if ! LC_ALL=C /lib64/ld-linux-x86-64.so.2 --help | grep -Fq 'x86-64-v4 (supported, searched)'; then
+        echo 'Lichii: this AVX-512 build requires an x86-64-v4 CPU and OS support. Download the standard Linux x86_64 AppImage instead.' >&2
+        exit 78
+    fi
+fi
 export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export QT_PLUGIN_PATH="$APPDIR/usr/plugins"
 export QT_QPA_PLATFORM_PLUGIN_PATH="$APPDIR/usr/plugins/platforms"

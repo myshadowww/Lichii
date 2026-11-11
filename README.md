@@ -28,12 +28,16 @@ Visit the [Lichii game compatibility website](https://lichii.zortos.me) to find 
 Download the Linux x86_64 `.AppImage` and `SHA256SUMS` from
 [this fork's releases](https://github.com/myshadowww/Lichii/releases). Each release
 records its source commit and minimum glibc version. Qt is bundled.
+Choose the standard `linux-x86_64.AppImage` for compatibility, or
+`linux-x86_64-avx512.AppImage` if your CPU and OS support x86-64-v4. AVX-512 may
+improve some workloads; a game-performance gain is not guaranteed.
 
 ```sh
 chmod +x Lichii-*.AppImage
 ./Lichii-*.AppImage
 ```
 
+Download one variant, or use its full filename when launching if you have both.
 If FUSE is unavailable, add `--appimage-extract-and-run`. See
 [Linux releases](docs/linux-releases.md) for verification and build instructions,
 and [native Linux DLSS](docs/user/DLSSLinux.md) for optional runtime/model setup.

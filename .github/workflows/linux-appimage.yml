@@ -22,6 +22,10 @@ jobs:
     if: github.repository == 'myshadowww/Lichii'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [generic, avx512]
     steps:
       - name: Check out packaging tools
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
@@ -54,10 +58,11 @@ jobs:
         env:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
           RELEASE_DATE: ${{ steps.release.outputs.date }}
+          CPU_VARIANT: ${{ matrix.variant }}
         run: |
           sudo git config --global --add safe.directory "$PWD/source"
-          sudo env BUILD_JOBS=4 bash tooling/tools/linux/build-appimage.sh \
-            "$PWD/source" "$PWD/release-work" "$SOURCE_SHA" "$RELEASE_DATE"
+          sudo env BUILD_JOBS=4 ALLOW_UNSUPPORTED_CPU=1 bash tooling/tools/linux/build-appimage.sh \
+            "$PWD/source" "$PWD/release-work" "$SOURCE_SHA" "$RELEASE_DATE" "$CPU_VARIANT"
 
       - name: Package AppImage
         run: |
@@ -69,20 +74,26 @@ jobs:
             --qmake "$PWD/release-work/qt/6.8.3/gcc_64/bin/qmake"
 
       - name: Validate in a clean Ubuntu runtime without Qt
+        env:
+          CPU_VARIANT: ${{ matrix.variant }}
         run: |
           docker build -t lichii-runtime-check \
             -f tooling/tools/linux/runtime-test.Containerfile tooling/tools/linux
-          docker run --rm -v "$PWD/release-work/package:/package:ro" lichii-runtime-check
+          docker run --rm -v "$PWD/release-work/package:/package" lichii-runtime-check \
+            --ubuntu-baseline --allow-unsupported-cpu \
+            --report "/package/validation-$CPU_VARIANT.json" /package
+          cat "release-work/package/validation-$CPU_VARIANT.json" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Store release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: linux-appimage
+          name: linux-appimage-${{ matrix.variant }}
           if-no-files-found: error
           path: |
             release-work/package/*.AppImage
             release-work/package/SHA256SUMS
-            release-work/package/build-info.json
+            release-work/package/build-info*.json
+            release-work/package/validation-*.json
 
   publish:
     needs: build
@@ -93,8 +104,8 @@ jobs:
       - name: Download validated assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: linux-appimage
-          path: assets
+          pattern: linux-appimage-*
+          path: variants
 
       - name: Publish Linux release
         env:
@@ -103,23 +114,56 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          cd assets
-          sha256sum --check SHA256SUMS
           python3 - <<'PY'
-          import json
+          import hashlib, json, shutil, subprocess
           from pathlib import Path
-          info = json.loads(Path('build-info.json').read_text())
-          Path('notes.md').write_text(
-              'Linux x86_64 AppImage built from the tagged desktop source.\n\n'
-              f"Source: `{info['source_commit']}`. Requires glibc {info['minimum_glibc']} or newer.\n\n"
-              'Download the `.AppImage`, make it executable, and run it. '
+          output = Path('assets')
+          output.mkdir()
+          records, sources, checksums = [], set(), []
+          for variant in ('generic', 'avx512'):
+              directory = Path('variants') / f'linux-appimage-{variant}'
+              subprocess.run(['sha256sum', '--check', 'SHA256SUMS'], cwd=directory, check=True)
+              metadata, = directory.glob('build-info*.json')
+              image, = directory.glob('*.AppImage')
+              info = json.loads(metadata.read_text())
+              validation = directory / f'validation-{variant}.json'
+              result = json.loads(validation.read_text())
+              assert info['cpu_variant'] == result['cpu_variant'] == variant
+              assert info['source_commit'] == result['source_commit']
+              assert all(result[key] == 'passed' for key in ('checksums', 'embedded_manifest', 'dependencies'))
+              allowed = {'passed'} if variant == 'generic' else {'passed', 'skipped_unsupported_cpu'}
+              assert info['ctest'] in allowed and result['offscreen_startup'] in allowed
+              if variant == 'avx512':
+                  assert result['unsupported_cpu_guard'] == 'passed'
+              sources.add(info['source_commit'])
+              records.append(f"| {variant} | {info['required_cpu_isa']} | {info['ctest']} | {result['offscreen_startup']} |")
+              for asset in (image, metadata, validation):
+                  shutil.copy2(asset, output / asset.name)
+                  digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+                  checksums.append(f'{digest}  {asset.name}\n')
+          assert len(sources) == 1, 'Variants were built from different source commits'
+          (output / 'SHA256SUMS').write_text(''.join(checksums))
+          (output / 'notes.md').write_text(
+              'Two Linux x86_64 AppImages built from the same tagged desktop source.\n\n'
+              f"Source: `{sources.pop()}`. Built on Ubuntu 24.04; see each build record for its minimum glibc version.\n\n"
+              '- Standard `linux-x86_64.AppImage`: portable, no AVX-512 requirement. Choose this if unsure.\n'
+              '- `linux-x86_64-avx512.AppImage`: compiled for x86-64-v4; requires CPU and OS support for AVX-512 F/BW/CD/DQ/VL and the v2/v3 features.\n\n'
+              'AVX-512 is not guaranteed to improve game performance. Both builds retain runtime CPU feature detection.\n\n'
+              'Download one `.AppImage`, make it executable, and run it. '
               'FUSE-free launch is supported with `--appimage-extract-and-run`.\n\n'
+              'Download its build record, validation record and `SHA256SUMS`; use '
+              '`sha256sum --check --ignore-missing SHA256SUMS` to verify the files you downloaded.\n\n'
               'Native Linux DLSS and neural rendering are enabled in the build; '
               'their optional runtime/model files are obtained through the application. '
               'Games, keys, firmware, saves, and game shader recipes are not included.\n\n'
-              'Build tests and an isolated offscreen startup check passed. '
+              '| Build | CPU target | CTest | Offscreen startup |\n'
+              '| --- | --- | --- | --- |\n' + '\n'.join(records) + '\n\n'
+              '`skipped_unsupported_cpu` means the runner could compile and inspect the AVX-512 package '
+              'but could not execute its tests or GUI. The launcher rejection check still runs.\n\n'
               'This is an experimental desktop build; automated checks do not establish gameplay compatibility.\n')
           PY
+          cd assets
+          sha256sum --check SHA256SUMS
           gh release create "$RELEASE_TAG" --verify-tag --prerelease \
             --title "Lichii Linux $RELEASE_TAG" --notes-file notes.md \
-            ./*.AppImage SHA256SUMS build-info.json
+            ./*.AppImage SHA256SUMS build-info*.json validation-*.json
