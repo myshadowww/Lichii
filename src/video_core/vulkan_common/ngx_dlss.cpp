@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <string_view>
+#include <vector>
 #include <fmt/format.h>
 #include "common/dynamic_library.h"
 #include "common/fs/fs_util.h"
@@ -43,6 +45,44 @@ State &GetState() {
 std::mutex status_mutex;
 Ngx::RuntimeStatus status;
 std::atomic<u64> evaluations{};
+PFN_vkGetDeviceProcAddr ngx_device_proc{};
+VkDevice ngx_device{};
+
+// DLSS 310.9 can clear an internal image after a transition whose destination scope
+// only includes shader writes. This wrapper affects barriers requested by NGX only.
+VKAPI_ATTR void VKAPI_CALL NgxPipelineBarrier(
+    VkCommandBuffer command, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+    VkDependencyFlags flags, u32 memory_count, const VkMemoryBarrier* memories,
+    u32 buffer_count, const VkBufferMemoryBarrier* buffers, u32 image_count,
+    const VkImageMemoryBarrier* images) {
+    const auto barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(
+        ngx_device_proc(ngx_device, "vkCmdPipelineBarrier"));
+    const auto needs_transfer = [](const VkImageMemoryBarrier& image) {
+        return image.newLayout == VK_IMAGE_LAYOUT_GENERAL &&
+               (image.dstAccessMask & VK_ACCESS_SHADER_WRITE_BIT);
+    };
+    if (!image_count || !std::any_of(images, images + image_count, needs_transfer)) {
+        barrier(command, src, dst, flags, memory_count, memories, buffer_count, buffers,
+                image_count, images);
+        return;
+    }
+    std::vector<VkImageMemoryBarrier> patched(images, images + image_count);
+    for (auto& image : patched) {
+        if (needs_transfer(image)) {
+            image.dstAccessMask |= VK_ACCESS_TRANSFER_WRITE_BIT;
+        }
+    }
+    barrier(command, src, dst | VK_PIPELINE_STAGE_TRANSFER_BIT, flags, memory_count, memories,
+            buffer_count, buffers, image_count, patched.data());
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL NgxGetDeviceProcAddr(VkDevice device, const char* name) {
+    const auto original = ngx_device_proc(device, name);
+    if (original && std::strcmp(name, "vkCmdPipelineBarrier") == 0) {
+        return reinterpret_cast<PFN_vkVoidFunction>(NgxPipelineBarrier);
+    }
+    return original;
+}
 
 std::wstring WidePath(const std::filesystem::path &path) {
     const auto utf32 = Common::UTF8ToUTF32(Common::FS::PathToUTF8String(path));
@@ -214,10 +254,12 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     NVSDK_NGX_FeatureCommonInfo info{};
     info.PathListInfo = {paths, 1};
     info.LoggingInfo = {LogFromNgx, NVSDK_NGX_LOGGING_LEVEL_ON, true};
+    ngx_device_proc = dld.vkGetDeviceProcAddr;
+    ngx_device = device;
     const auto result =
         state.api.init(ProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1", state.cache_directory.c_str(),
                        instance, physical, device, dld.vkGetInstanceProcAddr,
-                       dld.vkGetDeviceProcAddr, NVSDK_NGX_Version_API, &info);
+                       NgxGetDeviceProcAddr, NVSDK_NGX_Version_API, &info);
     if (NVSDK_NGX_FAILED(result)) {
         Ngx::ReportFailure(fmt::format("initialization failed ({:#x})", static_cast<u32>(result)));
         Stop();
