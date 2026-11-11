@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright 2026 Lichii contributors
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -eu
+APPDIR="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+export LD_LIBRARY_PATH="$APPDIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export QT_PLUGIN_PATH="$APPDIR/usr/plugins"
+export QT_QPA_PLATFORM_PLUGIN_PATH="$APPDIR/usr/plugins/platforms"
+# Host desktop theme plugins may require a different Qt build.
+unset QT_QPA_PLATFORMTHEME
+export QT_STYLE_OVERRIDE=Fusion
+exec "$APPDIR/usr/bin/lichii" "$@"

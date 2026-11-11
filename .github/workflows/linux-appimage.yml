@@ -1,0 +1,125 @@
+name: Linux desktop AppImage
+
+on:
+  push:
+    tags: [desktop-*]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing desktop-YYYY-MM-DD tag to build and release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-appimage-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'myshadowww/Lichii'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out packaging tools
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          path: tooling
+          persist-credentials: false
+
+      - name: Validate release tag
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^desktop-([0-9]{4}-[0-9]{2}-[0-9]{2})([.-][a-zA-Z0-9.-]+)?$ ]]
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "date=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tagged desktop source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          path: source
+          ref: refs/tags/${{ steps.release.outputs.tag }}
+          persist-credentials: false
+
+      - name: Resolve source revision
+        id: source
+        run: echo "sha=$(git -C source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and test on Ubuntu 24.04
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          RELEASE_DATE: ${{ steps.release.outputs.date }}
+        run: |
+          sudo git config --global --add safe.directory "$PWD/source"
+          sudo env BUILD_JOBS=4 bash tooling/tools/linux/build-appimage.sh \
+            "$PWD/source" "$PWD/release-work" "$SOURCE_SHA" "$RELEASE_DATE"
+
+      - name: Package AppImage
+        run: |
+          sudo python3 tooling/tools/linux/package-appimage.py \
+            --app-root "$PWD/release-work/installed" \
+            --source-dir "$PWD/source" \
+            --output "$PWD/release-work/package" \
+            --tools-dir "$PWD/release-work/tools" \
+            --qmake "$PWD/release-work/qt/6.8.3/gcc_64/bin/qmake"
+
+      - name: Validate in a clean Ubuntu runtime without Qt
+        run: |
+          docker build -t lichii-runtime-check \
+            -f tooling/tools/linux/runtime-test.Containerfile tooling/tools/linux
+          docker run --rm -v "$PWD/release-work/package:/package:ro" lichii-runtime-check
+
+      - name: Store release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linux-appimage
+          if-no-files-found: error
+          path: |
+            release-work/package/*.AppImage
+            release-work/package/SHA256SUMS
+            release-work/package/build-info.json
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: linux-appimage
+          path: assets
+
+      - name: Publish Linux release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum --check SHA256SUMS
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          info = json.loads(Path('build-info.json').read_text())
+          Path('notes.md').write_text(
+              'Linux x86_64 AppImage built from the tagged desktop source.\n\n'
+              f"Source: `{info['source_commit']}`. Requires glibc {info['minimum_glibc']} or newer.\n\n"
+              'Download the `.AppImage`, make it executable, and run it. '
+              'FUSE-free launch is supported with `--appimage-extract-and-run`.\n\n'
+              'Native Linux DLSS and neural rendering are enabled in the build; '
+              'their optional runtime/model files are obtained through the application. '
+              'Games, keys, firmware, saves, and game shader recipes are not included.\n\n'
+              'Build tests and an isolated offscreen startup check passed. '
+              'This is an experimental desktop build; automated checks do not establish gameplay compatibility.\n')
+          PY
+          gh release create "$RELEASE_TAG" --verify-tag --prerelease \
+            --title "Lichii Linux $RELEASE_TAG" --notes-file notes.md \
+            ./*.AppImage SHA256SUMS build-info.json

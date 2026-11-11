@@ -6,10 +6,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
-<h2 align="center">⚠️ Lichii has no official website ⚠️</h2>
-
-> [!CAUTION]
-> **Lichii has no official website.** The only site run by this project is the **game compatibility website, [lichii.zortos.me](https://lichii.zortos.me)**, for compatibility reports only. Download Lichii **only** from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Any other "Lichii" website or download (such as lichii.org) is not ours and may contain malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
+> **Linux desktop fork:** this repository focuses on native Linux DLSS, neural rendering,
+> and Linux desktop compatibility. Download our AppImages from
+> [myshadowww/Lichii releases](https://github.com/myshadowww/Lichii/releases).
+> The original Lichii project is [zortos293/Lichii](https://github.com/zortos293/Lichii).
 
 <p align="center">
   <img src="dist/branding/lichii_icon_with_logo.png" alt="Lichii" width="600">
@@ -25,9 +25,19 @@ Visit the [Lichii game compatibility website](https://lichii.zortos.me) to find 
 
 ## Downloads and setup
 
-Download Lichii only from this repository's [releases page](https://github.com/zortos293/Lichii/releases). Lichii has no other download site: archives offered elsewhere, such as lichii.org, are not built by this project, and one has been reported to install malware ([#545](https://github.com/zortos293/Lichii/issues/545)).
+Download the Linux x86_64 `.AppImage` and `SHA256SUMS` from
+[this fork's releases](https://github.com/myshadowww/Lichii/releases). Each release
+records its source commit and minimum glibc version. Qt is bundled.
 
-On Windows, extract the entire build archive and run **lichii.exe**. Only use games and system files you have legally obtained. Games, keys and firmware are not included.
+```sh
+chmod +x Lichii-*.AppImage
+./Lichii-*.AppImage
+```
+
+If FUSE is unavailable, add `--appimage-extract-and-run`. See
+[Linux releases](docs/linux-releases.md) for verification and build instructions,
+and [native Linux DLSS](docs/user/DLSSLinux.md) for optional runtime/model setup.
+Games, keys, firmware, saves, and game shader recipes are not included.
 
 ### Existing saves and settings
 
