@@ -670,11 +670,6 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotAntiAliasing, Game, tr("Game")),
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
                           }});
-    translations->insert({Settings::EnumMetadata<Settings::NvidiaDlssQuality>::Index(),
-                          {
-                              PAIR(NvidiaDlssQuality, Automatic, tr("Automatic (upscaling)")),
-                              PAIR(NvidiaDlssQuality, Native, tr("Native (DLAA)")),
-                          }});
     translations->insert({Settings::EnumMetadata<Settings::NeuralRendering>::Index(),
                           {
                               PAIR(NeuralRendering, Off, tr("Off")),
