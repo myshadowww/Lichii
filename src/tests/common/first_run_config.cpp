@@ -6,6 +6,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
 #include "common/fs/path_util.h"
+#include "common/fs/profile_migration.h"
+#include "frontend_common/profile_import.h"
 #include "common/recommended_settings.h"
 #include "common/settings.h"
 #include "frontend_common/config.h"
@@ -54,10 +56,14 @@ class ConfigDirectory {
 public:
     ConfigDirectory()
         : original{Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir)},
+          original_data{Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir)},
           path{std::filesystem::temp_directory_path() /
                fmt::format("lichii-config-{}", std::random_device{}())} {
         REQUIRE(std::filesystem::create_directory(path));
         Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, path);
+        // Configuration tests use a fresh private profile, independent of host migration state.
+        Common::FS::SetEdenPath(Common::FS::EdenPath::EdenDir, path / "data");
+        Common::FS::ProfileMigration::MarkFresh(FrontendCommon::ProfileImportStateDirectory());
         for (const auto& [key, setting] : Settings::values.linkage.by_key) {
             setting->SetGlobal(false);
             setting->LoadString("");
@@ -68,6 +74,7 @@ public:
 
     ~ConfigDirectory() {
         Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, original);
+        Common::FS::SetEdenPath(Common::FS::EdenPath::EdenDir, original_data);
         std::error_code error;
         std::filesystem::remove_all(path, error);
     }
@@ -80,6 +87,7 @@ public:
     }
 
     const std::filesystem::path original;
+    const std::filesystem::path original_data;
     const std::filesystem::path path;
 };
 
