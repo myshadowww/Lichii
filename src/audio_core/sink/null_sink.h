@@ -28,6 +28,10 @@ public:
         return buffer.frames == TargetSampleCount && buffer.frames_played == 0 &&
                !buffer.consumed && samples.size() == TargetSampleCount * 2;
     }
+    u32 SysmixQueueLimit() const override {
+        // No host callback consumes this sink; the 5 ms pump alone paces guest PCM consumption.
+        return 1;
+    }
     bool IsReady() const override {
         return true;
     }

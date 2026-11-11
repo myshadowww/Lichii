@@ -20,7 +20,10 @@ queue cap. It snapshots the available slots before the loop, so concurrent host
 consumption cannot extend a timing callback indefinitely. The initial cap remains
 three blocks; a 1024-frame host callback raises it to six. Full queues return
 before rereading or converting guest samples. Each admitted block retains the
-existing cursor checks and notification handling.
+existing cursor checks and notification handling. The null output sink has no host
+callback or queued audio to consume, so it limits each pump to one block. This
+preserves 240 frames per 5 ms tick and prevents early guest-space notifications
+when audio output is disabled.
 
 A partial guest tail is deferred while queued audio remains. The existing
 empty-host path can pad a real underrun, but the refill never invents extra silent
@@ -32,7 +35,9 @@ The queue remains bounded by both its existing block limit and sample-ring capac
 The regression checks ordered stereo PCM across guest-ring wrap with no producer
 jitter, 0.667 ms lateness, and 5.667 ms lateness with the missed deadline skipped.
 A separate case drains the host during admission and checks that the original
-refill budget still bounds the loop. Existing partial-block, ownership, fault,
+refill budget still bounds the loop. A real null-sink regression checks one-block
+consumption, read-cursor publication and notification thresholds across six ticks.
+Existing partial-block, ownership, fault,
 notification and microphone tests also pass.
 
 Run the focused tests with:

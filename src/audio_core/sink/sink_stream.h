@@ -90,7 +90,8 @@ public:
 
     virtual bool TryAppendOutputBlock(SinkBuffer& buffer, std::span<s16> samples);
 
-    u32 SysmixQueueLimit() const;
+    /// Bound queued sysmix blocks; discard sinks use one to preserve the timer cadence.
+    virtual u32 SysmixQueueLimit() const;
 
     /**
      * Check if the stream is paused.
