@@ -2197,6 +2197,12 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
 #endif
         return false;
     }
+    if (!use_history) {
+        // A live switch to spatial repair invalidates history even for gaps under 250 ms.
+        fsr3_last_evaluation.reset();
+        fsr3_history_reset = true;
+        dlss_history_reset = true;
+    }
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
                                  jitter, motion_scale)) {
         return true;

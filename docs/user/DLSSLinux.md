@@ -120,8 +120,9 @@ Being installed or ready alone does not mean the game has reached a supported
 upscaler pass.
 
 Linux shares the Windows backend's recognized game passes and input contracts.
-Fire Emblem's spatial workaround remains the default; its existing
-`EDEN_NX2_DLSS_REPLACEMENT=dlss` override is still required to select DLSS.
+Fire Emblem selects temporal replacement with the NVIDIA DLSS checkbox, falling back to FSR
+if NVIDIA DLSS is unavailable. Disabling the checkbox restores its spatial workaround.
+The `EDEN_NX2_DLSS_REPLACEMENT=fsr|dlss|native` overrides remain available for comparisons.
 This feature does not add frame generation or ray reconstruction.
 
 ## Installed locations and troubleshooting

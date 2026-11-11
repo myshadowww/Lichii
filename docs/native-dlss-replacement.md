@@ -5,8 +5,10 @@ Windows, then AMD FSR 3.1.4 if NVIDIA DLSS is disabled or unavailable. FSR uses 
 eight temporal-upscaling passes, including depth, motion, history and optional RCAS.
 This is separate from the presentation filters that scale the finished window image.
 
-Fire Emblem uses the jitter-only spatial workaround by default. Explicit `fsr` and `dlss`
-comparison modes enable temporal replacement for its validated input contract. The upstream
+Fire Emblem uses temporal replacement when the NVIDIA DLSS setting is enabled, with FSR
+fallback if NVIDIA DLSS is unavailable. With the setting disabled it uses the jitter-only
+spatial workaround. Explicit `fsr` and `dlss` comparison modes also enable temporal replacement
+for its validated input contract. The upstream
 temporal blend and RCAS fallback remain available if a temporal backend is unavailable.
 Invalid consumed inputs leave the native dispatch enabled. An already-rejected native
 tensor shader remains an explicit dispatch failure. General tensor emulation remains.
@@ -21,6 +23,15 @@ normalized motion toward the previous frame, HDR color and jitter in render pixe
 Resolution scaling scales the render extent and jitter together. History resets on size
 changes, first use and evaluation gaps longer than 250 ms. An explicit game camera-cut
 reset is not yet extracted.
+
+The v131072 capture also uses prepass `5e8d8dc58bed8ba4`, alongside the original
+`4cbf6eff32525aec`, with final pass `14b4222bbe23abee`. A sampled frame and bounded
+contract trace confirmed 1280x720 color, motion and depth and 2560x1440 output;
+prepass color at CB0+0x278 matches final-pass color at CB0+0x328. Its shader adds
+motion times the output dimensions to the current pixel before sampling previous
+history, confirming normalized previous-minus-current motion. CB0+0x1a0/+0x1a4
+motion biases are zero and CB0+0x1b0/+0x1b4 supplies render-pixel jitter. These are
+exact title and shader gates; unrecognized programs retain native execution.
 
 Fast Fusion's shaders still execute natively. Its captured shader identities are known,
 but motion scale/direction, jitter units, depth convention, reset and resource roles have
@@ -178,7 +189,9 @@ and makes later evaluations fall back; it does not wait for the scheduler worker
 
 `EDEN_NX2_DLSS_REPLACEMENT=fsr` selects temporal replacement and forces FSR for comparison.
 `dlss` selects temporal replacement with NVIDIA preferred when enabled and available.
-`native` preserves the guest evaluation. With no override, Fire Emblem uses spatial de-jitter.
+`native` preserves the guest evaluation. With no override, Fire Emblem follows the NVIDIA
+DLSS setting, using temporal replacement when enabled and spatial de-jitter when disabled.
+Switching to spatial repair invalidates temporal history before the next temporal evaluation.
 The old `EDEN_NX2_DLSS_STANDIN` variable is not read. The internal `standin` backend override
 does not select Fire Emblem's intercepted dispatch. The RCAS sharpness setting controls FSR
 and fallback sharpening. NVIDIA model-selection overrides

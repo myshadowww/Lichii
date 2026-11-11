@@ -181,9 +181,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nRequires NVIDIA's runtime files. Use the setup controls "
               "below to download or locate them. Windows uses Streamline; Linux uses native NGX.\n"
-              "Fire Emblem: Fortune's Weave also needs "
-              "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "Fire Emblem: Fortune's Weave uses temporal replacement while this is enabled; "
+              "otherwise its spatial workaround remains active.\n"
+              "In The Legend of Zelda: Ocarina of Time it replaces the game's "
               "upscaler at 1x resolution scale.\n"
 #ifdef __linux__
               "Can be switched during gameplay with Apply. Install the runtime files before "

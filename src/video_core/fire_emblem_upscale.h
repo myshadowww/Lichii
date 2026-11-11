@@ -19,6 +19,7 @@ constexpr u64 ProgramId = 0x04007EF01F8AE000ULL;
 // NativeProgramKey of the captured DLSS final output pass, not its lowered shader hash.
 constexpr u64 OutputProgramKey = 0x14b4222bbe23abeeULL;
 constexpr u64 PrepassProgramKey = 0x4cbf6eff32525aecULL;
+constexpr u64 AlternatePrepassProgramKey = 0x5e8d8dc58bed8ba4ULL;
 constexpr u64 StarFoxProgramId = 0x0400E88025B1A000ULL;
 constexpr u64 StarFoxPrepassProgramKey = 0xd686ca0b9fad9e6dULL;
 constexpr u64 StarFoxCutscenePrepassProgramKey = 0xebab31dd6f0fc08dULL;
@@ -128,7 +129,7 @@ struct Passes {
 
 constexpr std::optional<Passes> CapturedPasses(u64 program_id) {
     if (program_id == ProgramId) {
-        return Passes{PrepassProgramKey, OutputProgramKey, false};
+        return Passes{PrepassProgramKey, OutputProgramKey, false, AlternatePrepassProgramKey};
     }
     if (program_id == StarFoxProgramId) {
         return Passes{StarFoxPrepassProgramKey, StarFoxOutputProgramKey, true,
@@ -170,6 +171,12 @@ inline bool UseReplacement(u64 program_id, u64 native_key, const char* option) {
     const auto passes = CapturedPasses(program_id);
     return passes && native_key == passes->output &&
            (option == nullptr || (std::string_view{option} == "fsr" || std::string_view{option} == "dlss"));
+}
+
+inline bool UseTemporalReplacement(bool allow_history, bool nvidia_enabled, const char* option) {
+    return allow_history &&
+           (option ? std::string_view{option} == "fsr" || std::string_view{option} == "dlss"
+                   : nvidia_enabled);
 }
 
 inline bool PlainImage(const Tegra::Texture::TICEntry& image) {

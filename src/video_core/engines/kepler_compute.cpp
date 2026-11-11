@@ -784,7 +784,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (!passes) {
         return false;
     }
-    if (passes->star_fox && (passes->IsPrepass(native_key) || native_key == passes->output)) {
+    if (passes->IsPrepass(native_key) || native_key == passes->output) {
         TraceDlssContract(native_key, false);
     }
     if (passes->IsPrepass(native_key)) {
@@ -832,7 +832,7 @@ VideoCore::GameDlssReason KeplerCompute::GameDlssBlocker() const {
         return GameDlssReason::TurnedOff;
     }
     // NVIDIA DLSS, when turned on and running, comes first.
-    if (rasterizer->UsesNvidiaDlss()) {
+    if (!forced_native && rasterizer->UsesNvidiaDlss()) {
         return GameDlssReason::NvidiaDlss;
     }
     const auto& scale = Settings::values.resolution_info;
@@ -1310,7 +1310,7 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
         !memory_manager.IsFullyMappedRange(address, bytes)) {
         return;
     }
-    LOG_INFO(HW_GPU, "DLSS contract candidate {:016x}: cb0={:#x} bytes={:#x} grid={}x{}x{} block={}x{}x{} native dispatch retained",
+    LOG_INFO(HW_GPU, "DLSS contract candidate {:016x}: cb0={:#x} bytes={:#x} grid={}x{}x{} block={}x{}x{} dispatch observed",
              native_key, address, bytes, launch_description.grid_dim_x.Value(),
              launch_description.grid_dim_y.Value(), launch_description.grid_dim_z.Value(),
              launch_description.block_dim_x.Value(), launch_description.block_dim_y.Value(),
@@ -1339,11 +1339,9 @@ void KeplerCompute::TraceDlssContract(u64 native_key, bool warn_unvalidated) {
 
 bool KeplerCompute::TryFireEmblemUpscale(bool allow_history) {
     using namespace VideoCommon::FireEmblemUpscale;
-    static const bool requested_history = [] {
-        const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return option && (std::string_view{option} == "fsr" || std::string_view{option} == "dlss");
-    }();
-    const bool use_history = allow_history && requested_history;
+    static const char* const option = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+    const bool use_history = UseTemporalReplacement(
+        allow_history, Settings::GetNvidiaDlssRuntimeSettings().enabled, option);
     const size_t game_index = dlss_chain.star_fox ? 1 : 0;
     const char* const game = dlss_chain.star_fox ? "Star Fox" : "Fire Emblem";
     const auto jitter = fe_upscale_jitter.Take();
