@@ -37,8 +37,8 @@ jitter, 0.667 ms lateness, and 5.667 ms lateness with the missed deadline skippe
 A separate case drains the host during admission and checks that the original
 refill budget still bounds the loop. A real null-sink regression checks one-block
 consumption, read-cursor publication and notification thresholds across six ticks.
-Existing partial-block, ownership, fault,
-notification and microphone tests also pass.
+Existing partial-block, ownership, fault, notification and microphone tests also
+pass.
 
 Run the focused tests with:
 

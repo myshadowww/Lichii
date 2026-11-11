@@ -663,7 +663,7 @@ TEST_CASE("sysmix refill budget stays bounded while the host consumes concurrent
     REQUIRE(stream.GetCounters().padded_frames == 0);
 }
 
-TEST_CASE("sysmix null output preserves the guest clock and notification timing", "[sysmix]") {
+TEST_CASE("sysmix null output preserves PCM cadence and notification timing", "[sysmix]") {
     Context context;
     AudioCore::Sink::NullSink sink{"auto"};
     Cursor(context, 0, 1440);
