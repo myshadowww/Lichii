@@ -92,6 +92,11 @@ add_executable(yuzu
     configuration/configure_graphics_extensions.cpp
     configuration/configure_graphics_extensions.h
     configuration/configure_graphics_extensions.ui
+    configuration/configure_graphics_game.cpp
+    configuration/configure_graphics_game.h
+    configuration/configure_graphics_game.ui
+    configuration/graphics_settings.cpp
+    configuration/graphics_settings.h
     configuration/configure_hotkeys.cpp
     configuration/configure_hotkeys.h
     configuration/configure_hotkeys.ui

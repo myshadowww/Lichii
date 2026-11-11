@@ -27,6 +27,7 @@ class ConfigureGeneral;
 class ConfigureGraphics;
 class ConfigureGraphicsAdvanced;
 class ConfigureGraphicsExtensions;
+class ConfigureGraphicsGame;
 class ConfigureHotkeys;
 class ConfigureInput;
 class ConfigureProfileManager;
@@ -89,6 +90,7 @@ private:
     std::unique_ptr<ConfigureGeneral> general_tab;
     std::unique_ptr<ConfigureGraphicsAdvanced> graphics_advanced_tab;
     std::unique_ptr<ConfigureGraphicsExtensions> graphics_extensions_tab;
+    std::unique_ptr<ConfigureGraphicsGame> graphics_game_tab;
     std::unique_ptr<ConfigureUi> ui_tab;
     std::unique_ptr<ConfigureGraphics> graphics_tab;
     std::unique_ptr<ConfigureHotkeys> hotkeys_tab;

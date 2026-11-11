@@ -157,7 +157,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "checked, when it can't run on this GPU, with resolution scaling, and for the rest "
               "of the session if its output fails Lichii's checks.\nTakes effect when a game "
               "starts."));
-    INSERT(Settings, frame_rate_limit, tr("Frame rate limit (Switch 2):"),
+    INSERT(Settings, frame_rate_limit, tr("VSync event rate (Switch 2):"),
            tr("Rate of the Switch 2 VSync event that games start their frames on (default 60 Hz)."
               "\nAbove 60 Hz most games run too fast; use it with a game patch that follows real "
               "time, such as \"FPS Unlock (built-in)\" for Ocarina of Time.\nTakes effect when a "
@@ -172,7 +172,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "available. RCAS Sharpness controls sharpening. Takes effect when a game starts."));
     INSERT(Settings, amd_fsr4, tr("Use AMD FSR 4 in place of FSR 3.1"),
            tr("Uses AMD's ML-based FSR 4 where FSR replaces a game's upscaler (Ocarina of Time "
-              "with the setting above). Radeon RX 6000 or newer, or a Ryzen AI processor, with a "
+              "with its FSR option in the Game-Specific tab). Radeon RX 6000 or newer, or a Ryzen "
+              "AI processor, with a "
               "current AMD driver.\nNeeds AMD's FidelityFX runtime, which Lichii downloads from "
               "AMD when you ask. The files are AMD's, under AMD's licence. Without them, or if FSR 4 "
               "can't run, FSR 3.1 is used. Takes effect when a game starts."));
@@ -283,7 +284,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, skip_cpu_inner_invalidation, tr("Skip CPU Inner Invalidation"),
            tr("Skips certain cache invalidations during memory updates, reducing CPU usage and "
               "improving latency. This may cause soft-crashes."));
-    INSERT(Settings, fps_limit, tr("FPS Limit"),
+    INSERT(Settings, fps_limit, tr("Game frame rate limit:"),
            tr("Caps how often the game presents, so the game itself runs at this rate. 0 leaves "
               "the frame rate to the game and the display."));
     INSERT(Settings, vsync_mode, tr("VSync Mode:"),

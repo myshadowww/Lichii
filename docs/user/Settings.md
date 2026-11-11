@@ -14,7 +14,7 @@ Before touching the settings, see the game boots with stock options. We try our 
 
 ## Recommended settings
 
-Lichii can switch to the developer's recommended settings. It never asks on its own: use the Help menu. They only change performance options on the Graphics (Advanced and Extras), System and CPU pages. Language, region, resolution, graphics backend and per-game settings stay as they are.
+Lichii can switch to the developer's recommended settings. It never asks on its own: use the Help menu. They only change performance options on the Graphics (Advanced and Compatibility), System and CPU pages. Language, region, resolution, graphics backend and per-game settings stay as they are.
 
 - `Help/Apply Recommended Settings...`: Asks whether to use them, then lists what changed.
 - `Help/Restore My Previous Settings`: Puts back the values you had before you first applied the recommended ones. It appears once the recommended settings have changed something.
@@ -26,7 +26,7 @@ Neither is available while a game runs.
 - `General/Force X11 as Graphics Backend`: Wayland on *NIX has prominent issues that are unlikely to be resolved; the kind that are "not our fault, it's Wayland issue", this "temporary" hack forces X11 as the backend, regardless of the desktop manager's default.
 - `General/Enable Gamemode`: This only does anything when you have Feral Interactive's Gamemode library installed somewhere, if you do, this will help boost FPS by telling the OS to explicitly prioritize *this* application for "gaming" - only for *NIX systems.
 - `Hotkeys`: Deceptively to remove a hotkey you must right click and a menu will appear to remove that specific hotkey.
-- `UI/Language`: Changes language *of the interface* NOT the emulated program!
+- `Interface/Language`: Changes language *of the interface* NOT the emulated program!
 - `Debug/Enable Auto Stub`: May help to "fix" some games by just lying and saying that everything they do returns "success" instead of outright crashing for any function/service that is NOT implemented.
 - `Debug/Show log in console`: Does as said, note that the program may need to be reopened (Windows) for changes to take effect.
 - `Debug/Flush log output`: Classically, every write to the log is "buffered", that is, changes aren't written to the disk UNTIL the program has decided it is time to write, until then it keeps data in a buffer which resides on RAM. If the program crashes, the OS will automatically discard said buffer (any RAM associated with a dead process is automatically discarded/reused for some other purpose); this means critical data may not be logged to the disk on time, which may lead to missing log lines. Use this if you're wanting to remove that factor when debugging, sometimes a hard crash may "eat" some of the log lines IF this option isn't enabled.
@@ -52,7 +52,54 @@ It is important to note the majority of precision-reducing instructions do not b
 
 See also [an extended breakdown of some options](./Graphics.md).
 
-- `Extras/Extended Dynamic State` and `Extras/Vertex Input Dynamic State`: These Vulkan extensions essentially allow you to reuse the same pipeline but just change the state between calls (so called "dynamic state"); the "extended" levels signifies how much state can be placed on this "dynamic" range, for example the amount of depth culling to use can be placed on the dynamic state, avoiding costly reloads and flushes. While this by itself is a fine option, SOME vendors (notably PowerVR and Mali) have problems with anything related to EDS3. EDS3 contains EDS2, and EDS2 contains EDS1. Essentially this means more extended data the driver has to keep track of, at the benefit of avoiding costly flushes.
+The desktop graphics pages use the same organization in global settings and a game's Properties:
+
+| Tab | Settings |
+| --- | --- |
+| Graphics | Graphics API, display and frame rate, image quality, upscaling, neural rendering, and frame generation. |
+| Game-Specific | Ocarina of Time upscaling and anti-aliasing; Mario Kart World 30 FPS and dynamic FPS modes. These options only affect the named game. |
+| Advanced | GPU accuracy and synchronization, shaders and pipeline caches, textures and memory, GPU performance, video decoding, and diagnostics. |
+| Compatibility | Rendering workarounds and Vulkan driver options. |
+
+All neural rendering sliders are together under **Graphics → Neural Rendering**.
+Anisotropic filtering is under **Graphics → Image Quality**. Shader compilation
+options, including asynchronous compilation, are under **Advanced → Shaders and
+Pipeline Cache**. Long pages scroll to keep all controls accessible.
+
+The **Game frame rate limit** caps game presentations; **VSync event rate (Switch 2)**
+changes the emulated VSync event rate. These are separate controls, and increasing
+the latter can speed up games that do not have a compatible frame-rate patch.
+
+Global settings provide defaults. Per-game Properties can override them, including
+the options on Game-Specific. Moving a control between tabs does not change its
+saved value, default, or per-game override.
+
+<details>
+<summary>Desktop graphics settings screenshots</summary>
+
+Graphics — display and image quality:
+
+![Graphics settings](images/settings/graphics.png)
+
+Graphics — neural rendering and frame generation:
+
+![Graphics enhancements](images/settings/graphics-enhancements.png)
+
+Game-Specific:
+
+![Game-specific settings](images/settings/game-specific.png)
+
+Advanced:
+
+![Advanced graphics settings](images/settings/advanced.png)
+
+Compatibility:
+
+![Graphics compatibility settings](images/settings/compatibility.png)
+
+</details>
+
+- `Compatibility/Extended Dynamic State` and `Compatibility/Vertex Input Dynamic State`: These Vulkan extensions essentially allow you to reuse the same pipeline but just change the state between calls (so called "dynamic state"); the "extended" levels signifies how much state can be placed on this "dynamic" range, for example the amount of depth culling to use can be placed on the dynamic state, avoiding costly reloads and flushes. While this by itself is a fine option, SOME vendors (notably PowerVR and Mali) have problems with anything related to EDS3. EDS3 contains EDS2, and EDS2 contains EDS1. Essentially this means more extended data the driver has to keep track of, at the benefit of avoiding costly flushes.
 - `Advanced/Use persistent cache`: This saves compiled shaders onto the disk, independent of any driver's own disk saved shaders (yes, some drivers, notably NVIDIA, save a secondary shader cache onto disk) - disable this only if you're debugging or working on the GPU backend. This option is meant to massively help to reduce shader stutters (after playing for one session that compiles them).
 - `Advanced/Use Vulkan pipeline cache`: This is NOT the same as `Use persistent cache`; it's a separate flag that tells the Vulkan backend to create pipeline caches, which are a detail that can be used to massively improve performance and remove pipeline creation overhead. This is a Vulkan feature.
 
