@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
+    yuzu/neural_model_sources.cpp
     video_core/neural_rendering_model.cpp
     common/addon_config.cpp
     video_core/vulkan_overlay_filter.cpp

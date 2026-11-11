@@ -23,7 +23,7 @@ locally. Lichii does not bundle the model, DLSS5VKLayer, or a Wine helper.
 | Feature | File to obtain | How to install it |
 | --- | --- | --- |
 | DLSS super resolution and native DLAA | `libnvidia-ngx-dlss.so.310.9.16` | Use **Download NVIDIA DLSS…** in Graphics, or **Import Linux DLSS…**. |
-| Optional neural rendering | `nvngx_dlssnr.dll`, model version **310.8.0** | Use **Import neural rendering model…** in Graphics. |
+| Optional neural rendering | `nvngx_dlssnr.dll`, model version **310.8.0** | Detected and imported automatically from the locations below, or use **Import neural rendering model…** in Graphics. |
 
 The DLSS download button retrieves the pinned runtime from the
 [official NVIDIA DLSS repository](https://github.com/NVIDIA/DLSS/blob/9981c6350dc58c0ce21f024fd65e31e851c31689/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.310.9.16)
@@ -37,6 +37,17 @@ For neural rendering, supply your own copy of the 310.8.0 DLL, for example from 
 existing installation that provides it. If you already use DLSS5VKLayer, its
 model file can be imported directly; its usual location is
 `${XDG_DATA_HOME:-$HOME/.local/share}/dlssnr/binaries/nvngx_dlssnr.dll`.
+Graphics settings automatically checks that location, the active profile's `ngx`
+folder, and your system-configured download directory for `nvngx_dlssnr.dll`.
+Localized or relocated download directories are supported. Extracted subfolders
+can have any name: the background search checks up to three directory levels and
+4,096 entries without following directory symlinks. If Downloads is disabled and
+maps to your home directory, only the model directly in that directory is checked.
+A supported model is verified and imported without a file picker; the original
+file is left in place. The import button checks these locations again before
+opening the configured download directory so you can browse elsewhere. The DLSS
+runtime download alone does not include this separate, optional neural model.
+
 The known-good source DLL used for testing has SHA-256:
 
 ```text
@@ -116,7 +127,7 @@ This feature does not add frame generation or ray reconstruction.
 ## Installed locations and troubleshooting
 
 The **Open folder** button opens the active profile's `ngx` directory. In a
-default Linux profile this is `${XDG_DATA_HOME:-$HOME/.local/share}/eden/ngx`:
+default Linux profile this is `${XDG_DATA_HOME:-$HOME/.local/share}/lichii/ngx`:
 
 ```text
 ngx/

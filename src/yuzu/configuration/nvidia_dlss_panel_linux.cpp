@@ -22,15 +22,18 @@
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QSaveFile>
+#include <QStandardPaths>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrentRun>
 #include "common/dynamic_library.h"
 #include "common/fs/fs_util.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/neural_rendering/model.h"
 #include "video_core/neural_rendering/runtime.h"
 #include "video_core/vulkan_common/ngx_dlss.h"
+#include "yuzu/configuration/neural_model_sources.h"
 #include "yuzu/configuration/nvidia_dlss_panel.h"
 
 namespace {
@@ -43,6 +46,17 @@ QString PathText(const std::filesystem::path &path) {
     return QString::fromStdString(Common::FS::PathToUTF8String(path));
 }
 QString ModelPath() { return PathText(Ngx::UserFolder() / Ngx::ModelFilename); }
+NeuralModelSetup::SearchDirectories NeuralModelDirectories() {
+    const auto standard_path = [](QStandardPaths::StandardLocation location) {
+        return std::filesystem::path{QStandardPaths::writableLocation(location).toStdString()};
+    };
+    return {
+        .runtime = Ngx::UserFolder(),
+        .data = standard_path(QStandardPaths::GenericDataLocation),
+        .downloads = standard_path(QStandardPaths::DownloadLocation),
+        .home = standard_path(QStandardPaths::HomeLocation),
+    };
+}
 QUrl AssetUrl(const QString &path) {
     return QUrl(QStringLiteral("https://raw.githubusercontent.com/NVIDIA/DLSS/%1/%2")
                     .arg(QString::fromLatin1(Ngx::SdkRevision), path));
@@ -97,16 +111,7 @@ NvidiaDlssPanel::NvidiaDlssPanel(QWidget *parent) : QWidget(parent) {
     neural_buttons->addStretch();
     layout->addLayout(neural_buttons);
     connect(neural_import_button, &QPushButton::clicked, this, &NvidiaDlssPanel::ImportNeuralModel);
-    // Model validation reads 141 MiB. Cache it for this panel and keep it off the UI thread.
-    auto* model_check = new QFutureWatcher<bool>(this);
-    connect(model_check, &QFutureWatcher<bool>::finished, this, [this, model_check] {
-        neural_model_valid = model_check->result();
-        neural_model_checked = true;
-        model_check->deleteLater();
-        Refresh();
-    });
-    model_check->setFuture(
-        QtConcurrent::run([path = NR::UserFolder()] { return NR::IsInstalled(path); }));
+    CheckNeuralModel();
     connect(download_button, &QPushButton::clicked, this, &NvidiaDlssPanel::Download);
     connect(import_button, &QPushButton::clicked, this, &NvidiaDlssPanel::Import);
     connect(folder_button, &QPushButton::clicked, this, [] {
@@ -124,7 +129,47 @@ NvidiaDlssPanel::NvidiaDlssPanel(QWidget *parent) : QWidget(parent) {
 
 void NvidiaDlssPanel::showEvent(QShowEvent *event) {
     QWidget::showEvent(event);
+    CheckNeuralModel();
     Refresh();
+}
+
+void NvidiaDlssPanel::CheckNeuralModel(bool browse_if_missing) {
+    if (neural_model_checking || neural_importing || neural_model_valid)
+        return;
+    neural_model_checking = true;
+    neural_model_checked = false;
+    Refresh();
+    // Validation and import read the full model; keep both off the UI thread.
+    auto* watcher = new QFutureWatcher<bool>(this);
+    connect(watcher, &QFutureWatcher<bool>::finished, this, [this, watcher, browse_if_missing] {
+        neural_model_valid = watcher->result();
+        neural_model_checking = false;
+        neural_model_checked = true;
+        watcher->deleteLater();
+        Refresh();
+        if (!neural_model_valid && browse_if_missing)
+            BrowseNeuralModel();
+    });
+    watcher->setFuture(QtConcurrent::run(
+        [destination = NR::UserFolder(), directories = NeuralModelDirectories()] {
+            if (NR::IsInstalled(destination))
+                return true;
+            for (const auto& source : NeuralModelSetup::FindSources(directories)) {
+                std::error_code error;
+                if (!std::filesystem::is_regular_file(source, error))
+                    continue;
+                try {
+                    NR::ImportModel(source, destination);
+                    LOG_INFO(Frontend, "Imported neural rendering model from {}",
+                             Common::FS::PathToUTF8String(source));
+                    return true;
+                } catch (const std::exception& exception) {
+                    LOG_WARNING(Frontend, "Could not import neural rendering model from {}: {}",
+                                Common::FS::PathToUTF8String(source), exception.what());
+                }
+            }
+            return false;
+        }));
 }
 
 /// Update runtime and model status plus action availability, reusing cached driver and model
@@ -158,12 +203,15 @@ void NvidiaDlssPanel::Refresh() {
     if (neural_importing) {
         neural_text = Tr("Importing the neural rendering model…");
     } else if (!neural_model_checked) {
-        neural_text = Tr("Checking the neural rendering model…");
+        neural_text = Tr("Looking for an installed or downloaded neural rendering model…");
     } else if (!neural_model_valid) {
         neural_text = Tr(
-            "Import a DLSS neural rendering 310.8.0 model to use Standard, Natural or Cinematic.");
+            "Optional neural rendering model not found. Import nvngx_dlssnr.dll (310.8.0) to use "
+            "Standard, Natural or Cinematic. The NVIDIA DLSS runtime download does not include "
+            "this separate model.");
     } else if (Settings::values.neural_rendering.GetValue() == Settings::NeuralRendering::Off) {
-        neural_text = Tr("Neural rendering is off. Choose a style and apply to enable it.");
+        neural_text =
+            Tr("Neural rendering model installed. Choose a style and apply to enable it.");
     } else if (!neural.error.empty()) {
         neural_text = Tr("Neural rendering: %1. Restart the game after resolving this.")
                           .arg(QString::fromStdString(neural.error));
@@ -176,13 +224,19 @@ void NvidiaDlssPanel::Refresh() {
     }
     neural_status_label->setText(neural_text);
     neural_status_label->setToolTip(PathText(NR::UserFolder()));
+    neural_import_button->setVisible(!neural_model_valid);
     neural_import_button->setEnabled(neural_model_checked && !neural_importing);
 }
 
-/// Import a selected neural-model DLL on a worker and refresh the UI with success or failure.
 void NvidiaDlssPanel::ImportNeuralModel() {
+    CheckNeuralModel(true);
+}
+
+/// Import a selected neural-model DLL on a worker and refresh the UI with success or failure.
+void NvidiaDlssPanel::BrowseNeuralModel() {
     const auto path =
-        QFileDialog::getOpenFileName(this, Tr("Import NVIDIA neural rendering model"), {},
+        QFileDialog::getOpenFileName(this, Tr("Import NVIDIA neural rendering model"),
+                                     QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),
                                      Tr("Neural rendering model (nvngx_dlssnr.dll)"));
     if (path.isEmpty())
         return;
@@ -223,8 +277,10 @@ void NvidiaDlssPanel::ImportNeuralModel() {
 /// Validate a selected Linux DLSS library and atomically save it into the user runtime
 /// directory.
 void NvidiaDlssPanel::Import() {
-    const QString path = QFileDialog::getOpenFileName(this, Tr("Import Linux NVIDIA DLSS"), {},
-                                                      Tr("Linux DLSS (libnvidia-ngx-dlss.so*)"));
+    const QString path = QFileDialog::getOpenFileName(
+        this, Tr("Import Linux NVIDIA DLSS"),
+        QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),
+        Tr("Linux DLSS (libnvidia-ngx-dlss.so*)"));
     if (path.isEmpty())
         return;
     QFile file(path);
@@ -242,6 +298,7 @@ void NvidiaDlssPanel::Import() {
     if (!Save(ModelPath(), data)) {
         QMessageBox::warning(this, Tr("NVIDIA DLSS"), Tr("Could not save the DLSS runtime."));
     }
+    CheckNeuralModel();
     Refresh();
 }
 
@@ -256,6 +313,7 @@ void NvidiaDlssPanel::Download() {
         download_button->setEnabled(true);
         import_button->setEnabled(true);
         network->deleteLater();
+        CheckNeuralModel();
         Refresh();
     };
     connect(licence, &QNetworkReply::finished, this, [this, network, licence, done] {
