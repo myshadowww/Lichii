@@ -376,7 +376,8 @@ void StarFoxCases(const Device& device, bool super_resolution, bool exercise_gam
 }
 
 /// Check live neural controls, quality, history resets, rebinding and failures with concurrent submits.
-void RenderCases(const Device& device, u32 scale, bool request_neural, bool expect_neural) {
+void RenderCases(const Device& device, u32 scale, bool request_neural, bool expect_neural,
+                 bool fail_creation) {
     MemoryAllocator allocator{device};
     StateTracker tracker;
     Scheduler scheduler{device, tracker};
@@ -411,12 +412,25 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
     });
     const auto original_motion_view = motion.resource.view;
     auto &api = const_cast<Ngx::Api &>(Ngx::GetApi());
+    const auto create = api.create;
     const auto evaluate = api.evaluate;
-    SCOPE_EXIT { api.evaluate = evaluate; };
+    SCOPE_EXIT {
+        api.create = create;
+        api.evaluate = evaluate;
+    };
+    if (fail_creation) {
+        api.create = [](VkDevice, VkCommandBuffer, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*,
+                        NVSDK_NGX_Handle** handle) {
+            *handle = nullptr;
+            return NVSDK_NGX_Result_FAIL_PlatformError;
+        };
+    }
     using Quality = Settings::NvidiaDlssQuality;
     using Neural = Settings::NeuralRendering;
     constexpr std::array cases{
-        Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Off},
+        // Match Ocarina's cold start; scale 8 exercises Native/M/Natural at 2560x1440.
+        Settings::NvidiaDlssRuntimeSettings{Quality::Native, Neural::Natural, 100, 100, 100,
+                                          true, Settings::NvidiaDlssPreset::M},
         Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Standard},
         Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Natural},
         Settings::NvidiaDlssRuntimeSettings{Quality::Automatic, Neural::Cinematic},
@@ -506,7 +520,7 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
                                   {0, 0},
                                   {1, 1},
                                   frame == 0,
-                                  !hdr,
+                                  frame != 0 && !hdr,
                                   hdr}),
                 "Upscale refused a frame");
         auto readback = allocator.CreateBuffer(
@@ -533,6 +547,22 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
         });
         scheduler.Finish();
         api.evaluate = evaluate;
+        if (frame == 0 && request_neural && !expect_neural && !fail_creation) {
+            Require(!VideoCore::NeuralRendering::GetStatus().error.empty(),
+                    "Missing neural model was not diagnosed");
+        }
+        if (fail_creation) {
+            Require(upscaler.Failed() && !Ngx::GetStatus().error.empty(),
+                    "Initial feature creation failure was not diagnosed");
+            Require(NvidiaDlssUpscaler::Status().evaluations == before_status.evaluations,
+                    "Failed creation counted a DLSS evaluation");
+            const auto neural = VideoCore::NeuralRendering::GetStatus();
+            Require(!neural.ready && neural.submitted_frames == 0,
+                    "Neural rendering started despite failed DLSS creation");
+            Require(!upscaler.Upscale({}), "Failed creation did not request fallback");
+            std::printf("PASS cold-start creation failure: no neural initialization\n");
+            return;
+        }
         Require(upscaler.Failed() == inject_failure, "Unexpected NGX evaluation result");
         const auto after_status = NvidiaDlssUpscaler::Status();
         Require(after_status.evaluations == before_status.evaluations + !inject_failure,
@@ -591,7 +621,8 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
         neural_frames += neural_on && !inject_failure;
         const auto neural = VideoCore::NeuralRendering::GetStatus();
         Require(neural.submitted_frames == neural_frames, "Incorrect neural rendering submission count");
-        Require(neural.ready == neural_on, "Neural readiness did not follow the live setting");
+        Require(neural.ready == (neural_on && !inject_failure),
+                "Neural readiness did not follow the live setting and DLSS result");
         std::printf("PASS frame %zu: %ux%u -> %ux%u; strength/tone/structure %u/%u/%u; "
                     "RGB %.4f %.4f %.4f\n", frame,
                     input_extent.width, input_extent.height, extent.width, extent.height,
@@ -633,7 +664,8 @@ int main(int argc, char **argv) try {
         std::filesystem::create_directory_symlink(std::filesystem::absolute(argv[4]), target);
     }
     Require(scale >= 1 && scale <= 8, "Scale must be between 1 and 8 (4K output)");
-    for (int run = 0; run < 2; ++run) {
+    for (int run = 0; run < 3; ++run) {
+        const bool fail_creation = run == 2;
         // Both DLSS and neural rendering may start off, then be enabled without a new device.
         Settings::values.nvidia_dlss = run != 0;
         Settings::values.neural_rendering = Settings::NeuralRendering::Off;
@@ -660,11 +692,8 @@ int main(int argc, char **argv) try {
             Require(NvidiaDlss::IsAvailable(), "Duplicate attachment disturbed the active device");
             Settings::values.nvidia_dlss = true;
             Settings::RefreshNvidiaDlssRuntimeSettings();
-            RenderCases(device, static_cast<u32>(scale), request_neural, expect_neural);
-            if (request_neural && !expect_neural) {
-                Require(!VideoCore::NeuralRendering::GetStatus().error.empty(),
-                        "Missing neural model was not diagnosed");
-            }
+            RenderCases(device, static_cast<u32>(scale), request_neural, expect_neural,
+                        fail_creation);
             StarFoxCases(device, false);
             StarFoxCases(device, true);
             StarFoxCases(device, false, true);
