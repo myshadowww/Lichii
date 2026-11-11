@@ -12,7 +12,13 @@ not stall while the driver compiles them.
    movie files and sead's primitive drawer are parsed. For Ocarina of Time it finds, in about 30
    seconds, every program nxnative's build of the game holds (42,848 of 42,854; the others are
    entries nxnative's current `shader_split.py` drops too) and every shader recorded sessions drew,
-   and its variation tables reproduce nxnative's vertex/pixel pair tables. The cutting of programs
+   and its variation tables reproduce nxnative's vertex/pixel pair tables. Data none of these
+   readers knows is searched for zstd frames (each is inflated and read like a file of its own) and
+   for bare NVN2 programs (a control section followed by its code); a file over 1 GiB is read for
+   its frames a window at a time, unless its first 1 GiB holds none. That covers Kirby Air Riders,
+   whose 16.6 GB asset pack holds 194,537 zstd members, each a FlatBuffer with one program or a
+   vertex and pixel pair: 27,567 programs in about a minute, including every vertex, pixel and
+   compute program a recorded race used (9 geometry programs it used are not found). The cutting of programs
    and the fingerprints follow nxnative's `shader_split.py` (github.com/seedds/nxnative, MIT).
    `nx2-precompile scan` then captures and lowers each program as `GenericEnvironment::LowerNativeCode` does, and computes the shader hash
    the emulator will compute at runtime. It then translates each program against a static fact oracle
@@ -24,20 +30,11 @@ not stall while the driver compiles them.
    are left out), with their mesh state
    (`SET_MESH_SHADER_A/B`, `SET_MESH_INIT_SHADER` and the pass-through geometry header) derived from
    the mesh program's control section by `nx2-precompile mesh-envs`.
-3. At boot, after the disk cache is loaded, `PipelineCache::PreparePrecompiled` builds every pipeline
-   of that file once and drops it. The driver keeps the compiled code in its own cache, and Lichii
-   keeps each pipeline's shader infos and SPIR-V (`precompiled_infos.fork-v<N>.bin`).
-4. When a draw first needs a pipeline the file predicted, the GPU thread checks that the game's state
-   answers the recorded environments' questions as they were answered
-   (`FileEnvironment::AnswersHoldFor`: a constant buffer value only used as a texture handle stands
-   for the type and the pixel format traits of the texture it names, a storage buffer pointer word for
-   its classification, any other value for itself). Then the translation of the recorded environments
-   is the one the game's state gives, so the pipeline is created with the kept infos and a worker
-   builds it from the kept SPIR-V, which the driver finds compiled; the draw waits for it on the
-   scheduler thread, not on the GPU thread. A pipeline that is not predicted, or whose answers
-   differ, is translated on the GPU thread as before. In Ocarina of Time this took the GPU thread's
-   time for the 628 pipelines of entering an area from 2.5 s to 0.25 s; translated live with
-   `EDEN_NX2_PRECOMPILED_AUDIT=1`, all 1,719 of two sessions gave the kept SPIR-V and infos.
+3. At boot, after the shader cache's boot builds, `PipelineCache::PreparePrecompiled` builds every
+   pipeline of that file once and drops it, as jobs of the shader job scheduler. The driver keeps
+   the compiled code in its own cache. A draw still
+   translates the guest program with its real facts and builds its own pipeline; when that pipeline is
+   one the file predicted, the driver finds it compiled.
 
 A native compute program's translation leaves out the accesses through a pointer slot that is null
 at the time, and the program is translated again once the game fills that slot
@@ -74,12 +71,19 @@ Unlimited** (NVIDIA Control Panel, Manage 3D settings). With "Driver default" th
 held all of them (about 2.6 GB on an RTX 3080). The preparation step cannot detect this; a session's
 log shows it as prepared pipelines that still take hundreds of milliseconds to build.
 
+Eclipse archives such as Star Fox's `data.zip` are also supported: a VZIP prefix and ZIP64
+directory locate members; the first 64 KiB block identifies shader assets before their remaining
+LZ4 blocks are decoded. Shader members are checked against their declared sizes, CRC and native
+control headers. Non-shader assets are not inflated in full. This does not provide support for
+Unreal IoStore or RDB/RDX/FDATA archives.
+
 ## Commands
 
 ```
 nx2-precompile extract  --game GAME.nup|ROMFS_DIR --out PREFIX [--packages merged|union] [--threads N]
 nx2-precompile scan     --pkg PREFIX.programs --out PREFIX [--priors FILE] [--threads N]
 nx2-precompile validate --pkg PREFIX.programs --cache CACHE.bin --out PREFIX [--priors FILE]
+nx2-precompile cache-export --cache lichii-cache.v2.bin --out CACHE.bin
 nx2-precompile mesh-envs --pkg PREFIX.programs --cache DRAWS.tsv --out PREFIX [--priors FILE]
 nx2-precompile check    --file precompiled.fork-v<N>.nx2prep
 nx2-precompile recipe   --file precompiled.fork-v<N>.nx2prep --game GAME --out GAME.nx2recipe
@@ -99,10 +103,12 @@ Ocarina of Time file of 133,016 pipelines (1.17 GB) is a recipe of 1.3 MB.
 
 A recipe carries no program code or program header. Making one withholds, with its pipelines, any
 environment whose program header is not its code's, whose mesh geometry header is neither derivable
-from the code nor zero, or whose layout is unknown; and it refuses to write a recipe in which any 32
-bytes of any of the game's programs appear (`Report::environments_withheld`, `FindGameCode`).
-`audit` runs that last check on a recipe from elsewhere against every program of every package and
-version in the game's files; run it before sharing one. What a recipe does keep from the game are
+from the code nor zero, or whose layout is unknown; and it refuses to write a recipe in which it
+finds 32 bytes of any of the game's programs (`Report::environments_withheld`, `FindGameCode`). That
+search is a sampling check, not a proof: it looks for 32-byte windows with at least 16 nonzero
+bytes, starting at every fourth offset of each program. `audit` runs that check on a recipe from
+elsewhere against every program of every package and version in the game's files; run it before
+sharing one. What a recipe does keep from the game are
 the values the translation read: constant buffer values, texture types and formats, storage buffer
 locations. A recipe is made for one game version and one cache version, and is built again when
 either changes. Making the same recipe twice gives the same file.
@@ -115,8 +121,8 @@ One person does this per game version and cache version; everyone else only need
    Check `nx2-precompile cache-version` against the Lichii build players will use; they must match.
    Install Python 3.11 or newer (no packages needed).
 2. Play the game in Lichii for a while, with the NVIDIA cache size set as above. Every pipeline the
-   game builds is recorded in the title's disk cache, `cache/shader/<title id>/vulkan.fork-v<N>.bin`
-   in Lichii's user folder. These recorded pipelines are what the tools learn render states and
+   game builds is recorded in the title's shader cache, `cache/shader/<title id>/lichii-cache.v2.bin`
+   in Lichii's user folder (`vulkan.fork-v<N>.bin` before the shader cache v2). These recorded pipelines are what the tools learn render states and
    storage-pointer facts from, so the more varied the play (areas, menus, cutscenes, effects), the
    better the predictions for the rest of the game. One long session works; caches from several
    sessions or players, in different folders, work better. Copy each cache out before the next
@@ -126,15 +132,24 @@ One person does this per game version and cache version; everyone else only need
 
    ```
    NX2_GAME="D:/Games/Game [title][v131072].nup" NX2_OUT=out NX2_TOOL=path/to/nx2-precompile.exe \
-       bash tools/nx2-precompile/run_pipeline.sh session1/vulkan.fork-v54.bin session2/vulkan.fork-v54.bin
+       bash tools/nx2-precompile/run_pipeline.sh session1/lichii-cache.v2.bin session2/lichii-cache.v2.bin
    ```
+
+   A shader cache v2 log is converted first (`nx2-precompile cache-export`): its graphics and
+   compute records are the older cache format's records byte for byte, which the other commands
+   and the Python scripts read. Caches of the older format are read as they are.
+   The export reports damaged records and incomplete tails, keeps only the latest live records,
+   and refuses to overwrite its input. Keep the original recordings and inspect those counts.
 
    For an unpacked game, `NX2_GAME` is its `romfs` folder; the recipe takes the game's title ID
    from the `exefs/main.npdm` beside it, so the game list's recipe menu accepts it.
+   Standalone-update NUPs use the playable update's program ID, as the emulator's loader does;
+   recipe creation fails when no program ID can be determined.
 
    About 8 minutes for Ocarina of Time. It writes `out/precompiled.fork-v<N>.nx2prep` and
-   `out/game.nx2recipe` (`NX2_RECIPE` names another), and ends with the audit, which must report
-   0 pieces of code.
+   `out/game.nx2recipe` (`NX2_RECIPE` names another). The audit must report 0 pieces of code.
+   It then reassembles the recipe to `out/native-preparation.bin` and verifies its reconstructed
+   shader environments and SPIR-V. Only a successful final check completes the pipeline.
 4. Optionally test it: start from an empty shader folder, prepare the recipe in Lichii (right-click
    the game, "Prepare Precompiled Shaders from Recipe..."), boot, play somewhere new, then run
    `analyze_session.sh` on that session's cache and log to see what still compiled at runtime.
@@ -142,7 +157,9 @@ One person does this per game version and cache version; everyone else only need
    `Ocarina of Time v131072.nx2recipe`). A new game update or a Lichii build with another cache
    version needs the steps again. For a new cache version, the caches recorded under older ones
    can still be learned from (the Ocarina of Time file for v54 was built from v52 and v53 caches);
-   only the precompiled file must be built by a tool of the new version.
+   only the precompiled file must be built by a tool of the new version. The scripts read every
+   cache in v53's layout, whose task and mesh environments have fields an older layout lacks: a
+   cache whose task or mesh records lack them must be converted first.
 
 `run_pipeline.sh CACHE.bin...` runs the whole chain from the game (`NX2_GAME`, its `.nup`) and the
 disk caches recorded while playing it; see the script's header for the other variables. It needs
@@ -151,7 +168,15 @@ PREFIX.programs (the programs, for the other commands' `--pkg`), PREFIX.tsv (fin
 origin of each), PREFIX.variations.tsv (the programs each variation draws together) and
 PREFIX.errors.txt. `--pkg` also takes a folder of nxnative's `BTCD` packages.
 
-`analyze_session.sh` sorts the pipelines a play session still built at runtime by cause: prepared, state not predicted, mesh, shader not in the game files.
+On POSIX, the pipeline scans in isolated processes by default: two workers, a 1536 MiB address-space
+limit per process, and a 20-second limit per batch. A failed batch is subdivided until the failing
+program is identified. Failed programs remain visible in `scan.tsv` and `scan.scan.json` and do not
+supply predicted environments. This handles shaders that exhaust memory or hang the translator.
+`NX2_SCAN_WORKERS`, `NX2_SCAN_MEMORY_MIB` and `NX2_SCAN_TIMEOUT` change those limits;
+`NX2_ISOLATED_SCAN=0` selects the original unbounded scan. Other native commands use
+`NX2_THREADS` workers (default 4). Non-POSIX hosts retain the direct scan.
+
+`analyze_session.sh` sorts the pipelines a play session still built at runtime by cause: prepared, state not predicted, mesh, shader not in the game files. A shader cache v2 log is converted with `cache-export` first; its first new record counts the records of that export.
 
 `py/learn_priors.py` learns the storage-pointer classifications the oracle uses from the recorded
 caches.
@@ -159,6 +184,35 @@ caches.
 `cache-version` prints the pipeline cache version the tool was built with; the precompiled file
 carries it in its name and header, and Lichii reads only a file of its own version, so a build
 that changes the version needs the file built again (the log names a file of another version).
+
+### Tool checks
+
+The v2 export and extraction updates incorporate the tool changes from
+[Lichii PR #1117](https://github.com/zortos293/Lichii/pull/1117), including
+`745c56580bb497659c5ee08622b430b8257c9a6c` (v2 export), the subsequent reader and
+render-state fixes, and `40dadda7d52e2544e3882893d3c75459ab1c9b54` /
+`b57bfc0457b91b67358018d9d8ffd8346ba8ef6e` (embedded shader extraction).
+
+Synthetic checks need Python and the xxhash/LZ4 shared libraries, with no game data:
+
+```sh
+NX2_TOOL=build/bin/nx2-precompile python3 -I tools/nx2-precompile/test_cache_export.py
+python3 -I tools/nx2-precompile/test_starfox_extract.py build/bin/nx2-precompile
+python3 -I tools/nx2-precompile/test_scan_isolated.py
+NX2_TOOL=build/bin/nx2-precompile python3 -I tools/nx2-precompile/test_recipe_metadata.py
+```
+
+For each generated recipe, verify the title ID, game version and cache version, run `audit`,
+assemble it again, and run `check` with `NX2_CHECK_EMIT=1`. A recipe's training-cache match rate
+does not measure unseen gameplay coverage or driver compilation time. GPU preparation and a
+separate gameplay session are needed to measure stutter reduction.
+
+The desktop loader reads `native-preparation.bin` in the title's shader directory. Files named
+`precompiled.fork-v<N>.nx2prep` are intermediate tool outputs. Importing a recipe through
+**Build Shader Precache from Recipe...** creates the desktop file. An older AppImage may need
+an externally assembled `native-preparation.bin` when its extractor does not understand a newly
+supported game container. The GPU still prepares that file on its next launch; a tool replay
+check does not create a driver cache or a completed preparation journal.
 
 `validate` compares, for every environment a disk cache recorded, the SPIR-V from the recorded
 facts with the SPIR-V from the oracle's facts, and names the fact class behind each difference.
@@ -178,20 +232,11 @@ serialized environment.
 `PREFIX.mesh` (mesh-envs): `NXPMESH1`, then per draw u32 line, u64 mesh state hash, u64 task and
 mesh shader hashes, and the sized task (possibly empty) and mesh environments.
 
-`precompiled.fork-v<N>.nx2prep`, in the game's shader directory next to `vulkan.fork-v<N>.bin`:
+`precompiled.fork-v<N>.nx2prep`, in the game's shader directory next to `lichii-cache.v2.bin`:
 `NX2PREP1`, u32 cache version, u32 environment count, u32 record count, u32 reserved; per environment
 u64 offset and u64 size; per record u8 kind (0 graphics, 1 compute), u8 environment count, u16
 reserved, u32 environment indices in stage order, then the 1056-byte graphics or 24-byte compute key.
 Environments are stored once and shared by the records that use them.
-
-`precompiled_infos.fork-v<N>.bin`, written by the preparation step next to it: `NX2INFO3`, u32 stamp
-size and the stamp (`precompiled_prepared`'s line: the file, driver and build it was written for),
-u64 index offset, the blobs (a `Shader::SerializeInfo` info, or one zstd frame of a stage's SPIR-V
-words), then the index: u32 record count, u32 blob count, per record u64 key hash, u8 environment
-count, u8 kind (0 graphics, 1 compute: stage 0), 2 bytes 0, u32 environments[5], u32 info blobs[5],
-u32 SPIR-V blobs[5] (per pipeline stage, ~0 for none), and per blob u64 offset, u32 size, u32 0.
-Ocarina of Time: 753 MiB. The stamp holds the build's `scm_rev`: a build that changes the translator
-without a new revision needs `EDEN_NX2_PRECOMPILED_FORCE=1`, or its kept SPIR-V is the old one's.
 
 ## Switches
 
@@ -203,10 +248,3 @@ without a new revision needs `EDEN_NX2_PRECOMPILED_FORCE=1`, or its kept SPIR-V 
   destroyed (default 9000); `0` keeps every pipeline.
 - `EDEN_NX2_PIPELINE_LOG_LIMIT=<n>`: how many runtime pipeline builds over 2 ms are logged (default
   400; builds over 100 ms are always logged).
-- `EDEN_NX2_PRECOMPILED_FAST=0`: translate precompiled pipelines on the GPU thread like the others
-  (the kept infos and SPIR-V unused), to compare.
-- `EDEN_NX2_PRECOMPILED_VERIFY=1`: a worker translates the recorded environments instead of using the
-  kept SPIR-V, and fails the build when the infos differ from the kept ones.
-- `EDEN_NX2_PRECOMPILED_AUDIT=1`: also translate each precompiled pipeline from the game's state on
-  the GPU thread and compare its SPIR-V and infos with the kept ones (slow; counted in the log every
-  10 s).

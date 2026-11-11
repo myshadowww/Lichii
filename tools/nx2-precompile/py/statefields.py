@@ -54,18 +54,35 @@ def attribute_read_mask(sph: bytes) -> int:
     return m
 
 
+EDS3_BLEND = 1 << 3            # raw1: extended_dynamic_state_3_blend
+DYNAMIC_VERTEX_INPUT = 1 << 5  # raw1: dynamic_vertex_input
+XFB_ENABLED = 1 << 6           # raw1: xfb_enabled
+
+
+def hashes_past_prefix(state: bytes) -> bool:
+    """Whether the key's hash covers bytes past these 112 (FixedPipelineState::Size): with
+    transform feedback, or without dynamic vertex input (the attributes and divisors)."""
+    raw1 = u32(state, 0)
+    return bool(raw1 & XFB_ENABLED) or not raw1 & DYNAMIC_VERTEX_INPUT
+
+
 def canonical(state: bytes, read_mask: int | None) -> bytes:
-    """State with the bytes that cannot change the pipeline cleared: attribute types the vertex
-    program does not read (vertex input is dynamic) and blend equations/factors of attachments
-    whose blending is off."""
+    """State with the bytes that cannot change the pipeline cleared, as
+    FixedPipelineState::CanonicalizeNative does: attribute types the vertex program does not read
+    (only with dynamic vertex input; without it these bytes are the enabled divisors) and, unless
+    blending is dynamic, blend equations/factors of attachments whose blending is off and
+    attachments past the last colour target."""
     b = bytearray(state)
-    if read_mask is not None:
+    raw1 = u32(b, 0)
+    if read_mask is not None and raw1 & DYNAMIC_VERTEX_INPUT:
         types = int.from_bytes(b[64:72], 'little')
         keep = 0
         for a in range(32):
             if read_mask >> a & 1:
                 keep |= 3 << (2 * a)
         b[64:72] = (types & keep).to_bytes(8, 'little')
+    if raw1 & EDS3_BLEND:
+        return bytes(b)
     used = 0
     for i in range(8):
         if b[8 + i]:

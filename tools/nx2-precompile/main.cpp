@@ -55,6 +55,7 @@
 #include "core/file_sys/vfs/vfs_real.h"
 #include "video_core/nx2_recipe.h"
 #include "video_core/pipeline_cache_files.h"
+#include "video_core/shader_cache_v2/cache_file.h"
 
 namespace {
 using Json = nlohmann::json;
@@ -89,7 +90,7 @@ std::vector<u8> ReadFile(const std::filesystem::path& path) {
 
 template <typename T>
 T Load(std::span<const u8> bytes, size_t offset) {
-    if (offset + sizeof(T) > bytes.size())
+    if (offset > bytes.size() || sizeof(T) > bytes.size() - offset)
         throw std::runtime_error("Truncated input");
     T value;
     std::memcpy(&value, bytes.data() + offset, sizeof(T));
@@ -474,6 +475,10 @@ public:
             put(shared_memory);
         } else {
             put(sph);
+            // As GenericEnvironment::Serialize writes them (the mask is unknown offline: 0)
+            if (stage == Stage::Geometry) {
+                put(gp_passthrough_mask);
+            }
             if (stage == Stage::Task || stage == Stage::Mesh) {
                 put(mesh_registers);
                 put(mesh_primitive_header);
@@ -533,7 +538,8 @@ struct RecordedEnvironment final : public Shader::Environment {
         viewport = Load<u32>(bytes, offset + 68);
         stage = static_cast<Stage>(Load<u32>(bytes, offset + 72));
         offset += 76;
-        if (code_size % 8 || offset + code_size > bytes.size())
+        if (code_size == 0 || code_size % 8 || offset > bytes.size() ||
+            code_size > bytes.size() - offset)
             throw std::runtime_error("Invalid recorded code size");
         code.resize(code_size / 8);
         std::memcpy(code.data(), bytes.data() + offset, code_size);
@@ -906,6 +912,10 @@ std::unique_ptr<OracleEnvironment> MakeOracle(const PackageProgram& program, con
 
 template <typename F>
 void ParallelFor(size_t count, unsigned threads, F&& body) {
+    if (threads == 0) {
+        // As Extract and MakeRecipe read it: every hardware thread.
+        threads = std::max(1u, std::thread::hardware_concurrency());
+    }
     std::atomic<size_t> next{0};
     std::vector<std::thread> workers;
     for (unsigned t = 0; t < threads; ++t) {
@@ -1141,7 +1151,10 @@ int MeshEnvs(const std::filesystem::path& pkg, const std::filesystem::path& comb
         if (stage != Stage::Task && stage != Stage::Mesh)
             return;
         std::string error;
-        lowered[i] = CaptureAndLower(packages.programs[i], error);
+        try {
+            lowered[i] = CaptureAndLower(packages.programs[i], error);
+        } catch (const std::exception&) {
+        }
     });
     std::unordered_map<u64, size_t> by_hash;
     for (size_t i = 0; i < lowered.size(); ++i)
@@ -1285,6 +1298,17 @@ int Check(const std::filesystem::path& path, unsigned threads) {
             id = Load<u32>(file, offset);
             offset += 4;
         }
+        if (kind > 1) {
+            fmt::print("record {} has unknown kind {}; the rest is not read\n", r, kind);
+            ++bad_records;
+            break;
+        }
+        if (count == 0 || (kind == 1 && count != 1) ||
+            std::ranges::any_of(ids, [&](u32 id) { return id >= envs.size(); })) {
+            ++bad_records;
+            offset += kind == 1 ? ComputeKeySize : GraphicsKeySize;
+            continue;
+        }
         if (kind == 1) {
             ++compute;
             const u64 key_hash = Load<u64>(file, offset);
@@ -1382,15 +1406,20 @@ void OpenGame(Game& out, const std::filesystem::path& game, const std::filesyste
     if (out.container->GetStatus() != Loader::ResultStatus::Success) {
         throw std::runtime_error("cannot read the NUP");
     }
+    // Match AppLoader_NUP: a standalone update can carry the entire playable game.
+    const auto base = out.container->FindBasePackage();
+    const auto update = out.container->FindBestUpdatePackage();
+    if (base && out.container->GetExeFSDir(*base)) {
+        out.title_id = out.container->GetPackages()[*base].title_id;
+    } else if (update && out.container->GetExeFSDir(*update)) {
+        out.title_id = out.container->GetPackages()[*update].title_id;
+    }
     FileSys::VirtualDir merged;
     for (size_t i = 0; i < out.container->GetPackages().size(); ++i) {
         const auto& package = out.container->GetPackages()[i];
         const auto romfs = out.container->GetRomFSDir(i);
         fmt::print("package {}: {:016X} v{} kind {}{}\n", i, package.title_id, package.version,
                    static_cast<int>(package.kind), romfs ? "" : " (no RomFS)");
-        if (package.kind == FileSys::NupContainer::PackageKind::Base) {
-            out.title_id = package.title_id;
-        }
         if (package.kind != FileSys::NupContainer::PackageKind::Addon) {
             out.version = std::max(out.version, package.version);
         }
@@ -1413,12 +1442,12 @@ FileSys::Nx2ShaderExtract::Result ExtractGame(const Game& game, unsigned threads
     namespace X = FileSys::Nx2ShaderExtract;
     X::Progress progress;
     std::atomic<bool> done{false};
-    std::jthread reporter([&] {
-        for (int tick = 0; !done.load(); ++tick) {
+    std::jthread reporter([&](std::stop_token stop) {
+        for (int tick = 0; !done.load() && !stop.stop_requested(); ++tick) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             if (tick % 50 == 49 && progress.files_total) {
                 fmt::print(stderr, "progress: {}/{}\n", progress.files_done.load(),
-                           progress.files_total);
+                           progress.files_total.load());
             }
         }
     });
@@ -1483,8 +1512,9 @@ int Extract(const std::filesystem::path& game_path, const std::filesystem::path&
     }
     const auto& s = result.stats;
     fmt::print("files {} ({:.1f} GB read), inflated {:.1f} GB, compressed files skipped after a "
-               "look {}, containers {}\n",
-               s.files, s.file_bytes / 1e9, s.inflated_bytes / 1e9, s.peeked_only, s.containers);
+               "look {}, containers {}, zstd frames inside other data {} ({} did not inflate)\n",
+               s.files, s.file_bytes / 1e9, s.inflated_bytes / 1e9, s.peeked_only, s.containers,
+               s.embedded_frames, s.embedded_failed);
     fmt::print("programs {} from {} occurrences, variations {}, errors {}, in {:.1f} s\n",
                result.programs.size(), s.occurrences, result.variations.size(),
                result.errors.size(), seconds);
@@ -1515,6 +1545,9 @@ int Recipe(const std::filesystem::path& precompiled, const std::filesystem::path
     auto spill = out;
     spill += ".spill";
     OpenGame(game, game_path, spill, "merged");
+    if (game.title_id == 0) {
+        throw std::runtime_error("cannot make a recipe without the game's program ID");
+    }
     const auto programs = ExtractGame(game, threads);
     const auto bytes = ReadFile(precompiled);
     VideoCommon::Nx2Recipe::Report report;
@@ -1523,6 +1556,9 @@ int Recipe(const std::filesystem::path& precompiled, const std::filesystem::path
         {.title_id = game.title_id, .game_version = game.version,
          .cache_version = Load<u32>(bytes, 8)},
         report, threads);
+    if (report.records == 0) {
+        throw std::runtime_error("none of the pipelines can be reconstructed from this game's files");
+    }
     std::ofstream(out, std::ios::binary)
         .write(reinterpret_cast<const char*>(recipe.data()),
                static_cast<std::streamsize>(recipe.size()));
@@ -1557,6 +1593,9 @@ int Assemble(const std::filesystem::path& recipe_path, const std::filesystem::pa
     VideoCommon::Nx2Recipe::Report report;
     const auto file = VideoCommon::Nx2Recipe::Assemble(
         recipe, programs, VideoCommon::VulkanPipelineCacheVersion, report, threads);
+    if (report.records == 0) {
+        throw std::runtime_error("none of the recipe's pipelines match this game's files");
+    }
     std::ofstream(out, std::ios::binary)
         .write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
     PrintReport(report);
@@ -1588,6 +1627,51 @@ int Audit(const std::filesystem::path& recipe_path, const std::filesystem::path&
     return matches.empty() ? 0 : 1;
 }
 
+/// A shader cache v2 log (lichii-cache.v2.bin) written as a pipeline cache file of the format
+/// before it (vulkan.fork-v<N>.bin): its live graphics and compute records, whose payloads are the
+/// older format's records byte for byte. The other commands and the Python scripts read that format.
+int CacheExport(const std::filesystem::path& cache, const std::filesystem::path& out) {
+    namespace CacheV2 = VideoCommon::ShaderCacheV2;
+    const CacheV2::LogFile log = CacheV2::ReadLogFile(cache);
+    if (log.bytes.empty()) {
+        throw std::runtime_error("no shader cache v2 log at " + cache.string());
+    }
+    if (log.parsed.header != CacheV2::HeaderStatus::Valid) {
+        throw std::runtime_error("invalid or unsupported shader cache v2 header");
+    }
+    if (std::filesystem::weakly_canonical(cache) == std::filesystem::weakly_canonical(out) ||
+        (std::filesystem::exists(out) && std::filesystem::equivalent(cache, out))) {
+        throw std::runtime_error("cache-export output must differ from the input cache");
+    }
+    std::ofstream file(out, std::ios::binary | std::ios::trunc);
+    file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
+    constexpr std::array<char, 8> magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+    const u32 version = VideoCommon::VulkanPipelineCacheVersion;
+    file.write(magic.data(), magic.size());
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    size_t graphics = 0, compute = 0;
+    for (const CacheV2::LogRecord& record : log.parsed.live) {
+        if (record.kind == CacheV2::RecordKind::Graphics) {
+            ++graphics;
+        } else if (record.kind == CacheV2::RecordKind::Compute) {
+            ++compute;
+        } else {
+            continue;
+        }
+        file.write(reinterpret_cast<const char*>(record.payload.data()),
+                   static_cast<std::streamsize>(record.payload.size()));
+    }
+    file.close();
+    fmt::print("{} graphics and {} compute pipelines written to {}\n", graphics, compute,
+               out.string());
+    const auto& stats = log.parsed.stats;
+    fmt::print("cache v2: {} superseded, {} tombstones, {} damaged headers, {} damaged records, "
+               "{} bytes skipped, {} tail bytes ignored\n",
+               stats.superseded, stats.tombstones, stats.bad_headers, stats.bad_payloads,
+               stats.skipped_bytes, stats.torn_tail_bytes);
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1605,7 +1689,8 @@ int main(int argc, char** argv) {
         }
         std::filesystem::path pkg, cache, out, priors_path, check_file, game, recipe;
         std::string packages = "merged";
-        unsigned threads = std::max(1U, std::thread::hardware_concurrency() - 2);
+        const unsigned hardware_threads = std::thread::hardware_concurrency();
+        unsigned threads = hardware_threads > 2 ? hardware_threads - 2 : 1;
         for (int i = 2; i + 1 < argc; i += 2) {
             const std::string arg = argv[i];
             const std::string value = argv[i + 1];
@@ -1619,6 +1704,11 @@ int main(int argc, char** argv) {
             else if (arg == "--recipe") recipe = value;
             else if (arg == "--packages") packages = value;
             else throw std::runtime_error("Unknown option " + arg);
+        }
+        if (command == "cache-export") {
+            if (cache.empty() || out.empty())
+                throw std::runtime_error("cache-export needs --cache lichii-cache.v2.bin --out FILE");
+            return CacheExport(cache, out);
         }
         if (command == "recipe") {
             if (check_file.empty() || game.empty() || out.empty())

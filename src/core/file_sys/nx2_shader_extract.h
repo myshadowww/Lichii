@@ -4,7 +4,8 @@
 // Finds the NVN2 (Switch 2) shader programs a game ships, by their content: every RomFS file is
 // read, zstd (with the game's dictionaries) and Yaz0 are undone, SARC archives are expanded, and
 // BNSH (shader archives, effect bundles, layouts), agl BAHS packs, agl NDSR packs, nn::ndve movie
-// files and sead's primitive drawer are parsed; other data is searched for embedded BNSH.
+// files and sead's primitive drawer are parsed; Eclipse ZIP/LZ4 shader members are read by their
+// central directory; other data is searched for embedded BNSH.
 //
 // Programs are cut as the game's GPU reads them (control section, then code area of the length
 // the control section names at +0x44) and fingerprinted like nxnative's shader_split.py
@@ -51,7 +52,9 @@ struct Stats {
     u64 file_bytes{};          ///< bytes of RomFS files read
     u64 inflated_bytes{};      ///< bytes produced by zstd and Yaz0
     u64 peeked_only{};         ///< compressed files whose content held no container
-    u64 containers{};          ///< SARC, BNSH, BAHS, NDSR, NDVE, sead files parsed
+    u64 containers{};          ///< SARC, BNSH, BAHS, NDSR, NDVE, sead files and data with bare programs parsed
+    u64 embedded_frames{};     ///< zstd frames found inside other data and inflated
+    u64 embedded_failed{};     ///< such frames that did not inflate (not reported as errors)
     u64 occurrences{};         ///< programs found, before removing duplicates
 };
 
@@ -64,13 +67,15 @@ struct Result {
 
 struct Progress {
     std::atomic<u64> files_done{};
-    u64 files_total{};
+    std::atomic<u64> files_total{};
 };
 
 /// Directories are scanned in order (base game first, then updates and add-ons); a program found
-/// in several keeps its first origin. `threads` 0 uses the hardware's.
+/// in several keeps its first origin. `threads` 0 uses the hardware's. `serial_reads` reads one
+/// file at a time, for storages that are not thread-safe (an XCI's or NSP's NCA layers).
 [[nodiscard]] Result Extract(std::span<const VirtualDir> roots, unsigned threads = 0,
-                             Progress* progress = nullptr, std::stop_token stop = {});
+                             Progress* progress = nullptr, std::stop_token stop = {},
+                             bool serial_reads = false);
 
 /// The fingerprint of one program (see the file comment).
 [[nodiscard]] u64 Fingerprint(std::span<const u8> control, std::span<const u8> code);
