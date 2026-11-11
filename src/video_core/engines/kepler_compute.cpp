@@ -781,10 +781,10 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (!passes) {
         return false;
     }
-    if (passes->spatial_only && (native_key == passes->prepass || native_key == passes->output)) {
+    if (passes->spatial_only && (passes->IsPrepass(native_key) || native_key == passes->output)) {
         TraceDlssContract(native_key, false);
     }
-    if (native_key == passes->prepass) {
+    if (passes->IsPrepass(native_key)) {
         dlss_chain.spatial_only = passes->spatial_only;
         CaptureFireEmblemJitter();
         dlss_chain.active = true;
@@ -806,7 +806,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
         return replacement && FinishDlssEvaluation();
     }
     return dlss_chain.failure != VideoCore::GameDlssReason::None &&
-           native_key != passes->prepass &&
+           !passes->IsPrepass(native_key) &&
            dlss_chain.programs.contains(native_key);
 }
 

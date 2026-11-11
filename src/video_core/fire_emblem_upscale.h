@@ -18,6 +18,7 @@ constexpr u64 OutputProgramKey = 0x14b4222bbe23abeeULL;
 constexpr u64 PrepassProgramKey = 0x4cbf6eff32525aecULL;
 constexpr u64 StarFoxProgramId = 0x0400E88025B1A000ULL;
 constexpr u64 StarFoxPrepassProgramKey = 0xd686ca0b9fad9e6dULL;
+constexpr u64 StarFoxCutscenePrepassProgramKey = 0xebab31dd6f0fc08dULL;
 constexpr u64 StarFoxOutputProgramKey = 0x7d3764ff101bec27ULL;
 constexpr u32 PrepassColorOffset = 0x278;
 constexpr u32 JitterOffset = 0x1b0;
@@ -28,6 +29,11 @@ struct Passes {
     u64 prepass;
     u64 output;
     bool spatial_only;
+    u64 alternate_prepass{};
+
+    constexpr bool IsPrepass(u64 key) const {
+        return key == prepass || (alternate_prepass != 0 && key == alternate_prepass);
+    }
 };
 
 constexpr std::optional<Passes> CapturedPasses(u64 program_id) {
@@ -35,7 +41,8 @@ constexpr std::optional<Passes> CapturedPasses(u64 program_id) {
         return Passes{PrepassProgramKey, OutputProgramKey, false};
     }
     if (program_id == StarFoxProgramId) {
-        return Passes{StarFoxPrepassProgramKey, StarFoxOutputProgramKey, true};
+        return Passes{StarFoxPrepassProgramKey, StarFoxOutputProgramKey, true,
+                      StarFoxCutscenePrepassProgramKey};
     }
     return std::nullopt;
 }

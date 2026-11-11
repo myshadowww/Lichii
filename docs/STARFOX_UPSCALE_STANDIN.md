@@ -32,7 +32,7 @@ conventions and the native network's numerical correctness remain unverified.
 
 ## Safety and behavior
 
-Only Star Fox and the two exact keys select the new route. Every native dispatch
+Only Star Fox and the captured prepass/output keys select this route. Every native dispatch
 still runs, including the final pass, so its secondary output and other writes
 are preserved. Afterward, the spatial replacement overwrites only the validated
 display output. It does not read previous-frame history or motion vectors.
@@ -69,6 +69,29 @@ Fire Emblem keeps its original format and upscale restrictions. No new shader
 fingerprints or slot-search heuristics are added.
 
 ## Owner-side comparison
+
+### November 11 docked cutscene capture
+
+The Linux `e860139f` capture of the Venom approach uses prepass key
+`ebab31dd6f0fc08d`, so the original `d686ca0b9fad9e6d` gate never opened its
+replacement chain. The final pass remains `7d3764ff101bec27`. Accept both
+captured prepasses, keeping the same output and resource checks.
+
+In `capture-1794356508-001`, pass 43 writes a clean 1920x1080 sRGB image at
+`0x8126f62000`. Dispatch 12 (translated hash `25a620c965883cde`) reads it
+alongside previous history and writes the first visibly corrupted RGBA16F
+image at `0x81330f1000`. Dispatch 24 (`bccc6a99e0f227fa`) preserves the black
+rectangles near the bottom of the frame. The subsequent 4K upscale copies
+the already corrupted image.
+
+The new prepass's native disassembly confirms the existing contract: jitter
+loads at instructions `0xe0`/`0xf0` use `cbuf0+0x1b0`/`+0x1b4`, and `TLD`
+at `0x3140` reads colour through `cbuf0+0x278`. Captured jitter is
+`(-0.4375, 0.388888955)`. The final pass reads that same sRGB image at
+`+0x328` and writes equal-sized RGBA16F output at `+0x348`, with separate
+history at `+0x350`. Native dispatches still run to preserve their other
+writes; only the validated display output is replaced. This restores the
+existing spatial workaround, not the correctness of native temporal history.
 
 Start a fresh process with `EDEN_NX2_DLSS_CONTRACT_TRACE=1` and log filter
 `*:Info HW.GPU:Debug Shader:Debug Render.Vulkan:Debug`.
