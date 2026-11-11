@@ -184,7 +184,6 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
                            neural_mode != Settings::NeuralRendering::Off;
     const auto neural_style = requested ? static_cast<NR::Style>(static_cast<u32>(neural_mode) - 1)
                                        : NR::Style::Standard;
-    PrepareNeuralRendering(in, requested);
     const bool hdr = in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
     const bool auto_exposure = in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0;
     const auto preset = PresetFor(neural_options.preset);
@@ -194,7 +193,7 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
                     {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
                     VK_IMAGE_ASPECT_COLOR_BIT};
     scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, in, out, hdr, auto_exposure, preset, neural_style, neural_options,
+    scheduler.Record([this, in, out, hdr, auto_exposure, preset, neural_options,
                       reset = in.reset || options_changed](vk::CommandBuffer cmdbuf) {
         const auto &api = Ngx::GetApi();
         const auto clear_output = [&] {
@@ -348,7 +347,14 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
                 (static_cast<u32>(neural_options.preset) << 16), std::memory_order_relaxed);
             evaluations.fetch_add(1, std::memory_order_release);
             Ngx::ReportEvaluation();
-            if (neural_rendering) {
+        }
+    });
+    // Complete the first DLSS evaluation before allocating and warming the optional NR backend.
+    PrepareNeuralRendering(in, requested);
+    if (neural_rendering) {
+        scheduler.Record([this, in, neural_style, neural_options,
+                          reset = in.reset || options_changed](vk::CommandBuffer cmdbuf) {
+            if (!failed) {
                 NR::Frame frame;
                 frame.style = neural_style;
                 frame.intensity = neural_options.strength / 100.0f;
@@ -361,8 +367,8 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
                 neural_rendering->Record(*cmdbuf, frame);
                 NR::ReportFrame();
             }
-        }
-    });
+        });
+    }
     scheduler.InvalidateState();
     return true;
 }
@@ -389,6 +395,9 @@ void NvidiaDlssUpscaler::PrepareNeuralRendering(const Inputs& in, bool requested
     // The backend uploads model constants during construction. Finish before touching its queue
     // or replacing descriptors referenced by work already recorded on the scheduler worker.
     scheduler.Finish();
+    if (failed) {
+        return;
+    }
     // The presentation thread also uses these queues. Keep construction, rebind failure cleanup
     // and their device-idle waits under the same lock, after Finish has released the worker.
     std::scoped_lock queue_lock{scheduler.submit_mutex};
