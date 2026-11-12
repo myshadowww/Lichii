@@ -2,15 +2,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <random>
+#include <span>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
@@ -256,4 +264,127 @@ TEST_CASE("Reads of GPU pages over unmapped device memory return zeros", "[memor
     std::ranges::fill(bytes, u8{0xcd});
     memory.ReadBlock(window, bytes.data(), size);
     REQUIRE(std::ranges::all_of(bytes, [](u8 value) { return value == 0; }));
+}
+
+TEST_CASE("Deferred device pages preserve partial writes and discard unmapped bytes",
+          "[memory_manager][sparse_backing]") {
+    ScopedSystemTestContext context;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager memory{physical};
+    NullRasterizer rasterizer;
+    memory.BindInterface(&rasterizer);
+    constexpr DAddr device = 0x10000;
+    constexpr size_t page_size = 0x1000;
+    memory.KeepWrites(device, 2 * page_size);
+    std::vector<u8> bytes(2 * page_size, 0xcd);
+    REQUIRE(memory.ReadKept(device, bytes.data(), bytes.size()));
+    REQUIRE(std::ranges::all_of(bytes, [](u8 value) { return value == 0; }));
+
+    const std::array<u8, 8> expected{1, 2, 3, 4, 5, 6, 7, 8};
+    memory.WriteBlockUnsafe(device + page_size - 4, expected.data(), expected.size());
+    memory.KeepWrites(device, 2 * page_size); // Repeated requests must preserve previous writes.
+    memory.ReadBlockUnsafe(device, bytes.data(), bytes.size());
+    REQUIRE(std::ranges::equal(std::span{bytes}.subspan(page_size - 4, expected.size()), expected));
+    REQUIRE(bytes[page_size - 5] == 0);
+    REQUIRE(bytes[page_size + 4] == 0);
+
+    memory.Unmap(device, page_size);
+    bytes.assign(bytes.size(), 0xcd);
+    memory.ReadBlock(device, bytes.data(), bytes.size());
+    REQUIRE(std::ranges::all_of(std::span{bytes}.first(page_size),
+                               [](u8 value) { return value == 0; }));
+    REQUIRE(std::ranges::equal(std::span{bytes}.subspan(page_size, 4),
+                              std::span{expected}.last(4)));
+    memory.Unmap(device + page_size, page_size);
+    REQUIRE_FALSE(memory.WriteKept(device, expected.data(), expected.size()));
+    memory.KeepWrites(device, 2 * page_size);
+    REQUIRE(memory.ReadKept(device, bytes.data(), bytes.size()));
+    REQUIRE(std::ranges::all_of(bytes, [](u8 value) { return value == 0; }));
+}
+
+TEST_CASE("Deferred device mapping publishes data and handles the final page fallback",
+          "[memory_manager][sparse_backing]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    Kernel::KProcess process{system.Kernel()};
+    SCOPE_EXIT { system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    auto* physical = system.DeviceMemory().buffer.BackingBasePointer() + 0x10000;
+    std::memset(physical, 0xcd, 0x2000);
+    table.entries.GetAndFault(4).Store(false, Common::PageType::Memory, 1,
+                                     reinterpret_cast<uintptr_t>(physical) - 0x4000);
+    table.entries.GetAndFault(5).Store(false, Common::PageType::Memory, 1,
+                                     reinterpret_cast<uintptr_t>(physical + 0x1000) - 0x5000);
+    auto& cpu_memory = process.GetMemory();
+    cpu_memory.SetCurrentPageTable(process);
+    Tegra::MaxwellDeviceMemoryManager memory{system.DeviceMemory()};
+    NullRasterizer rasterizer;
+    memory.BindInterface(&rasterizer);
+    const auto asid = memory.RegisterProcess(&cpu_memory);
+    constexpr DAddr device = 0x10000;
+    memory.KeepWrites(device, 0x2000);
+    const u32 expected = 0x12345678;
+    REQUIRE(memory.WriteKept(device + 8, &expected, sizeof(expected)));
+    REQUIRE(memory.GetPointer<u8>(device) == nullptr);
+
+    // Complete the mapping between the caller's pointer lookup and its fallback. This consumes
+    // every kept page, so a kept-count shortcut would now drop both reads and writes.
+    memory.Map(device, 0x4000, 0x2000, asid, true);
+    u32 observed{};
+    REQUIRE(memory.ReadKept(device + 8, &observed, sizeof(observed)));
+    REQUIRE(observed == expected);
+    REQUIRE(std::ranges::all_of(std::span{physical, size_t{8}},
+                               [](u8 value) { return value == 0; }));
+    REQUIRE(std::ranges::all_of(std::span{physical + 0x1000, size_t{0x1000}},
+                               [](u8 value) { return value == 0; }));
+    const u32 replacement = 0xabcdef01;
+    REQUIRE(memory.WriteKept(device + 8, &replacement, sizeof(replacement)));
+    std::memcpy(&observed, physical + 8, sizeof(observed));
+    REQUIRE(observed == replacement);
+    memory.Unmap(device, 0x2000);
+    memory.UnregisterProcess(asid);
+}
+
+TEST_CASE("GPU reads and writes use deferred device backing", "[memory_manager][sparse_backing]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    device_memory.BindInterface(&rasterizer);
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31, 16};
+    memory.BindRasterizer(&rasterizer);
+    constexpr GPUVAddr gpu = 0x40000000;
+    constexpr DAddr device = 0x10000;
+    memory.Map(gpu, device, 0x2000, Tegra::PTEKind::PITCH, false);
+    device_memory.KeepWrites(device, 0x2000);
+    memory.Write<u32>(gpu + 4, 0x12345678);
+    REQUIRE(memory.Read<u32>(gpu + 4) == 0x12345678);
+    const std::array<u8, 8> expected{1, 2, 3, 4, 5, 6, 7, 8};
+    std::array<u8, 8> observed{};
+    memory.WriteBlock(gpu + 0xffc, expected.data(), expected.size());
+    memory.ReadBlock(gpu + 0xffc, observed.data(), observed.size());
+    REQUIRE(observed == expected);
+    memory.WriteBlockUnsafe(gpu + 0x20, expected.data(), expected.size());
+    memory.ReadBlockUnsafe(gpu + 0x20, observed.data(), observed.size());
+    REQUIRE(observed == expected);
+}
+
+TEST_CASE("Deferred device ranges reject empty and overflowing requests",
+          "[memory_manager][sparse_backing]") {
+    ScopedSystemTestContext context;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager memory{physical};
+    constexpr DAddr end = 1ULL << Tegra::MaxwellDeviceTraits::device_virtual_bits;
+    constexpr DAddr maximum = std::numeric_limits<DAddr>::max();
+    u32 value = 99;
+    for (const auto [address, size] : {std::pair<DAddr, size_t>{0, 0}, {end, 1},
+                                     {end - 1, 2}, {maximum - 1, 4}, {1, maximum}}) {
+        memory.KeepWrites(address, size);
+        REQUIRE_FALSE(memory.ReadKept(address, &value, size));
+        REQUIRE(value == 99);
+        REQUIRE_FALSE(memory.WriteKept(address, &value, size));
+    }
 }

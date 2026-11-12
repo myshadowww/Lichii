@@ -125,7 +125,8 @@ public:
 
     PAddr GetPhysicalRawAddressFromDAddr(DAddr address) const {
         PAddr subbits = PAddr(address & page_mask);
-        auto paddr = tracked_entries[(address >> page_bits)].compressed_physical_ptr;
+        const auto paddr =
+            tracked_entries[(address >> page_bits)].compressed_physical_ptr.load(std::memory_order_acquire);
         if (paddr == 0) {
             return 0;
         }
@@ -233,10 +234,10 @@ private:
 
     struct TrackedEntry {
         VAddr cpu_backing_address;
-        u32 continuity_tracker;
-        u32 compressed_physical_ptr;
+        std::atomic<u32> continuity_tracker{};
+        std::atomic<u32> compressed_physical_ptr{};
     };
-    Common::SparseLargeVector<u32> compressed_device_addr;
+    Common::SparseLargeVector<std::atomic<u32>> compressed_device_addr;
     Common::SparseLargeVector<TrackedEntry> tracked_entries;
 
     // Process memory interfaces
@@ -252,6 +253,9 @@ private:
     static constexpr size_t asid_start_bit = guest_max_as_bits;
 
     std::pair<Asid, VAddr> ExtractCPUBacking(size_t page_index) {
+        if (tracked_entries[page_index].compressed_physical_ptr.load(std::memory_order_acquire) == 0) {
+            return {Asid{0}, 0};
+        }
         auto content = tracked_entries[page_index].cpu_backing_address;
         const VAddr address = content & guest_mask;
         const Asid asid{static_cast<size_t>(content >> asid_start_bit)};
@@ -300,7 +304,6 @@ private:
 
     /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
     std::mutex kept_mutex;
-    std::atomic<size_t> kept_count{};
     using KeptPage = std::array<u8, size_t{1} << page_bits>;
     std::unordered_map<size_t, std::unique_ptr<KeptPage>> kept_pages;
 

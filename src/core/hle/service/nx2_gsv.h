@@ -1251,10 +1251,29 @@ private:
             lk.lock();
             if (backing) {
                 m_reserve.push_back(std::move(*backing));
-                BackDeferredBlocks();
+                if (!stop.stop_requested()) {
+                    BackDeferredBlocks();
+                }
             } else {
                 m_reserve_exhausted = true;
             }
+        }
+        // These pages were never handed to the GPU. Release them while this worker still has
+        // its kernel thread context, without holding the mutex the GPU takes.
+        auto unused = std::move(m_reserve);
+        lk.unlock();
+        auto* const process = system.ApplicationProcess();
+        for (auto& backing : unused) {
+            if (process != nullptr &&
+                R_FAILED(process->GetPageTable().UnmapPageGroup(
+                    Common::ProcessAddress{backing.address}, *backing.pages,
+                    Kernel::KMemoryState::IoMemory))) {
+                LOG_ERROR(Service, "nx2:gpu could not unmap unused reserve {:#x}+{:#x}",
+                          backing.address, backing.size);
+                continue;
+            }
+            backing.pages->Close(system.Kernel());
+            ReleaseReservation(backing.reserved);
         }
     }
 
