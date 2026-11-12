@@ -14,9 +14,6 @@ add_executable(nx2-precompile main.cpp
     ${CMAKE_SOURCE_DIR}/src/core/file_sys/vfs/vfs_offset.cpp)
 target_link_libraries(nx2-precompile PRIVATE common shader_recompiler OpenSSL::Crypto
     zstd::zstd xxhash lz4::lz4 ZLIB::ZLIB)
-if (lz4_ADDED)
-    target_include_directories(nx2-precompile PRIVATE ${lz4_SOURCE_DIR}/lib)
-endif()
 if (TARGET Boost::crc)
     target_link_libraries(nx2-precompile PRIVATE Boost::crc)
 endif()
