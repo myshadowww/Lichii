@@ -20,6 +20,10 @@ add_library(frontend_common STATIC
     mod_manager.h mod_manager.cpp
     nx_archive.h nx_archive.cpp)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    target_sources(frontend_common PRIVATE nvidia_shader_cache.cpp nvidia_shader_cache.h)
+endif()
+
 if (ENABLE_UPDATE_CHECKER)
     target_link_libraries(frontend_common PRIVATE httplib::httplib)
     target_link_libraries(frontend_common PRIVATE nlohmann_json::nlohmann_json)

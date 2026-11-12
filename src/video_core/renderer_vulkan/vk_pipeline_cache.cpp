@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -613,6 +614,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     kept_stages = decltype(kept_stages){ram != 0 ? ram / 64 : u64{256} << 20};
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+        const char* const path = std::getenv("__GL_SHADER_DISK_CACHE_PATH");
+        const char* const size = std::getenv("__GL_SHADER_DISK_CACHE_SIZE");
+        LOG_INFO(Render_Vulkan,
+                 "NVIDIA shader disk cache: __GL_SHADER_DISK_CACHE_PATH={}, "
+                 "__GL_SHADER_DISK_CACHE_SIZE={}",
+                 path != nullptr ? path : "unset", size != nullptr ? size : "unset");
+    }
+#endif
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
     const auto subgroup_stage_bit{[subgroup_stages](VkShaderStageFlags flag, Shader::Stage stage) {
         return (subgroup_stages & flag) != 0 ? (1u << static_cast<u32>(stage)) : 0u;

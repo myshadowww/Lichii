@@ -11,6 +11,10 @@
 #include "nx2_switches.h"
 #include "startup_checks.h"
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#include "frontend_common/nvidia_shader_cache.h"
+#endif
+
 #if YUZU_ROOM
 #include <cstring>
 #include "dedicated_room/yuzu_room.h"
@@ -85,6 +89,9 @@ static Qt::HighDpiScaleFactorRoundingPolicy GetHighDpiRoundingPolicy() {
 }
 
 int main(int argc, char* argv[]) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    FrontendCommon::ConfigureNvidiaShaderDiskCache(std::getenv("XDG_CACHE_HOME"), std::getenv("HOME"));
+#endif
     LoadNx2Switches(argv[0]);
 #if YUZU_ROOM
     bool launch_room = false;

@@ -243,6 +243,10 @@ create_target_directory_groups(tests)
 target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    target_sources(tests PRIVATE frontend_common/nvidia_shader_cache.cpp)
+endif()
+
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/jit_ordered_loads.cpp core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)

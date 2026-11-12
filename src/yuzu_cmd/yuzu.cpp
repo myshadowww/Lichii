@@ -50,6 +50,9 @@
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
 #include "frontend_common/profile_import.h"
+#if defined(__linux__) && !defined(__ANDROID__)
+#include "frontend_common/nvidia_shader_cache.h"
+#endif
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "network/network.h"
@@ -547,6 +550,9 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
 }
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    FrontendCommon::ConfigureNvidiaShaderDiskCache(std::getenv("XDG_CACHE_HOME"), std::getenv("HOME"));
+#endif
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
 #endif
