@@ -26,6 +26,12 @@ def main():
         subprocess.run([args.glslang, '-V', '--target-env', 'vulkan1.3',
                         '-I' + str(root / 'shaders'), str(shader), '-o', str(result)], check=True)
         assets.append(result)
+        if shader.stem in ('nr_preprocess', 'nr_composite'):
+            native = intermediates / (shader.stem + '_native.spv')
+            subprocess.run([args.glslang, '-V', '--target-env', 'vulkan1.3',
+                            '-DLICHII_NATIVE_EXPOSURE=1', '-I' + str(root / 'shaders'),
+                            str(shader), '-o', str(native)], check=True)
+            assets.append(native)
 
     def emit(script, name, before=(), after=()):
         result = intermediates / (name + '.ptx')

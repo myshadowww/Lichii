@@ -33,6 +33,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/macro.h"
+#include "video_core/macro_failure_capture.h"
 #include "video_core/query_dma.h"
 
 #include "common/assert.h"
@@ -1514,12 +1515,30 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
             }
             native_jit->Prepare(native_code, native_code_generation);
             fifo.assign(parameters.begin(), parameters.end());
-            const auto result = native_jit->Execute(
-                method, fifo, std::span<u32>{*native_interpreter.active_dram},
-                [&](u32 address) {
-                    return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U;
-                },
-                emit);
+            const auto read = [&](u32 address) {
+                return address < Maxwell3D::Regs::NUM_REGS
+                           ? maxwell3d.GetRegisterValue(address) : 0U;
+            };
+            const auto run = [&](auto&& read_callback, auto&& emit_callback) {
+                return native_jit->Execute(method, fifo,
+                    std::span<u32>{*native_interpreter.active_dram}, read_callback, emit_callback);
+            };
+            const auto result = [&] {
+                if (MacroFailureCapture::Enabled(method)) {
+                    auto trace = MacroFailureCapture::Begin(method, native_code_generation,
+                        native_code, fifo, *native_interpreter.active_dram);
+                    if (trace) {
+                        const auto captured = run(
+                            [&](u32 address) { return trace->ReadCall(address, read); },
+                            [&](u32 address, u32 value) {
+                                return trace->EmitCall(address, value, emit);
+                            });
+                        trace->Finish(captured);
+                        return captured;
+                    }
+                }
+                return run(read, emit);
+            }();
             if (!result.success) {
                 native_execution_failed = true;
                 LOG_ERROR(HW_GPU, "Native MME (JIT) failed: start={:#x}, consumed={}/{}, error={}",
@@ -1562,14 +1581,34 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         }
         fifo.assign(parameters.begin(), parameters.end());
         const u64 code_generation = native_code_generation;
-        const auto result = native_interpreter.Execute(native_code, method, fifo,
-            [&](u32 address) { return address < Maxwell3D::Regs::NUM_REGS ? maxwell3d.GetRegisterValue(address) : 0U; },
-            [&](u32 address, u32 value) {
-                if (use_memo) {
-                    native_writes.emplace_back(address, value);
+        const auto read = [&](u32 address) {
+            return address < Maxwell3D::Regs::NUM_REGS
+                       ? maxwell3d.GetRegisterValue(address) : 0U;
+        };
+        const auto recorded_emit = [&](u32 address, u32 value) {
+            if (use_memo) native_writes.emplace_back(address, value);
+            return emit(address, value);
+        };
+        const auto run = [&](auto&& read_callback, auto&& emit_callback) {
+            return native_interpreter.Execute(native_code, method, fifo,
+                                               read_callback, emit_callback);
+        };
+        const auto result = [&] {
+            if (MacroFailureCapture::Enabled(method)) {
+                auto trace = MacroFailureCapture::Begin(method, native_code_generation,
+                    native_code, fifo, *native_interpreter.active_dram);
+                if (trace) {
+                    const auto captured = run(
+                        [&](u32 address) { return trace->ReadCall(address, read); },
+                        [&](u32 address, u32 value) {
+                            return trace->EmitCall(address, value, recorded_emit);
+                        });
+                    trace->Finish(captured);
+                    return captured;
                 }
-                return emit(address, value);
-            });
+            }
+            return run(read, recorded_emit);
+        }();
         // Remember the call if its effects depend only on its parameters and the data RAM words
         // it read (and the macro code did not change under it).
         if (use_memo && result.success && !read_memory && !native_interpreter.read_registers &&

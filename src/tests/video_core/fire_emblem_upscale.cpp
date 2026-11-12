@@ -41,6 +41,31 @@ TEST_CASE("FE upscale substitute only selects the captured output pass", "[fe_up
     }
 }
 
+TEST_CASE("Captured DLSS passes keep title-specific history and region contracts", "[fe_upscale]") {
+    const auto fire_emblem = FE::CapturedPasses(FE::ProgramId);
+    const auto star_fox = FE::CapturedPasses(FE::StarFoxProgramId);
+    const auto duskbloods = FE::CapturedPasses(FE::DuskbloodsProgramId);
+    REQUIRE(fire_emblem);
+    REQUIRE(star_fox);
+    REQUIRE(duskbloods);
+    REQUIRE(fire_emblem->IsPrepass(FE::PrepassProgramKey));
+    REQUIRE(fire_emblem->IsPrepass(FE::AlternatePrepassProgramKey));
+    REQUIRE_FALSE(fire_emblem->star_fox);
+    REQUIRE_FALSE(fire_emblem->render_region);
+    REQUIRE(star_fox->IsPrepass(FE::StarFoxPrepassProgramKey));
+    REQUIRE(star_fox->IsPrepass(FE::StarFoxCutscenePrepassProgramKey));
+    REQUIRE(star_fox->star_fox);
+    REQUIRE_FALSE(star_fox->render_region);
+    REQUIRE(duskbloods->IsPrepass(FE::DuskbloodsPrepassProgramKey));
+    REQUIRE_FALSE(duskbloods->IsPrepass(0));
+    REQUIRE_FALSE(duskbloods->IsPrepass(FE::AlternatePrepassProgramKey));
+    REQUIRE_FALSE(duskbloods->IsPrepass(FE::StarFoxCutscenePrepassProgramKey));
+    REQUIRE_FALSE(duskbloods->star_fox);
+    REQUIRE(duskbloods->render_region);
+    REQUIRE(FE::UseReplacement(FE::DuskbloodsProgramId, FE::DuskbloodsOutputProgramKey, nullptr));
+    REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::DuskbloodsOutputProgramKey, nullptr));
+}
+
 TEST_CASE("FE upscale substitute validates both surface descriptors", "[fe_upscale]") {
     const auto input = Image(0x100000, 1280, 720);
     const auto output = Image(0x800000, 2560, 1440);
@@ -65,6 +90,23 @@ TEST_CASE("FE upscale substitute validates both surface descriptors", "[fe_upsca
         rejected([](auto& image) { image.max_mip_level.Assign(1); });
         rejected([](auto& image) { image.layer_base_0_2.Assign(1); });
         rejected([](auto& image) { image.address_low = 0; });
+    }
+}
+
+TEST_CASE("FE temporal selection follows the live setting and explicit comparisons", "[fe_upscale]") {
+    REQUIRE_FALSE(FE::UseTemporalReplacement(true, false, nullptr));
+    REQUIRE(FE::UseTemporalReplacement(true, true, nullptr));
+    REQUIRE_FALSE(FE::UseTemporalReplacement(true, false, nullptr));
+    for (bool enabled : {false, true}) {
+        for (const char* option : {"fsr", "dlss"}) {
+            REQUIRE(FE::UseTemporalReplacement(true, enabled, option));
+            REQUIRE_FALSE(FE::UseTemporalReplacement(false, enabled, option));
+        }
+        for (const char* option : {"native", "standin", "0", "", "invalid"}) {
+            REQUIRE_FALSE(FE::UseTemporalReplacement(true, enabled, option));
+        }
+        // Star Fox records spatial repair first and selects its own temporal pass separately.
+        REQUIRE_FALSE(FE::UseTemporalReplacement(false, enabled, nullptr));
     }
 }
 
@@ -192,6 +234,22 @@ TEST_CASE("Star Fox cutscene prepass opens the existing spatial replacement chai
     REQUIRE_FALSE(passes->IsPrepass(FE::PrepassProgramKey));
     REQUIRE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(FE::PrepassProgramKey));
     REQUIRE_FALSE(FE::CapturedPasses(FE::ProgramId)->IsPrepass(0));
+}
+
+TEST_CASE("FE captured alternate prepass opens only its own replacement chain", "[fe_upscale]") {
+    const auto passes = FE::CapturedPasses(FE::ProgramId);
+    REQUIRE(passes);
+    for (const u64 prepass : {0x4cbf6eff32525aecULL, 0x5e8d8dc58bed8ba4ULL}) {
+        REQUIRE(passes->IsPrepass(prepass));
+        REQUIRE_FALSE(FE::CapturedPasses(FE::StarFoxProgramId)->IsPrepass(prepass));
+        REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, prepass, nullptr));
+        for (unsigned bit = 0; bit < 64; ++bit) {
+            REQUIRE_FALSE(passes->IsPrepass(prepass ^ (1ULL << bit)));
+        }
+    }
+    REQUIRE_FALSE(passes->IsPrepass(0));
+    REQUIRE_FALSE(passes->IsPrepass(FE::OutputProgramKey));
+    REQUIRE_FALSE(FE::CapturedPasses(FE::ProgramId ^ 1));
 }
 
 TEST_CASE("Star Fox scene output requires its captured title and native program",

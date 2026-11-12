@@ -231,6 +231,24 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
         // A macro call must begin by writing the macro method's register, not its argument.
         ASSERT((method % 2) == 0 && "Can't start macro execution by writing to the ARGS register");
         executing_macro = method;
+        if (MacroArgumentTrace::Enabled()) {
+            const auto positions = GetNativeMacroPositions();
+            const auto slot = ((method - MacroRegistersStart) >> 1) % positions.size();
+            const u32 entry = positions[slot];
+            try {
+                if (GetNativeMacroEngine().native_turing && MacroArgumentTrace::Selected(entry)) {
+                    if (!macro_argument_trace) {
+                        macro_argument_trace = std::make_unique<MacroArgumentTrace::Invocation>();
+                    }
+                    macro_argument_trace->Reset(entry, method,
+                                               GetNativeMacroEngine().native_code_generation);
+                } else if (macro_argument_trace) {
+                    macro_argument_trace->active = false;
+                }
+            } catch (...) {
+                macro_argument_trace.reset();
+            }
+        }
     }
 
     macro_segments.emplace_back(current_dma_segment, amount);
@@ -248,6 +266,10 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
         !Settings::IsGPULevelHigh()) {
         std::array<u32, 64> parameters;
         std::copy_n(base_start, amount, parameters.begin());
+        if (macro_argument_trace && macro_argument_trace->active) {
+            macro_argument_trace->Append(this, current_dma_segment,
+                                        std::span<const u32>{parameters.data(), amount});
+        }
         ConsumeSink(system);
         CallMacroMethod(system, executing_macro, std::span<const u32>{parameters.data(), amount});
         macro_segments.clear();
@@ -255,6 +277,10 @@ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_s
         return;
     }
     macro_params.insert(macro_params.end(), base_start, base_start + amount);
+    if (macro_argument_trace && macro_argument_trace->active) {
+        macro_argument_trace->Append(
+            this, current_dma_segment, std::span<const u32>{macro_params}.last(amount));
+    }
 
     // Call the macro when there are no more parameters in the command buffer
     if (is_last_call) {
@@ -318,16 +344,6 @@ size_t Maxwell3D::EstimateIndexBufferSize() {
     return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
 }
 
-u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
-    // Keep track of the register value in shadow_state when requested.
-    auto const c = shadow_state.shadow_ram_control;
-    if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
-        return shadow_state.reg_array[method] = argument;
-    else if (c == Regs::ShadowRamControl::Replay)
-        return shadow_state.reg_array[method];
-    return argument;
-}
-
 void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
         ReleaseFront();
@@ -354,22 +370,6 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
             process(method, value);
     }
     method_sink.clear();
-}
-
-void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
-    // The instances after the first are drawn together once their loop ends, and they must see
-    // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
-    // c[0][0x644]) right after the loop, before the macro returns.
-    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
-        draw_manager.DrawDeferred(*this, true);
-    }
-    if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
-        !IsFastDrawParameter(method)) {
-        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
-    }
-    regs.reg_array[method] = argument;
-    for (auto const& table : dirty.tables)
-        dirty.flags[table[method]] = true;
 }
 
 bool Maxwell3D::IsFastDrawParameter(u32 method) {
@@ -523,6 +523,11 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, std::span<cons
     const u32 entry =
         ((method - MacroRegistersStart) >> 1) % static_cast<u32>(GetNativeMacroPositions().size());
 
+    // The recorder copies this context before the macro executes any callbacks.
+    std::optional<MacroArgumentTrace::InvocationScope> argument_trace;
+    if (MacroArgumentTrace::Enabled()) {
+        argument_trace.emplace(macro_argument_trace.get(), parameters);
+    }
     // Execute the current macro.
     GetNativeMacroEngine().Execute(system, *this, GetNativeMacroPositions()[entry], parameters);
     draw_manager.DrawDeferred(*this);
@@ -539,6 +544,15 @@ void Maxwell3D::TraceFirstMethodWrite(u32 method, u32 argument) {
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     if (front_macros && !VideoCommon::GpuSplit::OnBackThread()) {
         ReleaseFront();
+    }
+    // About half of the split back's 3D writes (~5 million a second in Ocarina of Time) are state
+    // registers: CallMethodFast's state write, here without the calls to it. A register not in
+    // execution_mask is not SET_SHADOW_RAM_CONTROL either (CallMethodSlow's). The verify switch
+    // takes the longer path below; the profile, the write history and the first-write trace
+    // leave fast_maxwell3d off.
+    if (fast_maxwell3d && executing_macro == 0 && method < MacroRegistersStart &&
+        !execution_mask[method] && !perf_verify) {
+        return WriteStateRegister(method, method_argument);
     }
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||
         method == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
@@ -571,13 +585,10 @@ bool IsStoreOnlyExecutable(u32 method) {
 // no write history, trace or profile, not a macro call or SET_SHADOW_RAM_CONTROL. The hot
 // executable methods go straight to their handler.
 void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_call) {
-    const u32 argument = ProcessShadowRam(method, method_argument);
     if (!execution_mask[method]) {
-        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
-            ProcessDirtyRegisters(method, argument);
-        }
-        return;
+        return WriteStateRegister(method, method_argument);
     }
+    const u32 argument = ProcessShadowRam(method, method_argument);
     ProcessDirtyRegisters(method, argument);
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     if (method - cb_data < 16) {

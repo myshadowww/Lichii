@@ -153,6 +153,12 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 `Common::g_build_fullname` and `g_scm_rev`, and `System::IsPaused`. It measures fps from
 `Core::g_nx2_present_count` (`src/core/core.cpp:78`) over a short window. It does not call
 `GetAndResetPerfStats`, which would reset the Qt status bar's counters.
+Linux NGX builds also return `nvidia_dlss` (`available`, `successful_evaluations`, `error`)
+and `neural_rendering` (`ready`, `submitted_frames`, `exposure_history_resets`, `error`).
+The exposure counter records NR reference-white/optional native-exposure changes that invalidate
+its proxy history; it excludes camera and ordinary lifecycle resets. These are read-only runtime
+snapshots: compare successive counts to verify activity. Successful NGX API evaluations and
+recorded NR submissions do not prove GPU completion, presentation or image quality.
 
 **`frame_times`** `{seconds?, refresh_hz?}` waits for `seconds` (default 5, > 0, at most 60),
 interruptible on shutdown like `status`. It measures intervals between guest presents inside
@@ -209,7 +215,9 @@ command. With `index: true`, the adapter runs that command itself. The adapter-o
 threads (default `GPU,GPUBack`) about 1000 times a second for `seconds` (default 10) and returns
 the self, self-and-caller and inclusive counts per function. The report and its folded stacks go
 to `samples-<session>-<n>.txt` in the dump directory. Windows only; the threads run slower while
-sampled, so read fps from a run without it.
+sampled, so read fps from a run without it. A stack ends at its first frame in generated code,
+shown as `(jit)`: a guest core thread (`CPUCore_*`) shows `(jit)` while it runs guest code and
+the host functions above `(jit)` while the JIT calls out.
 
 **`speed_limit`** `{on?}`. Lifts (`false`) or restores (`true`) the speed limit live and returns
 the `previous` and current `on` state, so a test script can boot through the logos and menus
@@ -441,3 +449,74 @@ the server again on the same port.
 - `log_tail` sees lines logged after the game finished loading. The boot itself is in
   `eden_log.txt`.
 - Runtime rejections last for one boot. Starting the next session clears them.
+
+## Native macro failure captures
+
+`EDEN_NX2_MME_FAILURE_CAPTURE=<fresh directory>` records the first failed unsplit
+native invocation of entries `0x1d2` and `0x1e7`. The private `MMEFAIL1` files contain
+the initial code, FIFO and RAM, bounded callback effects, final state and failure.
+The recorder does not change macro arguments or instruction limits. Truncated or
+mutated captures cannot establish an exact full replay; their initial state and
+recorded prefix remain useful. Split-front execution and successful memo hits are
+outside this recorder's scope.
+
+Adding `EDEN_NX2_MME_ARGUMENT_TRACE=1` writes an `.arguments.json` sidecar alongside
+each selected failure. It separates parser-dispatch words from the actual copied
+FIFO and retained command-list snapshot. Packet-header and payload origins remain
+separate across entry boundaries; known payload addresses include the mapped device
+address at dispatch. Source codes are 0 unknown, 1 submitted snapshot, 2 safe read,
+3 GPU readback, 4 unsafe read and 5 prefetched words. Retained snapshots can have
+been refreshed and must not be described as original submission bytes.
+
+Argument provenance is bounded to 32 original words and eight contributions;
+unknown context and truncation are explicit. Short macro continuation entries
+also record a bounded unsafe memory observation immediately before the existing
+safe read. This is labelled `pre_safe_read_observation`: it is neither executed
+data nor a submission snapshot, and occurs after the source-selection queries.
+The diagnostic adds no GPU flush or GPU wait. Both options are read at startup/first
+use and are off by default. Enabled capture can alter timing, so compare failures
+with an uncaptured run and retain the exact executable, settings and log. Keep
+these guest-code captures local.
+
+With both options enabled, `EDEN_NX2_MME_LIFETIME_ARENA=<device base>:<byte size>`
+adds `lifetime_observation` to the same sidecar. For example,
+`0xb1f0000:0x10000` selects a 64 KiB device-memory arena. This third option is also
+off by default and read at first use; sizes above 64 KiB are rejected. It links
+short entries' existing submit-copy words to mappings observed before and after
+that copy, then records overlapping CPU-write and cache-invalidation notifications,
+buffer-download stores and exclusions, owned upload staging bytes, and declared
+GPU-writable ranges. It adds no guest reread,
+GPU flush or GPU wait. Enabled hooks use a CPU mutex and copy bounded data, so they
+can block CPU threads and change timing.
+
+The fixed state is approximately 4.3 MiB: a latest-observation record for each arena
+byte, 1,024 events and 4,096 snapshots. Only the first 4,096 entries in a submission
+can carry snapshot IDs. Snapshots are at most 32 words; each captured contribution
+retains at most 128 bytes and the latest 256 overlapping events, serialized in
+chronological order. GPUVA and mapped-device
+ranges must each fit within one 4 KiB page. Missing or evicted snapshots, dropped
+history, out-of-scope ranges and partial arena coverage are explicit. Latest byte
+values survive event-ring eviction but do not constitute a complete write history.
+
+Sequence numbers describe host observation order, not GPU completion or guest-store
+order. Event kinds are 0 CPU `Collect` notification before the store, 1 downloaded
+bytes observed after their existing guest store, 2 download bytes excluded by a
+pending CPU-write range, 3 a GPU-writable range declaration, 4 a buffer-cache
+`WriteMemory` notification, and 5 owned upload staging bytes. Kind 4 identifies
+neither an actual store nor the original caller; kind 5 records existing staging
+bytes after their read or copy, not GPU completion. Borrowed immediate uploads
+remain outside this observation. Notifications do
+not cover every possible CPU writer; declarations do not prove individual shader
+stores. Source `download_route` values are 0 unknown, 1 scalar mapped, 2 scalar
+staged, 3 scalar immediate, 4 batch staged, 5 batch mapped, 6 mapped upload staging
+and 7 inline upload staging.
+`gpu_producer_class` values are 0 unknown, 1 draw-or-other, 2 dispatch-or-copy and
+3 explicit buffer copy. Buffer identities are host object addresses, not allocation
+generations. Declarations within `DispatchCompute` also record its existing native
+key and pipeline shader hash; other compute contexts are explicitly unknown. These
+hashes identify the active dispatch context, not individual byte stores. The original
+six per-byte columns remain unchanged; cache-invalidation sequence, upload-staging
+sequence and upload-staging value are appended. Mapping endpoints do not exclude a
+remap that changed back during the
+copy. Later snapshot refreshes retain the original lifetime ID; consult the origin's
+`snapshot_revision` when comparing original and retained words.

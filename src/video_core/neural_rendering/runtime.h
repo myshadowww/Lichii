@@ -10,6 +10,7 @@ namespace VideoCore::NeuralRendering {
 struct RuntimeStatus {
     bool ready{};
     std::uint64_t submitted_frames{};
+    std::uint64_t exposure_history_resets{};
     std::string error;
 };
 
@@ -20,5 +21,5 @@ void ReportReady();
 /// Mark a user-disabled backend inactive while retaining its submitted-frame counter.
 void ReportInactive();
 void ReportFailure(std::string error);
-void ReportFrame();
+void ReportFrame(bool exposure_changed = false);
 } // namespace VideoCore::NeuralRendering

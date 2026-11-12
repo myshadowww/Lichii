@@ -261,6 +261,8 @@ public:
     /// tonemapped image.
     bool BypassOotNetwork(u64 program_id, u64 native_key);
     void TraceDlssContract(u64 native_key, bool warn_unvalidated = true);
+    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
+    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
 
     /// GPU thread split with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2), called by
     /// the front instead of CallMethod for native compute engines: runs their macros and macro
@@ -287,10 +289,14 @@ private:
     bool DispatchNativeCompute(const NativeQmdScheduler::Descriptor& descriptor);
     void ProcessNativeReportSemaphore(u32 argument);
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
-    /// Texture descriptor that the handle at `offset` in constant buffer 0 selects.
-    std::optional<Texture::TICEntry> ConstBuffer0Image(u32 offset) const;
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
+    bool ScaleDlssRenderRegion(
+        GPUVAddr constants, const std::optional<Texture::TICEntry>& input,
+        const std::optional<Texture::TICEntry>& output,
+        const std::optional<VideoCommon::FireEmblemUpscale::JitterSample>& jitter,
+        const std::optional<Texture::TICEntry>& motion,
+        const std::optional<Texture::TICEntry>& depth, bool allow_history);
     void CaptureFireEmblemJitter();
     bool FinishDlssEvaluation();
     void CheckDlssNetwork();
@@ -304,6 +310,7 @@ private:
     struct DlssChain {
         bool active{};
         bool star_fox{};
+        bool render_region{};
         bool output_pass{};
         u32 rejected{};
         u32 clean_evaluations{};

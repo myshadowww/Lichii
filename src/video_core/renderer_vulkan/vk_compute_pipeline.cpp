@@ -22,6 +22,7 @@
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+#include "video_core/kirby_upscale.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
@@ -552,8 +553,17 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         }
     }
 
-    if (RecordingSampledTextures() || deferred_bind || kepler_compute.IsStarFoxFinalUpscale()) {
-        sampled_images.clear();
+    const bool kirby_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        VideoCommon::KirbyUpscale::IsNetworkShader(shader_hash);
+    const bool bananza_scene_input = Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+        (shader_hash == 0xfa41bddd07b97523ULL || shader_hash == 0xcd25b1bef2c4558aULL ||
+         shader_hash == 0x792039712972eb09ULL || shader_hash == 0xafefd62ccede1c51ULL);
+    sampled_images.clear();
+    if (RecordingSampledTextures() || deferred_bind || kepler_compute.IsStarFoxFinalUpscale() ||
+        kirby_scene_input || bananza_scene_input || (Settings::GetNvidiaDlssRuntimeSettings().enabled &&
+                               (shader_hash == 0x15b555dd8463cf5cULL ||
+                                shader_hash == 0x505d41b4f1088151ULL ||
+                                shader_hash == 0x7a6e67d9226d0b53ULL))) {
         const size_t first = Shader::NumDescriptors(info.texture_buffer_descriptors) +
                              Shader::NumDescriptors(info.image_buffer_descriptors);
         for (size_t index = first; index < first + Shader::NumDescriptors(info.texture_descriptors);

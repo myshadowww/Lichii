@@ -1,0 +1,27 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D scene_depth;
+layout(binding = 1, rg16f) uniform writeonly image2D motion;
+layout(push_constant, row_major) uniform Parameters {
+    mat4 clip_to_previous_clip;
+    vec4 pixel_to_clip;
+    vec4 depth_and_jitter;
+    uvec2 active_extent;
+} params;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = ivec2(params.active_extent);
+    if (any(greaterThanEqual(pixel, extent))) return;
+    float depth = texelFetch(scene_depth, pixel, 0).r;
+    vec2 screen = (vec2(pixel) + 0.5 - params.depth_and_jitter.zw) / vec2(extent);
+    vec4 clip = vec4(screen * params.pixel_to_clip.xy + params.pixel_to_clip.zw,
+                     depth * params.depth_and_jitter.x + params.depth_and_jitter.y, 1);
+    vec4 previous = params.clip_to_previous_clip * clip;
+    vec2 displacement = vec2(0);
+    if (depth >= 0 && depth <= 1 && previous.w > 1e-6) {
+        vec2 delta = (previous.xy / previous.w - clip.xy) /
+                     params.pixel_to_clip.xy * vec2(extent);
+        if (all(lessThanEqual(abs(delta), vec2(65504)))) displacement = delta;
+    }
+    imageStore(motion, pixel, vec4(displacement, 0, 0));
+}

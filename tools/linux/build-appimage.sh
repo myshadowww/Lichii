@@ -79,7 +79,7 @@ else
     "$work_dir/venv/bin/ctest" --test-dir "$work_dir/build" --output-on-failure --no-tests=error --parallel "$jobs"
 fi
 mkdir -p "$work_dir/installed/usr/bin" "$work_dir/installed/usr/lib"
-cp "$work_dir/build/bin/lichii" "$work_dir/build/bin/libnxformat.so" \
+cp "$work_dir/build/bin/lichii" \
     "$work_dir/build/bin/nx2-precompile" "$work_dir/installed/usr/bin/"
 python3 - "$work_dir/installed" "$revision" "$build_date" "$variant" "$cpu_target" "$ctest_status" <<'PY'
 import hashlib, json, pathlib, sys

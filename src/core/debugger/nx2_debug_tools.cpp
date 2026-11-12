@@ -35,6 +35,11 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_base.h"
 
+#ifdef EGLANTINE_NGX
+#include "video_core/neural_rendering/runtime.h"
+#include "video_core/vulkan_common/ngx_dlss.h"
+#endif
+
 namespace Core::Nx2Debug {
 
 using nlohmann::json;
@@ -190,7 +195,7 @@ json Status(ToolState& state, const json& params) {
     const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-    return {
+    json result{
         {"title", state.title},
         {"program_id", fmt::format("{:016X}", state.program_id)},
         {"build", std::string{Common::g_build_fullname}},
@@ -207,6 +212,18 @@ json Status(ToolState& state, const json& params) {
         {"log_filter", state.log_filter},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
     };
+#ifdef EGLANTINE_NGX
+    const auto dlss = Vulkan::Ngx::GetStatus();
+    const auto neural = VideoCore::NeuralRendering::GetStatus();
+    result["nvidia_dlss"] = {{"available", dlss.available},
+                             {"successful_evaluations", dlss.evaluations},
+                             {"error", dlss.error}};
+    result["neural_rendering"] = {{"ready", neural.ready},
+                                  {"submitted_frames", neural.submitted_frames},
+                                  {"exposure_history_resets", neural.exposure_history_resets},
+                                  {"error", neural.error}};
+#endif
+    return result;
 }
 
 json FrameTimes(ToolState& state, const json& params) {

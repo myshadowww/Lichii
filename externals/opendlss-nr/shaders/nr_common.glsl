@@ -41,7 +41,8 @@ struct NrParams {
   uint sourceWidth, sourceHeight;
   float autoMask, paperWhite, colorStrength, intensity, localTone, localStructure, skinStructure, style;
   uint historyValid, seed, nrEnabled, hdrInput;
-  float blendScale, pad1;
+  float blendScale;
+  uint motionExtent; // packed uint16 width/height; zero preserves the full-view ABI
   vec2 motionScale;
   vec2 motionJitter;
   // custom style (styleMode 1): the operator behind the natural / cinematic presets with every knob exposed
@@ -71,29 +72,31 @@ float proxyComponent(float scene, float paperWhite) {
   return roundF16(srgbEncode(value));
 }
 
-ivec2 motionTexel(sampler2D motionTex, vec2 pixel, vec2 valid) {
+ivec2 motionTexel(sampler2D motionTex, vec2 pixel, vec2 valid, uint packedExtent) {
   ivec2 size = textureSize(motionTex, 0);
+  ivec2 active_size = ivec2(packedExtent & 65535u, packedExtent >> 16u);
+  if (all(greaterThan(active_size, ivec2(0)))) size = min(size, active_size);
   return clamp(ivec2((pixel + 0.5) / valid * vec2(size)), ivec2(0), size - 1);
 }
 
 // Where `pixel` was in the previous frame, in uv: the motion texture is already in uv units of the render target.
-vec2 historyUv(sampler2D motionTex, vec2 pixel, vec2 valid, vec2 motionScale, vec2 motionJitter) {
+vec2 historyUv(sampler2D motionTex, vec2 pixel, vec2 valid, vec2 motionScale, vec2 motionJitter, uint motionExtent) {
   vec2 uv = (pixel + 0.5) / valid;
-  return (texelFetch(motionTex, motionTexel(motionTex, pixel + motionJitter, valid), 0).xy * motionScale) + uv;
+  return (texelFetch(motionTex, motionTexel(motionTex, pixel + motionJitter, valid, motionExtent), 0).xy * motionScale) + uv;
 }
 
 // Whether the previous frame has a history for `pixel`: false where its previous position was off screen
 // (velocity_unpack.comp). Without one, the history sample below is another surface's colour and must not be used.
-bool hasHistory(sampler2D motionTex, vec2 pixel, vec2 valid, vec2 motionScale, vec2 motionJitter) {
-  vec2 uv = historyUv(motionTex, pixel, valid, motionScale, motionJitter);
+bool hasHistory(sampler2D motionTex, vec2 pixel, vec2 valid, vec2 motionScale, vec2 motionJitter, uint motionExtent) {
+  vec2 uv = historyUv(motionTex, pixel, valid, motionScale, motionJitter, motionExtent);
   return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
 }
 
 // Five-tap Catmull-Rom reconstruction of the history there (the four axis taps plus the centre, with the
 // bilinear-weight trick). A box or bilinear filter here softens the image frame over frame, because the
 // history is fed back into the network's input.
-vec3 historySample(sampler2D previousTex, sampler2D motionTex, vec2 pixel, vec2 valid, vec2 motionScale, vec2 motionJitter) {
-  vec2 position = historyUv(motionTex, pixel, valid, motionScale, motionJitter) * valid;
+vec3 historySample(sampler2D previousTex, sampler2D motionTex, vec2 pixel, vec2 valid, vec2 motionScale, vec2 motionJitter, uint motionExtent) {
+  vec2 position = historyUv(motionTex, pixel, valid, motionScale, motionJitter, motionExtent) * valid;
   vec2 base = floor(position - 0.5) + 0.5;
   vec2 f = clamp(position - base, vec2(0.0), vec2(1.0));
   vec2 square = f * f; vec2 cube = f * square;

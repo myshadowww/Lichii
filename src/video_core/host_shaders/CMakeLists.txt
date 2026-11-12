@@ -14,6 +14,15 @@ set(GLSL_INCLUDES
 )
 
 set(SHADER_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/mario_kart_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_camera_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_color.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_depth.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output_unorm.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/yoshi_resample_motion.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output_rgba8.comp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scene_upscale_output_rgba16f.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_vertex_repack.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/astc_decoder.comp
     ${CMAKE_CURRENT_SOURCE_DIR}/bc_encoder.comp
@@ -86,6 +95,7 @@ set(SHADER_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_easu_fp32.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_rcas_fp16.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_fidelityfx_fsr_rcas_fp32.frag
+    ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_hdr_convert.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.frag
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.vert
     ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present_scaleforce_fp16.frag

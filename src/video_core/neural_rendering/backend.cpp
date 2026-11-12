@@ -7,6 +7,7 @@
 #include "nr_graph.h"
 #include "nr_model.h"
 #include "reference.h"
+#include <stdexcept>
 
 namespace VideoCore::NeuralRendering {
 namespace {
@@ -14,7 +15,8 @@ struct Params {
     uint32_t full_width, full_height, width, height, source_width, source_height;
     float auto_mask, paper_white, color_strength, intensity, tone, structure, skin_structure, style;
     uint32_t history_valid, seed, enabled, hdr;
-    float blend_scale, padding;
+    float blend_scale;
+    uint32_t motion_extent;
     std::array<float, 2> motion_scale, motion_jitter;
     float exposure, contrast, gamma, saturation, hue, vibrance, strength;
     uint32_t custom_style;
@@ -65,7 +67,7 @@ struct Backend::Impl {
         VkImageView view{};
         VkDeviceMemory memory{};
     } history[2], output;
-    vk::Buffer params[2];
+    vk::Buffer params[2], exposure_params[2];
     VkSampler nearest{}, linear{};
     VkDescriptorPool descriptor_pool{};
     VkDescriptorSetLayout set_layout{};
@@ -77,8 +79,9 @@ struct Backend::Impl {
     uint32_t frames{};
     bool history_valid{};
     Style previous_style{};
-    float previous_tone{}, previous_structure{};
+    float previous_tone{}, previous_structure{}, previous_reference_white = 1.0f;
     bool previous_hdr{};
+    std::array<float, 3> previous_reference_exposure{};
 
     /// Wait for GPU use and destroy backend resources; the caller must hold device queue
     /// synchronization.
@@ -100,6 +103,8 @@ struct Backend::Impl {
             vkFreeMemory(device, image->memory, nullptr);
         }
         for (auto& buffer : params)
+            context->destroyBuffer(buffer);
+        for (auto& buffer : exposure_params)
             context->destroyBuffer(buffer);
         // The graph, kernels and model are destroyed before their adopted context.
     }
@@ -185,6 +190,11 @@ struct Backend::Impl {
             buffer = context->createBuffer(sizeof(Params), false, "nr params",
                                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
+        // Separate native-only UBO preserves the shared vendor Params ABI (128 bytes).
+        for (auto& buffer : exposure_params)
+            buffer = context->createBuffer(16, false, "nr native exposure",
+                                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
         VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         sampler.addressModeU = sampler.addressModeV = sampler.addressModeW =
             VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
@@ -199,20 +209,21 @@ struct Backend::Impl {
             {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
-            {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+            {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {7, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
         VkDescriptorSetLayoutCreateInfo layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        layout.bindingCount = 7;
+        layout.bindingCount = 8;
         layout.pBindings = bindings;
         VK_CHECK(vkCreateDescriptorSetLayout(device, &layout, nullptr, &set_layout));
         VkPipelineLayoutCreateInfo pipeline{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         pipeline.setLayoutCount = 1;
         pipeline.pSetLayouts = &set_layout;
         VK_CHECK(vkCreatePipelineLayout(device, &pipeline, nullptr, &pipeline_layout));
-        CreatePipeline(preprocess, "nr_preprocess.spv");
-        CreatePipeline(composite, "nr_composite.spv");
+        CreatePipeline(preprocess, "nr_preprocess_native.spv");
+        CreatePipeline(composite, "nr_composite_native.spv");
         const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
-                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4},
+                                              {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8},
                                               {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8}};
         VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         pool.maxSets = 4;
@@ -235,20 +246,21 @@ struct Backend::Impl {
                 const VkDescriptorBufferInfo buffers[] = {
                     {pass ? graph->head().buffer.buffer : features->buffer.buffer, 0,
                      VK_WHOLE_SIZE},
-                    {params[h].buffer, 0, sizeof(Params)}};
-                VkWriteDescriptorSet writes[7]{};
-                for (uint32_t i = 0; i < 7; ++i) {
+                    {params[h].buffer, 0, sizeof(Params)},
+                    {exposure_params[h].buffer, 0, 16}};
+                VkWriteDescriptorSet writes[8]{};
+                for (uint32_t i = 0; i < 8; ++i) {
                     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                     writes[i].dstSet = sets[h][pass];
                     writes[i].dstBinding = i;
                     writes[i].descriptorCount = 1;
                     writes[i].descriptorType = bindings[i].descriptorType;
-                    if (i == 3 || i == 4)
-                        writes[i].pBufferInfo = &buffers[i - 3];
+                    if (i == 3 || i == 4 || i == 7)
+                        writes[i].pBufferInfo = &buffers[i == 7 ? 2 : i - 3];
                     else
                         writes[i].pImageInfo = &images[i < 3 ? i : i - 2];
                 }
-                vkUpdateDescriptorSets(device, 7, writes, 0, nullptr);
+                vkUpdateDescriptorSets(device, 8, writes, 0, nullptr);
             }
         }
         VkCommandPoolCreateInfo command_pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -342,18 +354,26 @@ void Backend::Rebind(VkImage color, VkImageView color_view, VkImageView motion_v
 }
 
 /// Append inference and output copy commands, resetting history when conditioning or HDR changes.
-void Backend::Record(VkCommandBuffer commands, const Frame& frame) {
+bool Backend::Record(VkCommandBuffer commands, const Frame& frame) {
+    if (!ValidReferenceWhite(frame.reference_white) ||
+        !ValidReferenceExposure(frame.reference_exposure) ||
+        (!frame.hdr && frame.reference_exposure != std::array<float, 3>{}))
+        throw std::invalid_argument("Invalid neural rendering reference exposure");
     auto& state = *impl;
     const uint32_t h = state.frames & 1u;
+    const bool exposure_changed = frame.reference_white != state.previous_reference_white ||
+                                  frame.reference_exposure != state.previous_reference_exposure;
     const bool reset = frame.reset || !state.history_valid || frame.style != state.previous_style ||
                        frame.tone != state.previous_tone ||
-                       frame.structure != state.previous_structure || frame.hdr != state.previous_hdr;
+                       frame.structure != state.previous_structure ||
+                       frame.hdr != state.previous_hdr || exposure_changed;
     Params params{};
     params.full_width = state.geometry.fullWidth;
     params.full_height = state.geometry.fullHeight;
     params.width = params.source_width = state.extent.width;
     params.height = params.source_height = state.extent.height;
-    params.auto_mask = params.paper_white = params.color_strength = 1.0f;
+    params.auto_mask = params.color_strength = 1.0f;
+    params.paper_white = frame.reference_white;
     params.intensity = frame.intensity;
     params.tone = frame.tone;
     params.structure = frame.structure;
@@ -366,12 +386,18 @@ void Backend::Record(VkCommandBuffer commands, const Frame& frame) {
     params.blend_scale = 1.0f;
     params.motion_scale = frame.motion_scale;
     params.motion_jitter = frame.motion_jitter;
+    params.motion_extent =
+        uint32_t{frame.motion_extent[0]} | (uint32_t{frame.motion_extent[1]} << 16);
     // Serialize reuse of all graph scratch, parameter and history resources, including prior
     // frames.
     MemoryBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                   VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
                   VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT);
     vkCmdUpdateBuffer(commands, state.params[h].buffer, 0, sizeof(params), &params);
+    const std::array<float, 4> exposure{frame.reference_exposure[0], frame.reference_exposure[1],
+                                        frame.reference_exposure[2], 0};
+    vkCmdUpdateBuffer(commands, state.exposure_params[h].buffer, 0, sizeof(exposure),
+                      exposure.data());
     MemoryBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_UNIFORM_READ_BIT);
     vkCmdExecuteCommands(commands, 1, &state.compute_commands[h]);
@@ -393,7 +419,10 @@ void Backend::Record(VkCommandBuffer commands, const Frame& frame) {
     state.previous_tone = frame.tone;
     state.previous_structure = frame.structure;
     state.previous_hdr = frame.hdr;
+    state.previous_reference_white = frame.reference_white;
+    state.previous_reference_exposure = frame.reference_exposure;
     ++state.frames;
+    return exposure_changed;
 }
 
 bool Backend::HadTimeout() const {

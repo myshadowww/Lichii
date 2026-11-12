@@ -28,6 +28,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/macro_argument_lifetime.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
@@ -95,7 +96,8 @@ void BufferCache<P>::RunGarbageCollector(bool aggressive_gc) {
         // textures) with fixed headroom, so on an 8 GB GPU the collector ran every frame once a
         // title 1 course was loaded, and the downloads were ~2.7% of the GPU thread.
         const Buffer& buffer = slot_buffers[buffer_id];
-        if (!aggressive_gc && gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
+        if (!aggressive_gc && !buffer.IsHostOnly() &&
+            gpu_modified_ranges.Intersects(buffer.CpuAddr(), buffer.SizeBytes())) {
             return false;
         }
         evicted.push_back(buffer_id);
@@ -223,6 +225,12 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu_data) {
+    if (Tegra::MacroArgumentLifetime::Enabled()) {
+        // This is cache bookkeeping, including direct OnCPUWrite and gathered invalidations.
+        // It is not an actual guest store and does not identify the original caller.
+        Tegra::MacroArgumentLifetime::Note(
+            Tegra::MacroArgumentLifetime::Kind::CacheInvalidation, device_addr, size);
+    }
     Nx2NoteListHostWrite(device_addr, size);
     NoteUniformWrite(device_addr, size);
     // EDEN_NX2_READ_CHECK: a newer value where an early download landed, as ClearDownload
@@ -496,6 +504,13 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             if (staging != nullptr) {
                 for (const Download& download : staged) {
+                    Buffer& buffer = slot_buffers[download.buffer_id];
+                    std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+                    if (Tegra::MacroArgumentLifetime::Enabled()) {
+                        lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                            reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                            buffer.SizeBytes(), 4, 0});
+                    }
                     WriteDownloadedMemory(
                         cpu_written,
                         slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
@@ -506,6 +521,12 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
             if constexpr (has_mapped) {
                 for (const Download& download : mapped) {
                     Buffer& buffer = slot_buffers[download.buffer_id];
+                    std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+                    if (Tegra::MacroArgumentLifetime::Enabled()) {
+                        lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                            reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                            buffer.SizeBytes(), 5, 0});
+                    }
                     WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + download.copy.src_offset,
                                           buffer.Mapped().data() + download.copy.src_offset,
                                           download.copy.size);
@@ -1458,6 +1479,13 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
         if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
             Tegra::Nx2MarkGpuWritten(pair.first, pair.second);
             Nx2NoteListWrite(buffer_b, pair.first, pair.second);
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                const Tegra::MacroArgumentLifetime::SourceScope source{{
+                    reinterpret_cast<std::uintptr_t>(&dest_buffer), dest_buffer.CpuAddr(),
+                    dest_buffer.SizeBytes(), 0, 3}};
+                Tegra::MacroArgumentLifetime::Note(Tegra::MacroArgumentLifetime::Kind::GpuDeclared,
+                                                  pair.first, pair.second);
+            }
         }
     }
     const auto& copy = copies[0];
@@ -2121,15 +2149,29 @@ void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_wr
     }
     if (!cpu_written.Intersects(device_addr, size)) {
         device_memory.WriteBlockUnsafe(device_addr, data, size);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::DownloadStore, device_addr, size, data);
+        }
         return;
     }
     Common::RangeSet<DAddr> parts;
     parts.Add(device_addr, size);
-    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
+    cpu_written.ForEachInRange(device_addr, size, [&](DAddr start, DAddr end) {
         parts.Subtract(start, end - start);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::DownloadExcluded, start, end - start,
+                data + (start - device_addr));
+        }
     });
     parts.ForEach([&](DAddr start, DAddr end) {
         device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::DownloadStore, start, end - start,
+                data + (start - device_addr));
+        }
     });
 }
 
@@ -2980,8 +3022,7 @@ void BufferCache<P>::UpdateIndexBuffer() {
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
-            ++buffer_deletions;
-            slot_buffers.erase(inline_buffer_id);
+            DeleteBuffer(inline_buffer_id, true);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -3193,6 +3234,14 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size, bool needs_sync) {
+    if (Tegra::MacroArgumentLifetime::Enabled()) {
+        Buffer& buffer = slot_buffers[buffer_id];
+        const Tegra::MacroArgumentLifetime::SourceScope source{{
+            reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(), buffer.SizeBytes(), 0,
+            nx2_collect_list_copies ? 2U : 1U}};
+        Tegra::MacroArgumentLifetime::Note(Tegra::MacroArgumentLifetime::Kind::GpuDeclared,
+                                          device_addr, size);
+    }
     if constexpr (!IS_OPENGL) {
         if (needs_sync) {
             Buffer& buffer = slot_buffers[buffer_id];
@@ -3504,6 +3553,9 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     bool has_stream_leap = false;
     auto expand_begin = [&](DAddr add_value) {
         static constexpr DAddr min_page = CACHING_PAGESIZE + Core::DEVICE_PAGESIZE;
+        if (begin <= min_page) {
+            return;
+        }
         if (add_value > begin - min_page) {
             begin = min_page;
             device_addr = Core::DEVICE_PAGESIZE;
@@ -3520,14 +3572,6 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         }
         end += add_value;
     };
-    if (begin == 0) {
-        return OverlapResult{
-            .ids = std::move(overlap_ids),
-            .begin = begin,
-            .end = end,
-            .has_stream_leap = has_stream_leap,
-        };
-    }
     for (; device_addr >> CACHING_PAGEBITS < Common::DivCeil(end, CACHING_PAGESIZE);
          device_addr += CACHING_PAGESIZE) {
         const BufferId overlap_id = page_table[device_addr >> CACHING_PAGEBITS];
@@ -3599,14 +3643,20 @@ template <class P>
 BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
                                       bool sparse_compatible) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferCreate};
+    const bool host_only = device_addr == 0;
     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
-    const OverlapResult overlap = ResolveOverlaps(device_addr, wanted_size);
+    const OverlapResult overlap =
+        host_only ? OverlapResult{.begin = device_addr, .end = device_addr_end}
+                  : ResolveOverlaps(device_addr, wanted_size);
     const u32 size = static_cast<u32>(overlap.end - overlap.begin);
     const BufferId new_buffer_id =
         slot_buffers.insert(runtime, overlap.begin, size, sparse_compatible);
     auto& new_buffer = slot_buffers[new_buffer_id];
+    if (host_only) {
+        new_buffer.MarkHostOnly();
+    }
     const size_t size_bytes = new_buffer.SizeBytes();
     runtime.ClearBuffer(new_buffer, 0, size_bytes, 0);
     new_buffer.MarkUsage(0, size_bytes);
@@ -3643,6 +3693,10 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
         lru_cache.Free(buffer.getLRUID());
     }
     const DAddr device_addr_begin = buffer.CpuAddr();
+    // Inline indices have no guest address; their host allocation must not cover guest pages.
+    if (buffer.IsHostOnly()) {
+        return;
+    }
     const DAddr device_addr_end = device_addr_begin + size;
     const u64 page_begin = device_addr_begin / CACHING_PAGESIZE;
     const u64 page_end = Common::DivCeil(device_addr_end, CACHING_PAGESIZE);
@@ -3822,6 +3876,14 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             u8* const src_pointer = staging_pointer.data() + copy.src_offset;
             const DAddr device_addr = buffer.CpuAddr() + copy.dst_offset;
             device_memory.ReadBlockUnsafe(device_addr, src_pointer, copy.size);
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                const Tegra::MacroArgumentLifetime::SourceScope source{{
+                    reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                    buffer.SizeBytes(), 6, 0}};
+                Tegra::MacroArgumentLifetime::Note(
+                    Tegra::MacroArgumentLifetime::Kind::UploadStaged, device_addr, copy.size,
+                    src_pointer);
+            }
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {
@@ -3873,6 +3935,12 @@ void BufferCache<P>::InlineMemoryImplementation(DAddr dest_address, size_t copy_
         }};
         u8* const src_pointer = upload_staging.mapped_span.data();
         std::memcpy(src_pointer, inlined_buffer.data(), copy_size);
+        if (Tegra::MacroArgumentLifetime::Enabled()) {
+            const Tegra::MacroArgumentLifetime::SourceScope source{{
+                reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(), buffer.SizeBytes(), 7, 0}};
+            Tegra::MacroArgumentLifetime::Note(
+                Tegra::MacroArgumentLifetime::Kind::UploadStaged, dest_address, copy_size, src_pointer);
+        }
         const bool can_reorder = runtime.CanReorderUpload(buffer, copies);
         runtime.CopyBuffer(buffer, upload_staging.buffer, copies, true, can_reorder);
     } else {
@@ -3895,6 +3963,9 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     u64 total_size_bytes = 0;
     for (const BufferId buffer_id : buffer_ids) {
         Buffer& buffer = slot_buffers[buffer_id];
+        if (buffer.IsHostOnly()) {
+            continue;
+        }
         const DAddr buffer_addr = buffer.CpuAddr();
         memory_tracker.ForEachDownloadRangeAndClear(
             buffer_addr, buffer.SizeBytes(), [&](u64 device_addr_out, u64 range_size) {
@@ -3944,6 +4015,9 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
 
 template <class P>
 void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
+    if (buffer.IsHostOnly()) {
+        return;
+    }
     boost::container::small_vector<BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     u64 largest_copy = 0;
@@ -3988,6 +4062,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             const VideoCore::DownloadLanding landing{landing_begin, landing_end};
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
             for (const BufferCopy& copy : copies) {
+                std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+                if (Tegra::MacroArgumentLifetime::Enabled()) {
+                    lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                        reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                        buffer.SizeBytes(), 1, 0});
+                }
                 WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + copy.src_offset,
                                       mapped.data() + copy.src_offset, copy.size);
             }
@@ -4012,6 +4092,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             // Undo the modified offset
             const u64 dst_offset = copy.dst_offset - download_staging.offset;
             const u8* copy_mapped_memory = mapped_memory + dst_offset;
+            std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                    reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                    buffer.SizeBytes(), 2, 0});
+            }
             WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
         }
     } else {
@@ -4022,6 +4108,12 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
             const VideoCore::DownloadLanding landing{copy_device_addr,
                                                      copy_device_addr + copy.size};
             const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+            std::optional<Tegra::MacroArgumentLifetime::SourceScope> lifetime_source;
+            if (Tegra::MacroArgumentLifetime::Enabled()) {
+                lifetime_source.emplace(Tegra::MacroArgumentLifetime::Source{
+                    reinterpret_cast<std::uintptr_t>(&buffer), buffer.CpuAddr(),
+                    buffer.SizeBytes(), 3, 0});
+            }
             WriteDownloadedMemory(cpu_written, copy_device_addr, immediate_buffer.data(), copy.size);
         }
     }
@@ -4031,12 +4123,17 @@ template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     const StutterTrace::SiteScope site{StutterTrace::Site::BufferDelete};
     ++buffer_deletions;
+    if (inline_buffer_id == buffer_id) {
+        inline_buffer_id = NULL_BUFFER_ID;
+    }
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }
-    read_trapped_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(),
-                                 slot_buffers[buffer_id].SizeBytes());
-    cpu_read_ranges.Subtract(slot_buffers[buffer_id].CpuAddr(), slot_buffers[buffer_id].SizeBytes());
+    Buffer& buffer = slot_buffers[buffer_id];
+    if (!buffer.IsHostOnly()) {
+        read_trapped_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
+        cpu_read_ranges.Subtract(buffer.CpuAddr(), buffer.SizeBytes());
+    }
     bool dirty_index{false};
     boost::container::small_vector<u64, NUM_VERTEX_BUFFERS> dirty_vertex_buffers;
     const auto scalar_replace = [buffer_id](Binding& binding) {
@@ -4072,8 +4169,7 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     InvalidateMultiRangeSegments(std::span{compute_segments}, buffer_id);
 
     // Mark the whole buffer as CPU written to stop tracking CPU writes
-    if (!do_not_mark) {
-        Buffer& buffer = slot_buffers[buffer_id];
+    if (!do_not_mark && !buffer.IsHostOnly()) {
         memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddr(), buffer.SizeBytes());
     }
 
@@ -4158,7 +4254,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         return NULL_BINDING;
     }
 
-    const bool reads_size_word = !(table_pointer && !is_written) && !native_pointer;
+    const bool reads_size_word =
+        !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
     const u32 alignment = runtime.GetStorageBufferAlignment();
     struct CachedBinding {
@@ -4192,30 +4289,36 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         u32 size = [&]() {
             const u32 memory_layout_size = static_cast<u32>((std::min)(
                 u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)}, u64{(std::numeric_limits<u32>::max)()}));
+            const u32 packed_size = static_cast<u32>(next_qword);
+            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
+                                            packed_size != 0 && packed_size <= memory_layout_size;
+            const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
+            const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
             // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
             // 1 GiB). Ocarina of Time's grass instances lie 12-18 MiB past theirs (an 8 MiB cap
             // culled every blade), and its light probe records reach about 130 MiB past theirs: a
             // 64 MiB cap left the far probes outside the binding, and the fog took one overbright
-            // constant from them. A native (Switch 2) compute pointer has no size either, and
-            // Mario Kart World's lighting passes read past 8 MiB from theirs: capped there, the
-            // reads came back zero and lit land and characters too dark. Written bindings keep
-            // a cap: a write marks the whole binding GPU-modified.
-            const bool native_compute = native_pointer && compute;
-            if ((table_pointer || native_compute) && !is_written) {
-                const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
-                const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
+            // constant from them. Written pools keep a cap: a write marks the whole binding
+            // GPU-modified.
+            if (table_pointer && !is_written) {
                 return (std::min)(memory_layout_size, limit);
             }
             // A native compute program's pointer is bare: the word after it is another parameter
             // (a dimension, stride or texture handle), not an NVN buffer size. Taking it as one
             // bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
+                // word after the pointer (Eglantine #609 reads it): capped at 8 MiB those reads
+                // came back zero and lit land and characters too dark. A read-only compute binding
+                // takes a larger size word. Binding to the end of the mapping instead spanned
+                // Ocarina of Time's ~1 GiB heap and backed it with a 1 GiB buffer.
+                if (compute && !is_written && next_qword_is_size && packed_size > bare) {
+                    return (std::min)(packed_size, limit);
+                }
+                return bare;
             }
-            const u32 packed_size = static_cast<u32>(next_qword);
-            const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
-                                            packed_size != 0 && packed_size <= memory_layout_size;
             if (next_qword_is_size) {
                 return packed_size;
             }
@@ -4228,10 +4331,15 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
             if (native_pointer && compute) {
                 static std::atomic<u64> computed{}, past_cap{}, at_gap{}, logged{};
+                static std::atomic<u32> largest{};
                 static std::atomic<s64> next_log{};
                 const u64 total = computed.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (size > 8_MiB) {
                     past_cap.fetch_add(1, std::memory_order_relaxed);
+                    u32 seen = largest.load(std::memory_order_relaxed);
+                    while (size > seen &&
+                           !largest.compare_exchange_weak(seen, size, std::memory_order_relaxed)) {
+                    }
                 }
                 if (size < wanted) {
                     at_gap.fetch_add(1, std::memory_order_relaxed);
@@ -4247,9 +4355,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                     next_log.compare_exchange_strong(due, now + 10)) {
                     logged.store(long_bindings + gap_bindings, std::memory_order_relaxed);
                     LOG_INFO(HW_GPU,
-                             "Native compute storage bindings: {} reach past the old 8 MiB cap, "
-                             "{} stop at a mapping gap, of {} bound",
-                             long_bindings, gap_bindings, total);
+                             "Native compute storage bindings: {} reach past 8 MiB through their "
+                             "size word (largest {:#x} bytes), {} stop at a mapping gap, of {} "
+                             "bound",
+                             long_bindings, largest.load(std::memory_order_relaxed), gap_bindings,
+                             total);
                 }
             }
         }

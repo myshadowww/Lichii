@@ -13,7 +13,7 @@ namespace VideoCore::NeuralRendering {
 namespace {
 std::mutex status_mutex;
 RuntimeStatus status;
-std::atomic<std::uint64_t> frames{};
+std::atomic<std::uint64_t> frames{}, exposure_resets{};
 } // namespace
 
 std::filesystem::path UserFolder() {
@@ -24,6 +24,7 @@ RuntimeStatus GetStatus() {
     std::scoped_lock lock{status_mutex};
     auto result = status;
     result.submitted_frames = frames.load(std::memory_order_relaxed);
+    result.exposure_history_resets = exposure_resets.load(std::memory_order_relaxed);
     return result;
 }
 
@@ -31,6 +32,7 @@ void ResetStatus() {
     std::scoped_lock lock{status_mutex};
     status = {};
     frames = 0;
+    exposure_resets = 0;
 }
 
 void ReportReady() {
@@ -53,7 +55,12 @@ void ReportFailure(std::string error) {
     status.error = std::move(error);
 }
 
-void ReportFrame() {
+void ReportFrame(bool exposure_changed) {
     ++frames;
+    if (exposure_changed) {
+        const auto count = ++exposure_resets;
+        if (count <= 4 || count % 120 == 0)
+            LOG_INFO(Render_Vulkan, "NR reference exposure changed: {} history resets", count);
+    }
 }
 } // namespace VideoCore::NeuralRendering

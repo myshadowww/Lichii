@@ -37,6 +37,7 @@ class NvidiaDlssUpscaler {
         VkFormat format;
         VkImageSubresourceRange range;     ///< The view's level and layer, with the view's aspect.
         VkImageAspectFlags barrier_aspect; ///< Every aspect of the image's format.
+        VkExtent2D extent{}; ///< Actual view extent; zero uses the active render/output size.
     };
 
     struct Inputs {
@@ -52,11 +53,16 @@ class NvidiaDlssUpscaler {
         bool reset;
         bool depth_inverted = true;
         bool hdr = true; ///< Linear HDR colour. False for tonemapped, perceptually encoded colour.
+        bool dynamic_resolution =
+            false; ///< Opt in to dynamic input range and maximum L/M allocation.
+        f32 neural_reference_white =
+            1.0f; ///< Scene-linear reference white for NR only; no DLSS exposure change.
+        std::array<f32, 3> neural_reference_exposure{}; ///< Optional base, extra, luminance cap.
     };
 
     /// Throws vk::Exception when the runtime has no DLSS for this device.
-    explicit NvidiaDlssUpscaler(const Device &device, Scheduler &scheduler,
-                                MemoryAllocator &memory_allocator);
+    explicit NvidiaDlssUpscaler(const Device& device, Scheduler& scheduler,
+                                MemoryAllocator& memory_allocator);
     ~NvidiaDlssUpscaler();
 
     /// Records one evaluation into the output image (RGBA16F at the upscale size, GENERAL
@@ -99,6 +105,16 @@ class NvidiaDlssUpscaler {
     NVSDK_NGX_Handle *feature{};
     NVSDK_NGX_Parameter *parameters{};
     bool depth_inverted = true;
+    bool dynamic_resolution{};
+    // Written on the scheduler worker; the renderer reads these only after WaitWorker().
+    VkExtent2D feature_min_extent{}, feature_max_extent{};
+    VkExtent2D requested_min_extent{}, requested_max_extent{};
+    VkExtent2D unsupported_render_extent{}, unsupported_output_extent{};
+    Settings::NvidiaDlssQuality unsupported_quality{};
+    Settings::NvidiaDlssPreset unsupported_preset{};
+    bool unsupported_dynamic_resolution{};
+    bool unsupported_input{};
+    bool pending_history_reset{};
 #else
     void *set_options{}; ///< slDLSSSetOptions
     void *get_state{}; ///< slDLSSGetState

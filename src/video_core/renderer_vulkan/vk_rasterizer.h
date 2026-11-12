@@ -31,6 +31,11 @@
 #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#ifdef EGLANTINE_NVIDIA_DLSS
+#include "video_core/renderer_vulkan/vk_scene_upscale.h"
+#include "video_core/renderer_vulkan/vk_mario_kart_motion.h"
+#include "video_core/renderer_vulkan/vk_yoshi_motion.h"
+#endif
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
@@ -162,7 +167,8 @@ public:
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                                    const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
                                    std::array<f32, 2> motion_scale, bool use_history = true,
-                                   bool reset_history = false) override;
+                                   bool reset_history = false,
+                                   std::optional<std::array<u32, 2>> render_region = std::nullopt) override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -192,7 +198,7 @@ private:
     static constexpr VkDeviceSize DEFAULT_BUFFER_SIZE = 4 * sizeof(float);
 
     template <typename Func>
-    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false);
+    void PrepareDraw(bool is_indexed, Func&&, bool is_indirect = false, u32 instance_count = 0);
 
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
@@ -248,11 +254,33 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
+    bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
     /// EDEN_NX2_PENDING_WRITE_TRACE: logs bound buffer ranges with collected, unapplied CPU writes.
     void TracePendingCpuWrites(bool compute, std::span<const u64> shader_hashes);
     bool OcarinaTemporalEnabled() const;
     void TrackOcarinaCamera();
+    void TrackMarioKartDraw(const GraphicsPipeline& pipeline, bool indexed, bool indirect,
+                            u32 instance_count);
+#ifdef EGLANTINE_NVIDIA_DLSS
+    bool TryMarioKartUpscale(VideoCommon::ImageViewId color, VideoCommon::ImageViewId target,
+                            const SceneUpscaler::OutputTransform& transfer);
+#endif
+    void TrackPokopiaDraw(const GraphicsPipeline& pipeline);
+    bool TryPokopiaUpscale(VideoCommon::ImageViewId color);
+    void TrackRaidersDraw(const GraphicsPipeline& pipeline);
+    void TrackOrbitalsDraw(const GraphicsPipeline& pipeline, bool indexed, bool indirect,
+                           u32 instance_count);
+    void TrackRaidersCompute(const ComputePipeline& pipeline);
+    bool TryRaidersUpscale(VideoCommon::ImageViewId color, VideoCommon::ImageViewId target);
+    void TrackKirbyDraw(const GraphicsPipeline& pipeline);
+    void TrackKirbyCompute(const ComputePipeline& pipeline, u64 native_key);
+    bool TryKirbyUpscale(VideoCommon::ImageViewId target);
+    void TrackBananzaDraw(const GraphicsPipeline& pipeline);
+    void TrackBananzaCompute(const ComputePipeline& pipeline);
+    void TrackYoshiCompute(const ComputePipeline& pipeline, u64 native_key);
+    bool TryBananzaUpscale(VideoCommon::ImageViewId color, VideoCommon::ImageViewId target);
     void TrackStarFoxDraw(const GraphicsPipeline& pipeline);
     bool TryStarFoxGameplay(VideoCommon::ImageViewId input, VideoCommon::ImageViewId output);
     /// Offsets the viewport of Ocarina's scene draws (depth-tested, into the scene depth) by a
@@ -313,6 +341,122 @@ private:
         GPUVAddr color_address{};
         std::array<f32, 2> jitter{};
     } starfox_gameplay;
+#ifdef EGLANTINE_NVIDIA_DLSS
+    struct YoshiSceneTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{}, map_serial{};
+        GPUVAddr depth_address{}, motion_address{};
+        VkImage depth_image{}, motion_image{};
+        std::array<u8, 64> constants{};
+        std::array<f32, 3> position{}, direction{}, projection{};
+        std::array<f32, 2> projection_jitter{};
+    } yoshi_scene, yoshi_previous;
+    std::unique_ptr<YoshiMotion> yoshi_motion;
+    std::unique_ptr<SceneUpscaler> yoshi_upscaler;
+    bool yoshi_enabled{}, yoshi_failed{};
+    const char* yoshi_fallback_reason{};
+
+    struct MarioKartSceneTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{}, map_serial{};
+        GPUVAddr depth_address{}, color_address{};
+        VkImage depth_image{}, color_image{};
+        VideoCommon::ImageViewId depth{};
+        VkExtent2D extent{};
+        VideoCommon::MarioKartUpscale::Camera camera{};
+        VideoCommon::MarioKartUpscale::Curvature bend{};
+        bool graded{}, evaluated{};
+    } mario_kart_scene;
+    std::unique_ptr<MarioKartMotion> mario_kart_motion;
+    std::unique_ptr<SceneUpscaler> mario_kart_upscaler;
+    bool mario_kart_enabled{}, mario_kart_failed{};
+    const char* mario_kart_fallback_reason{};
+
+    struct OrbitalsSceneTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{}, map_serial{};
+        VideoCommon::ImageViewId depth{}, color{};
+        GPUVAddr depth_address{}, color_address{};
+        VkImage depth_image{}, color_image{};
+        SceneUpscaler::Camera camera{};
+        bool evaluated{};
+    };
+    std::array<OrbitalsSceneTrace, 2> orbitals_scenes{};
+    std::array<std::unique_ptr<SceneUpscaler>, 2> orbitals_upscalers{};
+    bool orbitals_enabled{}, orbitals_failed{};
+    const char* orbitals_fallback_reason{};
+
+    struct RaidersSceneTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{}, map_serial{};
+        VideoCommon::ImageViewId depth{}, linear{}, resolved{};
+        GPUVAddr depth_address{}, hdr_address{}, linear_address{}, resolved_address{};
+        VkImage depth_image{}, hdr_image{}, linear_image{}, resolved_image{};
+        SceneUpscaler::Camera camera{};
+        bool gamma_resolve{}, evaluated{};
+    } raiders_scene;
+    std::unique_ptr<SceneUpscaler> raiders_upscaler;
+    bool raiders_enabled{}, raiders_failed{};
+    const char* raiders_fallback_reason{};
+
+    struct PokopiaSceneTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{}, map_serial{};
+        GPUVAddr depth_address{}, hdr_address{};
+        VkImage depth_image{}, hdr_image{};
+        VideoCommon::ImageViewId depth{}, hdr{};
+        SceneUpscaler::Camera camera{};
+        bool evaluated{};
+    } pokopia_scene;
+    std::unique_ptr<SceneUpscaler> pokopia_upscaler;
+    bool pokopia_enabled{}, pokopia_failed{};
+    const char* pokopia_fallback_reason{};
+
+    struct KirbyImageTrace {
+        VideoCommon::ImageViewId id{};
+        GPUVAddr address{};
+        VkImage image{};
+        u64 tick{};
+    };
+    struct KirbySceneTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{}, map_serial{};
+        VkExtent2D extent{};
+        std::array<std::byte, 0x210> camera_bytes{};
+        SceneUpscaler::Camera camera{};
+        KirbyImageTrace depth_attachment{}, depth{}, linear{}, resolved{};
+        std::array<KirbyImageTrace, 4> hdr{};
+        bool tonemapped{}, evaluated{};
+    } kirby_scene;
+    std::unique_ptr<SceneUpscaler> kirby_upscaler;
+    const Tegra::MemoryManager* kirby_origin_channel{};
+    std::array<s32, 3> kirby_reference_origin{};
+    bool kirby_enabled{}, kirby_failed{};
+    const char* kirby_fallback_reason{};
+
+    struct BananzaCameraTrace {
+        const Tegra::MemoryManager* channel{};
+        u64 frame{}, map_serial{};
+        GPUVAddr color_address{}, depth_address{};
+        VkImage color_image{}, depth_image{};
+        VideoCommon::ImageViewId color_view{}, depth_view{};
+        VkExtent2D extent{};
+        SceneUpscaler::Camera camera{};
+    };
+    std::array<BananzaCameraTrace, 8> bananza_cameras{};
+    struct BananzaSceneTrace {
+        BananzaCameraTrace camera{};
+        VideoCommon::ImageViewId depth{}, color{};
+        GPUVAddr color_address{};
+        VkImage color_image{}, depth_image{};
+        u64 tonemap_frame{}, resolve_frame{};
+    } bananza_scene;
+    std::unique_ptr<SceneUpscaler> bananza_upscaler;
+    bool bananza_enabled{};
+    bool bananza_failed{};
+    const char* bananza_fallback_reason{};
+    std::array<std::array<u32, 6>, 16> bananza_traced_attachment_shapes{};
+#endif
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
     struct OcarinaMotionTrace {

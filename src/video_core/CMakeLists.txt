@@ -99,6 +99,9 @@ add_library(video_core STATIC
     host1x/vic.h
     macro.cpp
     macro.h
+    macro_failure_capture.h
+    macro_argument_trace.h
+    macro_argument_lifetime.h
     macro_memo.h
     macro_turing.h
     fence_manager.h
@@ -161,6 +164,8 @@ add_library(video_core STATIC
     renderer_vulkan/present/fsr3.h
     renderer_vulkan/present/fxaa.cpp
     renderer_vulkan/present/fxaa.h
+    renderer_vulkan/present/hdr_convert.cpp
+    renderer_vulkan/present/hdr_convert.h
     renderer_vulkan/present/layer.cpp
     renderer_vulkan/present/layer.h
     renderer_vulkan/present/present_push_constants.h
@@ -184,6 +189,9 @@ add_library(video_core STATIC
     renderer_vulkan/pipeline_build_failure.cpp
     renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
+    renderer_vulkan/pipeline_eviction_policy.h
+    renderer_vulkan/retained_graphics_stages.h
+    renderer_vulkan/volume_clear.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
     renderer_vulkan/pipeline_shader_emission.h
@@ -312,6 +320,7 @@ add_library(video_core STATIC
     shader_environment.cpp
     shader_environment.h
     evicted_pointer_slots.h
+    bounded_store.h
     shader_handle_program.h
     shader_jobs.cpp
     shader_jobs.h
@@ -635,6 +644,13 @@ if (ENABLE_NVIDIA_DLSS)
     target_sources(video_core PRIVATE
         renderer_vulkan/vk_nvidia_dlss.cpp
         renderer_vulkan/vk_nvidia_dlss.h
+        renderer_vulkan/scene_camera_math.h
+        renderer_vulkan/vk_yoshi_motion.cpp
+        renderer_vulkan/vk_yoshi_motion.h
+        renderer_vulkan/vk_mario_kart_motion.cpp
+        renderer_vulkan/vk_mario_kart_motion.h
+        renderer_vulkan/vk_scene_upscale.cpp
+        renderer_vulkan/vk_scene_upscale.h
         renderer_vulkan/vk_starfox_dlss.cpp
         renderer_vulkan/vk_starfox_dlss.h
         vulkan_common/nvidia_dlss.h)

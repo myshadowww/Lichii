@@ -22,6 +22,7 @@
 #include "common/scratch_buffer.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/puller.h"
+#include "video_core/macro_argument_trace.h"
 
 namespace Core {
 class System;
@@ -124,6 +125,7 @@ struct CommandList final {
     /// executed instead of the memory, which the game may already be refilling for a later frame.
     std::vector<CommandHeader> submitted_words;
     std::vector<u32> submitted_offsets;
+    std::vector<u64> argument_lifetime_snapshots; // Diagnostic IDs; bounded to4096 entries.
     /// Entries (ascending) not copied when submitted, because a GPU map still queued covers them:
     /// DmaPusher::Push copies them after the map, and until then they read memory.
     std::vector<u32> deferred_entries;
@@ -131,6 +133,7 @@ struct CommandList final {
     /// that waited behind one, reads memory instead: games write the commands it runs before they
     /// release the acquire.
     u64 snapshot_suspensions = 0;
+    u64 argument_trace_submission{}, argument_trace_revision{};
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -157,6 +160,9 @@ public:
     ~DmaPusher();
 
     void Push(CommandList&& entries) {
+        if (MacroArgumentTrace::Enabled()) {
+            entries.argument_trace_submission = ++argument_trace_sequence;
+        }
         // Copied during a suspension, or behind one: copy again now, unless still suspended.
         const u64 now = suspensions.load(std::memory_order_acquire);
         if (!entries.submitted_offsets.empty() && (now & 1) == 0) {
@@ -214,6 +220,10 @@ public:
     void DumpCurrentEntry(const char* reason);
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash);
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
+    MacroArgumentTrace::Parse ArgumentTraceContext(MacroArgumentTrace::Source source,
+                                                   bool gpu_written, bool safe_read) const;
+    u64 argument_trace_sequence{};
+    MacroArgumentTrace::Packet argument_trace_packet{};
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
     /// A copy engine method sent to the split's back: a launch that releases its semaphore tells

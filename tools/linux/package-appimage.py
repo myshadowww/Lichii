@@ -100,7 +100,7 @@ def main():
     appdir = output / "AppDir"
     bindir = appdir / "usr/bin"
     bindir.mkdir(parents=True)
-    for name in ("lichii", "libnxformat.so", "nx2-precompile"):
+    for name in ("lichii", "nx2-precompile"):
         shutil.copy2(app / "usr/bin" / name, bindir / name)
     (bindir / "nx2_switches.txt").write_text(switches.rstrip() + "\n")
     # Copy only runtime files. Profiles, shaders extracted from games, downloaded
@@ -129,7 +129,7 @@ def main():
     shutil.copy2(source / "dist/lichii.png", icon)
     env = os.environ.copy()
     env.update(APPIMAGE_EXTRACT_AND_RUN="1", NO_STRIP="1", ARCH="x86_64")
-    # The local installation may carry a matching QtCharts build outside /usr/lib.
+    # The local installation may carry matching Qt libraries outside /usr/lib.
     qt_libs = run(args.qmake, "-query", "QT_INSTALL_LIBS")
     env["LD_LIBRARY_PATH"] = str(app / "usr/lib") + ":" + qt_libs + (
         ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")

@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D scene_depth;
+layout(binding=1,rg16f) writeonly uniform image2D motion_out;
+layout(binding=2,std140) uniform Parameters {
+    vec4 view[3];
+    vec4 projection; // fx, fy, off-center Y, depth A
+    vec4 depth; // depth B, reset, unused
+    vec4 previous_vp[4];
+    vec4 current_bend; // center XZ, threshold, radius
+    vec4 previous_bend;
+    uvec4 extent;
+} p;
+bool finite3(vec3 x) { return !any(isnan(x)) && !any(isinf(x)); }
+bool unbend(inout vec3 w, vec4 b) {
+    vec2 delta=w.xz-b.xy;
+    float radial=length(delta);
+    if(radial<=b.z) return true;
+    float y=w.y+b.w;
+    if(y<=0.0) return false;
+    vec2 shifted=vec2(radial-b.z,y);
+    float distance=b.z+b.w*atan(shifted.x,shifted.y);
+    w=vec3(b.x+delta.x/radial*distance,length(shifted)-b.w,
+           b.y+delta.y/radial*distance);
+    return finite3(w);
+}
+bool bend(inout vec3 w, vec4 b) {
+    vec2 delta=w.xz-b.xy;
+    float distance=length(delta);
+    if(distance<=b.z) return true;
+    float angle=(distance-b.z)/b.w;
+    if(w.y+b.w<=0.0 || angle<=0.0 || angle>=1.57079632679) return false;
+    float radial=b.z+(w.y+b.w)*sin(angle);
+    w=vec3(b.x+delta.x/distance*radial,(w.y+b.w)*cos(angle)-b.w,
+           b.y+delta.y/distance*radial);
+    return finite3(w);
+}
+void main() {
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(pixel,ivec2(p.extent.xy)))) return;
+    vec2 motion=vec2(0.0);
+    vec2 uv=(vec2(pixel)+0.5)/vec2(p.extent.xy);
+    float d=texelFetch(scene_depth,pixel,0).r;
+    if(p.depth.y==0.0 && d>=0.0 && d<=1.0) {
+        vec2 ndc=uv*vec2(2.0,-2.0)+vec2(-1.0,1.0);
+        float z=-p.depth.x/(2.0*d-1.0+p.projection.w);
+        vec3 v=vec3(-ndc.x*z/p.projection.x,
+                    (-ndc.y*z-p.projection.z*z)/p.projection.y,z);
+        vec3 translated=v-vec3(p.view[0].w,p.view[1].w,p.view[2].w);
+        vec3 w=translated.x*p.view[0].xyz+translated.y*p.view[1].xyz+
+               translated.z*p.view[2].xyz;
+        if(finite3(w) && unbend(w,p.current_bend) && bend(w,p.previous_bend)) {
+            vec4 h=vec4(w,1.0);
+            vec4 clip=vec4(dot(p.previous_vp[0],h),dot(p.previous_vp[1],h),
+                           dot(p.previous_vp[2],h),dot(p.previous_vp[3],h));
+            if(clip.w>0.00001) {
+                vec2 prev=clip.xy/clip.w*vec2(0.5,-0.5)+vec2(0.5);
+                vec2 candidate=(prev-uv)*vec2(p.extent.xy);
+                if(!any(isnan(candidate)) && !any(isinf(candidate)) &&
+                   all(lessThanEqual(abs(candidate),vec2(32752.0)))) motion=candidate;
+            }
+        }
+    }
+    imageStore(motion_out,pixel,vec4(motion,0.0,0.0));
+}

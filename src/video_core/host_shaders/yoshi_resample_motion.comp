@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D native_motion;
+layout(binding = 1, rg16f) uniform writeonly image2D motion;
+layout(push_constant) uniform Parameters {
+    uvec2 render_extent;
+    uvec2 output_extent;
+} params;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, ivec2(params.render_extent)))) return;
+    // Native temporal 85237f4449a5ebe7: nearest((p+.5)*output/render-.5), then
+    // convert its output-pixel displacement to input pixels. Do not filter object edges.
+    vec2 ratio = vec2(params.output_extent) / vec2(params.render_extent);
+    ivec2 source = clamp(ivec2(floor((vec2(pixel) + .5) * ratio)),
+                          ivec2(0), ivec2(params.output_extent) - 1);
+    vec2 value = texelFetch(native_motion, source, 0).rg / ratio;
+    if (any(isnan(value)) || any(isinf(value))) value = vec2(0);
+    imageStore(motion, pixel, vec4(value, 0, 0));
+}

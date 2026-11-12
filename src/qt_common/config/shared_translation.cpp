@@ -142,6 +142,34 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            "other race conditions."));
 
     // Renderer
+    INSERT(Settings, hdr_mode, tr("HDR output:"),
+           tr("HDR output for games with an HDR mode. Requires Vulkan.\n"
+              "Off (default): always SDR.\n"
+              "Auto: HDR while Windows HDR (\"Use HDR\") is on for the monitor that shows the "
+              "game, SDR otherwise and on hosts that cannot tell.\n"
+              "On: HDR whenever the display driver offers an HDR format.\n"
+              "The game is told the display is HDR only while Lichii really presents HDR. SDR "
+              "games and menus are shown at the reference white.\n"
+              "While HDR is active, anti-aliasing, post-processing, FSR/SGSR upscaling and frame "
+              "generation are off and the window is scaled bilinearly.\n"
+              "Screenshots are tone mapped to SDR."));
+    INSERT(Settings, hdr_swapchain, tr("HDR format:"),
+           tr("HDR10: 10-bit PQ, what HDR displays take.\n"
+              "scRGB: 16-bit float. Try it if HDR shows banding, which some NVIDIA drivers do "
+              "with 10-bit in fullscreen."));
+    INSERT(Settings, hdr_reference_white, tr("HDR Reference White"),
+           tr("Reference white in nits reported to the game, the brightness of its HUD and "
+              "menus. 0 (default): Windows' SDR content brightness for the monitor, so the game "
+              "matches the desktop; elsewhere the Switch 2 calibration, HDR Peak Luminance "
+              "divided by 1.5, rounded up and clamped to 50-300 nits.\n"
+              "SDR games and menus are shown at this brightness while HDR is active, and HDR "
+              "screenshots map it to SDR white."));
+    INSERT(Settings, hdr_peak_luminance, tr("HDR Peak Luminance"),
+           tr("Peak luminance in nits reported to the game, which tone maps to it. 0 (default): "
+              "the monitor's peak from its EDID as Windows reports it; elsewhere 300 nits, the "
+              "Switch 2 HDR calibration's starting value.\n"
+              "Also the HDR10 metadata peak, and what an HDR image rolls off to on an SDR "
+              "screen."));
     INSERT(Settings, renderer_backend, tr("API:"),
            tr("Changes the output graphics API.\nVulkan is recommended."));
     INSERT(Settings, vulkan_device, tr("Device:"),
@@ -150,7 +178,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Forces to render at a different resolution.\n"
               "Higher resolutions require more VRAM and bandwidth.\n"
               "Options lower than 1X can cause artifacts."));
-    INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"), QString());
+    INSERT(Settings, scaling_filter, tr("Window Adapting Filter:"),
+           tr("Bilinear while HDR output is active."));
     INSERT(Settings, game_dlss_network, tr("Use the game's own DLSS"),
            tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
               "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "
@@ -177,13 +206,13 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "current AMD driver.\nNeeds AMD's FidelityFX runtime, which Lichii downloads from "
               "AMD when you ask. The files are AMD's, under AMD's licence. Without them, or if FSR 4 "
               "can't run, FSR 3.1 is used. Takes effect when a game starts."));
-    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
-           tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
-              "instead of AMD FSR 3.1.\nRequires NVIDIA's runtime files. Use the setup controls "
+    INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS for supported games (experimental)"),
+           tr("Uses NVIDIA DLSS to reconstruct supported games and scenes on NVIDIA RTX GPUs.\n"
+              "Requires NVIDIA's runtime files. Use the setup controls "
               "below to download or locate them. Windows uses Streamline; Linux uses native NGX.\n"
-              "Fire Emblem: Fortune's Weave also needs "
-              "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "Fire Emblem: Fortune's Weave uses temporal replacement while this is enabled; "
+              "otherwise its spatial workaround remains active.\n"
+              "In The Legend of Zelda: Ocarina of Time it replaces the game's "
               "upscaler at 1x resolution scale.\n"
 #ifdef __linux__
               "Can be switched during gameplay with Apply. Install the runtime files before "
@@ -193,9 +222,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
 #endif
               ));
     INSERT(Settings, nvidia_dlss_quality, tr("NVIDIA DLSS quality:"),
-           tr("Applies only when a game uses its own DLSS.\nAutomatic selects a mode for the "
-              "game's render/output sizes. Native (DLAA) "
-              "applies anti-aliasing at the game's render resolution, then scales to its output; "
+           tr("Applies to supported games and scenes.\nAutomatic selects a mode for the "
+              "game's render/output sizes. Native (DLAA) requests anti-aliasing at the game's "
+              "render resolution, where supported by its integration; "
               "Ocarina's 1440p mode stays at 1440p instead of reconstructing to 4K.\n"
               "Explicit modes only apply when the game's render size is within NVIDIA's "
               "supported range; otherwise Automatic is used and the fallback is logged. "
@@ -203,7 +232,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "playing."));
     INSERT(
         Settings, nvidia_dlss_preset, tr("NVIDIA DLSS model preset:"),
-        tr("Applies only when a game uses its own DLSS.\nM (DLSS 4.5) is Lichii's default for "
+        tr("Applies to supported games and scenes.\nM (DLSS 4.5) is Lichii's default for "
            "every quality mode. NVIDIA recommends K for "
            "DLAA/Quality/Balanced, M for Performance, and L for Ultra Performance.\n"
            "L/M cost more on RTX 20/30 GPUs; consider K. J may reduce ghosting but flicker more. "
@@ -234,7 +263,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "neural history."));
     INSERT(Settings, anti_aliasing, tr("Anti-Aliasing Method:"),
            tr("The anti-aliasing method to use.\nSMAA offers the best quality.\nFXAA "
-              "can produce a more stable picture in lower resolutions."));
+              "can produce a more stable picture in lower resolutions.\nOff while HDR output "
+              "is active."));
     INSERT(Settings, oot_anti_aliasing, tr("Ocarina of Time anti-aliasing:"),
            tr("The Legend of Zelda: Ocarina of Time only.\nGame: the game's own anti-aliasing "
               "network, which sharpens heavily.\nNo sharpening: the image as the game renders it, "
@@ -297,7 +327,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, bg_green, QString(), QString());
     INSERT(Settings, bg_blue, QString(), QString());
 
-    INSERT(Settings, frame_gen, tr("Enable Frame Generation"), QString());
+    INSERT(Settings, frame_gen, tr("Enable Frame Generation"),
+           tr("Paused while HDR output is active."));
     INSERT(Settings, frame_gen_type, tr("Frame Generation Type"), QString());
     INSERT(Settings, frame_gen_multiplier, tr("Frame Generation Multiplier"), QString());
     INSERT(Settings, frame_gen_target_rate, tr("Target Frame Rate"), QString());
@@ -375,6 +406,12 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "later launches only build what is new, until the GPU driver changes. The loading "
               "screen has a Skip button.\nAsk asks at launch while the game has never been "
               "precached."));
+    INSERT(Settings, build_all_cached_shaders, tr("Build all cached shaders before game start"),
+           tr("Builds every shader saved by earlier play sessions on the loading screen and keeps "
+              "them built, so places you visited long ago don't stutter. Without it, only the "
+              "shaders of recent sessions are built there and the rest in the background or when "
+              "the game first needs them.\nLoading takes longer and uses more memory, about 0.3 "
+              "MB per shader, up to a quarter of the RAM. Takes effect when a game starts."));
     INSERT(Settings, native_async_draws, tr("Switch 2 draws with unbuilt pipelines:"),
            tr("Only applies when asynchronous shader building is on. Decides what a Switch 2 draw "
               "does when its graphics pipeline is still building.\n"
@@ -677,6 +714,17 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(NeuralRendering, Standard, tr("Standard")),
                               PAIR(NeuralRendering, Natural, tr("Natural")),
                               PAIR(NeuralRendering, Cinematic, tr("Cinematic")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::HdrMode>::Index(),
+                          {
+                              PAIR(HdrMode, Off, tr("Off")),
+                              PAIR(HdrMode, Auto, tr("Auto")),
+                              PAIR(HdrMode, On, tr("On")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::HdrSwapchain>::Index(),
+                          {
+                              PAIR(HdrSwapchain, Hdr10, tr("HDR10 (10-bit)")),
+                              PAIR(HdrSwapchain, Scrgb, tr("scRGB (16-bit float)")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::AspectRatio>::Index(),
                           {

@@ -186,6 +186,11 @@ bool DmaPusher::Step() {
 
     if (prefetch_size > 0) {
         const std::span<const CommandHeader> commands{command_list.prefetch_command_list};
+        std::optional<MacroArgumentTrace::ParseScope> argument_trace;
+        if (MacroArgumentTrace::Enabled()) {
+            argument_trace.emplace(
+                ArgumentTraceContext(MacroArgumentTrace::Source::Prefetched, false, false));
+        }
         command_resume_offset +=
             ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         if (puller.HasPendingAcquire()) {
@@ -321,8 +326,31 @@ bool DmaPusher::Step() {
                 header.size};
             RecordParsedEntry(header, commands);
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Submitted);
+            std::optional<MacroArgumentTrace::ParseScope> argument_trace;
+            if (MacroArgumentTrace::Enabled()) {
+                argument_trace.emplace(ArgumentTraceContext(
+                    MacroArgumentTrace::Source::SubmittedSnapshot, gpu_written, use_safe));
+            }
             command_resume_offset += ProcessCommands(commands, 0);
         } else if (use_safe) {
+            // Diagnostic-only observation, not a substitute for the existing SafeRead below.
+            // Short macro payloads can continue from a header in the preceding GP entry.
+            std::optional<MacroArgumentTrace::PreSafeReadObservation> pre_safe_read;
+            if (MacroArgumentTrace::Enabled() && header.size <= MacroArgumentTrace::MaxWords &&
+                dma_state.method_count != 0 && dma_state.method >= MacroRegistersStart &&
+                subchannels[dma_state.subchannel] &&
+                subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D) {
+                auto& observation = pre_safe_read.emplace();
+                observation.entry_gpuva = dma_state.dma_get;
+                observation.count = static_cast<u32>(header.size);
+                if (const auto device = memory_manager.GpuToCpuAddress(dma_state.dma_get)) {
+                    observation.entry_device = *device;
+                    observation.device_known = true;
+                }
+                memory_manager.ReadBlockUnsafe(dma_state.dma_get, observation.words.data(),
+                                               header.size * sizeof(u32));
+                observation.available = true;
+            }
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -330,6 +358,15 @@ bool DmaPusher::Step() {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Safe);
+            std::optional<MacroArgumentTrace::ParseScope> argument_trace;
+            if (MacroArgumentTrace::Enabled()) {
+                auto context = ArgumentTraceContext(
+                    MacroArgumentTrace::Source::SafeRead, gpu_written, use_safe);
+                if (pre_safe_read) {
+                    context.pre_safe_read = *pre_safe_read;
+                }
+                argument_trace.emplace(context);
+            }
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else if (bool pending = false;
@@ -346,6 +383,11 @@ bool DmaPusher::Step() {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Copy);
+            std::optional<MacroArgumentTrace::ParseScope> argument_trace;
+            if (MacroArgumentTrace::Enabled()) {
+                argument_trace.emplace(ArgumentTraceContext(
+                    MacroArgumentTrace::Source::GpuReadback, gpu_written, use_safe));
+            }
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
@@ -357,6 +399,11 @@ bool DmaPusher::Step() {
                 CheckLiveRead(live_read_reason, header, commands, submitted_copy);
             }
             Nx2CmdPageDiag::CountEntry(Nx2CmdPageDiag::Path::Slow);
+            std::optional<MacroArgumentTrace::ParseScope> argument_trace;
+            if (MacroArgumentTrace::Enabled()) {
+                argument_trace.emplace(ArgumentTraceContext(
+                    MacroArgumentTrace::Source::UnsafeRead, gpu_written, use_safe));
+            }
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         }
@@ -456,16 +503,28 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             // No command active - this is the first word of a new one
             switch (command_header.mode) {
             case SubmissionMode::Increasing:
+                if (MacroArgumentTrace::Enabled()) {
+                    MacroArgumentTrace::NotePacket(argument_trace_packet, command_header.argument,
+                                                   word_offset + index, false);
+                }
                 SetState(command_header);
                 dma_state.non_incrementing = false;
                 dma_increment_once = false;
                 break;
             case SubmissionMode::NonIncreasing:
+                if (MacroArgumentTrace::Enabled()) {
+                    MacroArgumentTrace::NotePacket(argument_trace_packet, command_header.argument,
+                                                   word_offset + index, false);
+                }
                 SetState(command_header);
                 dma_state.non_incrementing = true;
                 dma_increment_once = false;
                 break;
             case SubmissionMode::Inline:
+                if (MacroArgumentTrace::Enabled()) {
+                    MacroArgumentTrace::NotePacket(argument_trace_packet, command_header.argument,
+                                                   word_offset + index, true);
+                }
                 dma_state.method = command_header.method;
                 dma_state.subchannel = command_header.subchannel;
                 dma_state.dma_word_offset = u64(-s64(dma_state.dma_get)); // negate to set address as 0
@@ -474,6 +533,10 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
                 dma_increment_once = false;
                 break;
             case SubmissionMode::IncreaseOnce:
+                if (MacroArgumentTrace::Enabled()) {
+                    MacroArgumentTrace::NotePacket(argument_trace_packet, command_header.argument,
+                                                   word_offset + index, false);
+                }
                 SetState(command_header);
                 dma_state.non_incrementing = false;
                 dma_increment_once = true;
@@ -495,6 +558,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
 // where the first one ended. An entry starting anywhere else is such a call: run it with a clean
 // method state and resume the unfinished method when the stream continues at that address.
 void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+    if (MacroArgumentTrace::Enabled()) argument_trace_packet = {};
     const auto continued = std::ranges::find(parked_methods, entry_address,
                                              &ParkedMethod::resume_address);
     std::optional<ParkedMethod> resume;
@@ -557,6 +621,17 @@ bool DmaPusher::WantsSegment() const {
 }
 
 void DmaPusher::CallMethod(u32 argument) {
+    std::optional<MacroArgumentTrace::DispatchScope> argument_trace;
+    if (MacroArgumentTrace::Enabled()) {
+        argument_trace.emplace(
+            subchannels[dma_state.subchannel], argument_trace_packet, dma_state.dma_word_offset,
+            dma_state.method, dma_state.method_count, dma_state.non_incrementing,
+            dma_increment_once, dma_state.is_last_call, std::span<const u32>{&argument, 1},
+            !VideoCommon::GpuSplit::Get().Active());
+        if (const auto address = argument_trace->PayloadGpuva()) {
+            argument_trace->SetPayloadDevice(memory_manager.GpuToCpuAddress(*address));
+        }
+    }
     if (semaphore_watch != 0) [[unlikely]] {
         WatchArgument(dma_state.method, argument);
     }
@@ -621,6 +696,17 @@ void DmaPusher::CallMethod(u32 argument) {
 }
 
 void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+    std::optional<MacroArgumentTrace::DispatchScope> argument_trace;
+    if (MacroArgumentTrace::Enabled()) {
+        argument_trace.emplace(
+            subchannels[dma_state.subchannel], argument_trace_packet, dma_state.dma_word_offset,
+            dma_state.method, dma_state.method_count, dma_state.non_incrementing,
+            dma_increment_once, num_methods == dma_state.method_count,
+            std::span<const u32>{base_start, num_methods}, !VideoCommon::GpuSplit::Get().Active());
+        if (const auto address = argument_trace->PayloadGpuva()) {
+            argument_trace->SetPayloadDevice(memory_manager.GpuToCpuAddress(*address));
+        }
+    }
     if (semaphore_watch != 0) [[unlikely]] {
         for (u32 i = 0; i < num_methods; ++i) {
             WatchArgument(dma_state.method + (dma_state.non_incrementing ? 0 : i), base_start[i]);
@@ -709,6 +795,7 @@ void DmaPusher::NoteDmaSemaphore(u32 method, u32 argument) {
 }
 
 void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
+    if (MacroArgumentTrace::Enabled()) ++list.argument_trace_revision;
     list.snapshot_suspensions = now;
     for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
         const CommandListHeader& entry = list.command_lists[i];
@@ -723,6 +810,7 @@ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
 }
 
 void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+    if (MacroArgumentTrace::Enabled()) ++list.argument_trace_revision;
     for (const u32 i : list.deferred_entries) {
         if (i >= list.command_lists.size() || i >= list.submitted_offsets.size()) {
             continue;
@@ -961,6 +1049,50 @@ void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash
         LOG_WARNING(HW_GPU, "pushbuffer check: {} of {} entries changed after submit",
                     changed.load(), checked.load());
     }
+}
+
+MacroArgumentTrace::Parse DmaPusher::ArgumentTraceContext(
+    MacroArgumentTrace::Source source, bool gpu_written, bool safe_read) const {
+    MacroArgumentTrace::Parse trace{};
+    if (!MacroArgumentTrace::Enabled() || dma_pushbuffer.empty()) return trace;
+    const auto& list = dma_pushbuffer.front();
+    auto& origin = trace.origin;
+    origin.source = source;
+    origin.channel = channel_state.bind_id;
+    origin.submission = list.argument_trace_submission;
+    origin.snapshot_revision = list.argument_trace_revision;
+    origin.snapshot_suspensions = list.snapshot_suspensions;
+    origin.current_suspensions = suspensions.load(std::memory_order_relaxed);
+    origin.entry_index = dma_pushbuffer_subindex;
+    if (MacroArgumentLifetime::Enabled() &&
+        dma_pushbuffer_subindex < list.argument_lifetime_snapshots.size()) {
+        origin.lifetime_snapshot_id = list.argument_lifetime_snapshots[dma_pushbuffer_subindex];
+    }
+    origin.resume_word = command_resume_offset;
+    origin.gpu_written = gpu_written;
+    origin.safe_read = safe_read;
+    if (source == MacroArgumentTrace::Source::Prefetched) {
+        origin.entry_words = list.prefetch_command_list.size();
+        return trace;
+    }
+    if (dma_pushbuffer_subindex >= list.command_lists.size()) return trace;
+    const auto& header = list.command_lists[dma_pushbuffer_subindex];
+    origin.gp_header = header.raw;
+    origin.entry_gpuva = header.addr;
+    origin.entry_words = header.size;
+    origin.gpuva_known = true;
+    if (dma_pushbuffer_subindex < list.submitted_offsets.size() &&
+        !std::ranges::binary_search(list.deferred_entries, static_cast<u32>(dma_pushbuffer_subindex))) {
+        const size_t offset = list.submitted_offsets[dma_pushbuffer_subindex];
+        if (offset <= list.submitted_words.size() &&
+            origin.entry_words <= list.submitted_words.size() - offset) {
+            origin.snapshot_available = true;
+            trace.retained_snapshot = std::span<const u32>{
+                reinterpret_cast<const u32*>(list.submitted_words.data() + offset),
+                static_cast<size_t>(origin.entry_words)};
+        }
+    }
+    return trace;
 }
 
 void DmaPusher::RecordParsedEntry(const CommandListHeader& header,

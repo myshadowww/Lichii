@@ -373,8 +373,8 @@ void NvidiaDlssPanel::Refresh() {
     QString button;
     if (has_loader && has_model) {
         status =
-            Tr("<b>Ready.</b> Found %1 and %2.<br>DLSS and the settings below apply only "
-               "when a game uses its own DLSS. While DLSS runs, the status bar shows DLSS, "
+            Tr("<b>Ready.</b> Found %1 and %2.<br>DLSS and the settings below apply to "
+               "supported games and scenes. While DLSS runs, the status bar shows DLSS, "
                "its mode and its preset.")
                 .arg(Named(QStringLiteral("NVIDIA Streamline"), files.interposer_version), dlss);
     } else if (has_model) {

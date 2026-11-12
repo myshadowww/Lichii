@@ -24,12 +24,15 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 04005B902517C000 | Kirby Air Riders Global Test Ride |
 | 040057C02159A000 | Nintendo Switch 2 Welcome Tour |
 | 040004F027560000 | Orbitals Global Friends Pass |
+| 040032B023CA4000 | Orbitals |
 | 0400380020056000 | Raiders |
 | 0400D1D02399A000 | The Duskbloods network test |
 | 0400486024DEC000 | The Legend of Zelda: Ocarina of Time |
 | 0400245021D2C000 | Yoshi and the Mysterious Book |
 | 0400DDB020648000 | Cyberpunk 2077: Ultimate Edition |
 | 0100606026F12000 | Final Fantasy Resonance |
+| 010019A01E2F2000 | Metroid Prime 4: Beyond - Nintendo Switch 2 Edition |
+| 0100152000022000 | Mario Kart 8 Deluxe (Switch 1) |
 
 Add ids here when a report identifies a new game.
 

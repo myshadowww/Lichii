@@ -1,0 +1,13 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D upscaled_color;
+layout(binding = 1, rgb10_a2) uniform image2D target;
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(target))) ||
+        any(greaterThanEqual(pixel, textureSize(upscaled_color, 0)))) return;
+    vec3 value = texelFetch(upscaled_color, pixel, 0).rgb;
+    if (any(isnan(value)) || any(isinf(value))) return;
+    // Keep the native pass's alpha for subsequent composition.
+    imageStore(target, pixel, vec4(clamp(value, 0, 1), imageLoad(target, pixel).a));
+}

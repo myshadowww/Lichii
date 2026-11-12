@@ -38,6 +38,9 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/fire_emblem_upscale.h"
+#include "video_core/pokopia_upscale.h"
+#include "video_core/orbitals_upscale.h"
+#include "video_core/kirby_upscale.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/indirect_reset.h"
@@ -47,6 +50,7 @@
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
+#include "video_core/renderer_vulkan/volume_clear.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
@@ -61,6 +65,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/yoshi_upscale.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -68,11 +73,13 @@
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
 #include "video_core/shader_cache.h"
 #include "video_core/texture_cache/texture_cache_base.h"
+#include "video_core/texture_cache/scene_image_alias.h"
 #include "video_core/textures/texture.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/macro_argument_lifetime.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_profile.h"
@@ -216,6 +223,22 @@ VkRect2D GetScissorState(const Maxwell& regs, size_t index, u32 up_scale = 1, u3
         scissor.extent.height = (std::numeric_limits<s32>::max)();
     }
     return scissor;
+}
+
+// The part of a volume slice a clear writes: the scissor (when the clear uses it) limited to the
+// render area and the slice.
+VkRect2D VolumeClearRect(const Maxwell& regs, VkExtent2D render_area, VideoCommon::Extent3D slice) {
+    VkRect2D rect = regs.clear_control.use_scissor ? GetScissorState(regs, 0)
+                                                   : VkRect2D{{0, 0}, {slice.width, slice.height}};
+    const auto clamp_axis = [](s32& offset, u32& extent, u32 limit) {
+        const s64 begin = std::clamp<s64>(offset, 0, limit);
+        const s64 end = std::clamp<s64>(s64{offset} + extent, begin, limit);
+        offset = static_cast<s32>(begin);
+        extent = static_cast<u32>(end - begin);
+    };
+    clamp_axis(rect.offset.x, rect.extent.width, (std::min)(render_area.width, slice.width));
+    clamp_axis(rect.offset.y, rect.extent.height, (std::min)(render_area.height, slice.height));
+    return rect;
 }
 
 DrawParams MakeDrawParams(const Tegra::Engines::Maxwell3D::DrawManager::State& draw_state, u32 num_instances, bool is_indexed) {
@@ -765,7 +788,8 @@ bool RasterizerVulkan::TryNx2IndirectReset(bool is_indexed, u32 instance_count) 
 }
 
 template <typename Func>
-void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect) {
+void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_indirect,
+                                   u32 instance_count) {
 
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_draws;
@@ -1124,6 +1148,12 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
     const auto hashes = pipeline->ShaderHashes();
     TrackStarFoxDraw(*pipeline);
+    TrackBananzaDraw(*pipeline);
+    TrackKirbyDraw(*pipeline);
+    TrackPokopiaDraw(*pipeline);
+    TrackMarioKartDraw(*pipeline, is_indexed, is_indirect, instance_count);
+    TrackRaidersDraw(*pipeline);
+    TrackOrbitalsDraw(*pipeline, is_indexed, is_indirect, instance_count);
     if (oot_4k_scene_frame == render_trace_frame && hashes[5] == final_fragment &&
         std::ranges::find(hashes, final_vertex) != hashes.end()) {
         const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
@@ -1522,7 +1552,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             GPU::Logging::GPULogger::GetInstance().LogVulkanCall(
                 is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
         }
-    });
+    }, false, instance_count);
 }
 
 void RasterizerVulkan::DrawIndirect() {
@@ -1846,6 +1876,87 @@ void RasterizerVulkan::DrawTexture() {
                          sampler->Handle(), dst_region, src_region, src_size);
 }
 
+// A 1-layer depth target bound with a 3D color target limits the framebuffer to one layer, so
+// vkCmdClearAttachments can't reach the target's other slices. Those slices are zeroed by copying
+// zeros into the clear's rectangle of exactly the slices the clear names; the rest of the volume
+// keeps its contents. The rectangle can be smaller than the target: in handheld mode the game
+// clears a 48-wide fog volume through a 64-wide render target.
+bool RasterizerVulkan::ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice,
+                                         u32 slice_count) {
+    const auto& regs = maxwell3d->regs;
+    const u32 target_index = regs.clear_surface.RT;
+    const auto& color_buffer_ids = texture_cache.GetRenderTargets().color_buffer_ids;
+    // Depth and stencil clears take the normal path, so only a colour-only clear qualifies.
+    if (target_index >= color_buffer_ids.size() || regs.clear_surface.Z || regs.clear_surface.S) {
+        return false;
+    }
+    const auto view_id = color_buffer_ids[target_index];
+    const u32 depth = regs.rt[target_index].depth;
+    if (!view_id || depth <= framebuffer->Layers() || first_slice >= depth) {
+        return false;
+    }
+    const auto& view = texture_cache.GetImageView(view_id);
+    const bool is_volume = True(view.flags & VideoCommon::ImageViewFlagBits::Slice);
+    const bool clears_all_channels = regs.clear_surface.R && regs.clear_surface.G &&
+                                     regs.clear_surface.B && regs.clear_surface.A;
+    const auto format =
+        VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[target_index].format);
+    const bool clears_to_zero = CanUseZeroVolumeClear(format, regs.clear_color);
+    if (!is_volume || !clears_all_channels || !clears_to_zero) {
+        return false;
+    }
+    const VkRect2D rect = VolumeClearRect(regs, framebuffer->RenderArea(), view.size);
+    if (rect.extent.width == 0 || rect.extent.height == 0) {
+        return true;
+    }
+    const u32 width = rect.extent.width;
+    const u32 height = rect.extent.height;
+    // The host image can use a wider format than the guest's (B10G11R11 falls back to
+    // R16G16B16A16): size the zeros for the widest color texel, 16 bytes.
+    constexpr size_t WidestTexelBytes = 16;
+    const size_t slice_bytes = size_t{width} * height * WidestTexelBytes;
+    const auto zeros = staging_pool.Request(slice_bytes, MemoryUsage::Upload);
+    std::memset(zeros.mapped_span.data(), 0, slice_bytes);
+    const u32 count = std::min(slice_count, depth - first_slice);
+    const VkImage image = view.ImageHandle();
+    const u32 level = view.range.base.level;
+    // The clear's slices count from the view's first slice.
+    const u32 base_slice = static_cast<u32>(view.range.base.layer);
+    scheduler.RequestOutsideRenderPassOperationContext();
+    scheduler.Record([image, level, base_slice, rect, width, height, first_slice, count,
+                      buffer = zeros.buffer, offset = zeros.offset](vk::CommandBuffer cmdbuf) {
+        // Earlier passes may still be reading or writing the volume.
+        constexpr VkMemoryBarrier clear_waits{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, clear_waits);
+        for (u32 slice = first_slice; slice < first_slice + count; ++slice) {
+            const VkBufferImageCopy zero_slice{
+                .bufferOffset = offset,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1},
+                .imageOffset = {rect.offset.x, rect.offset.y, static_cast<s32>(base_slice + slice)},
+                .imageExtent = {width, height, 1},
+            };
+            cmdbuf.CopyBufferToImage(buffer, image, VK_IMAGE_LAYOUT_GENERAL, zero_slice);
+        }
+        constexpr VkMemoryBarrier clear_finished{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, clear_finished);
+    });
+    return true;
+}
+
 void RasterizerVulkan::Clear(u32 layer_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Clear};
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
@@ -1882,6 +1993,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         LOG_DEBUG(Render_Vulkan,
                   "Framebuffer clear layers: base={}, requested={}, clipped={}, framebuffer={}",
                   base_array_layer, layer_count, clear_layers.count, framebuffer->Layers());
+    }
+    if (ClearVolumeSlices(framebuffer, base_array_layer, layer_count)) {
+        return;
     }
     if (clear_layers.count == 0) {
         return;
@@ -2086,6 +2200,10 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");
         return;
     }
+    std::optional<Tegra::MacroArgumentLifetime::ComputeScope> lifetime_compute;
+    if (Tegra::MacroArgumentLifetime::Enabled()) {
+        lifetime_compute.emplace(native_key, pipeline->ShaderHash());
+    }
     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
     std::optional<ByteAddressedShadow> byte_addressed_shadow;
     buffer_cache.Nx2CollectListCopies(true);
@@ -2254,6 +2372,14 @@ void RasterizerVulkan::DispatchCompute() {
                 TryStarFoxGameplay(sampled[0].id, written[0]);
             }
         }
+    }
+    // Yoshi retains the complete native dispatch, including scalar-history shadow copy-back.
+    // Its replacement only writes the separate final HDR image after that work.
+    TrackYoshiCompute(*pipeline, native_key);
+    if (!byte_addressed_shadow) {
+        TrackBananzaCompute(*pipeline);
+        TrackKirbyCompute(*pipeline, native_key);
+        TrackRaidersCompute(*pipeline);
     }
     buffer_cache.NoteWorkRecorded(true);
     SubmitNx2ListCopies();
@@ -2717,6 +2843,13 @@ void RasterizerVulkan::FlushCommands() {
     }
     draw_counter = 0;
     pending_native_work = false;
+    // A fence with a download is submitted by InnerFence::Queue, and SignalFence then comes here
+    // with nothing recorded since: ~4,600 empty submits a second in Ocarina of Time's Castle
+    // Town, each followed by a full rebind (from Fritchii c338269b92).
+    if (!scheduler.RecordedSinceSubmit()) {
+        Scheduler::CountSkippedFlush();
+        return;
+    }
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {
@@ -2983,6 +3116,2017 @@ bool RasterizerVulkan::TryStarFoxGameplay(VideoCommon::ImageViewId input,
         *color, *target, *motion, *depth, starfox_gameplay.jitter);
     starfox_gameplay.color = {};
     return recorded;
+}
+
+void RasterizerVulkan::TrackOrbitalsDraw(const GraphicsPipeline& pipeline, bool indexed,
+                                         bool indirect, u32 instance_count) {
+#ifdef EGLANTINE_NGX
+    using namespace VideoCommon::OrbitalsUpscale;
+    using VideoCore::Surface::PixelFormat;
+    if (program_id != ProgramId || orbitals_failed)
+        return;
+    const bool enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+    if (enabled != orbitals_enabled) {
+        orbitals_enabled = enabled;
+        orbitals_scenes = {};
+        for (auto& upscaler : orbitals_upscalers)
+            if (upscaler)
+                upscaler->ResetHistory();
+    }
+    if (!enabled)
+        return;
+    const auto hashes = pipeline.ShaderHashes();
+    const bool tonemap = hashes[1] == 0x6895f4aa275b81d2ULL && hashes[5] == 0xf7dd0658d2e6a7b6ULL;
+    const bool fxaa = hashes[1] == 0xee69f81e66a97cafULL && hashes[5] == 0x892920f8b6352894ULL;
+    if (!tonemap && !fxaa)
+        return;
+    const auto fail = [&](const char* reason) {
+        if (orbitals_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Orbitals native scene retained: {}", reason);
+            orbitals_fallback_reason = reason;
+        }
+    };
+    const auto& regs = maxwell3d->regs;
+    const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+    const auto scissor = GetScissorState(regs, 0);
+    const auto& viewport_swizzle = regs.viewport_transform[0].swizzle;
+    if (tonemap) {
+        if (viewport.x == 0 || viewport.x == 960)
+            orbitals_scenes[viewport.x == 0 ? 0 : 1] = {};
+        else
+            orbitals_scenes = {};
+    }
+    if ((viewport.x != 0 && viewport.x != 960) || viewport.y != 1080 || viewport.width != 960 ||
+        viewport.height != -1080 || viewport.minDepth != 0 || viewport.maxDepth != 1 ||
+        scissor.offset.x > viewport.x || scissor.offset.y > 0 ||
+        static_cast<s64>(scissor.offset.x) + scissor.extent.width < viewport.x + 960 ||
+        static_cast<s64>(scissor.offset.y) + scissor.extent.height < 1080 || regs.blend.enable[0] ||
+        regs.depth_test_enable || !regs.color_mask[0].R || !regs.color_mask[0].G ||
+        !regs.color_mask[0].B || viewport_swizzle.x != Maxwell::ViewportSwizzle::PositiveX ||
+        viewport_swizzle.y != Maxwell::ViewportSwizzle::PositiveY ||
+        viewport_swizzle.z != Maxwell::ViewportSwizzle::PositiveZ ||
+        viewport_swizzle.w != Maxwell::ViewportSwizzle::PositiveW) {
+        fail("unsupported split viewport or render state");
+        return;
+    }
+    const u32 player = viewport.x == 0 ? 0 : 1;
+    auto& scene = orbitals_scenes[player];
+    const auto plain = [&](const ImageView* image, PixelFormat format, bool depth = false) {
+        if (!image || !image->BackingImage() || image->format != format || image->IsRescaled() ||
+            image->size.width != 1920 || image->size.height != 1080 || image->size.depth != 1 ||
+            image->type != ImageViewType::e2D || image->Samples() != VK_SAMPLE_COUNT_1_BIT ||
+            image->range != VideoCommon::SubresourceRange{})
+            return false;
+        const auto& backing = *image->BackingImage();
+        if (backing.info.size.width != 1920 || backing.info.size.height != 1080 ||
+            backing.info.size.depth != 1 || image->gpu_addr != backing.gpu_addr ||
+            !backing.guest_size_bytes ||
+            !gpu_memory->IsFullyMappedRange(backing.gpu_addr, backing.guest_size_bytes) ||
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, backing.info.format)
+                    .format !=
+                MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, image->format).format)
+            return false;
+        const auto identity = [](VkComponentSwizzle a, VkComponentSwizzle b) {
+            return a == VK_COMPONENT_SWIZZLE_IDENTITY || a == b;
+        };
+        const auto s = image->Swizzle();
+        return identity(s.r, VK_COMPONENT_SWIZZLE_R) &&
+               (depth ||
+                (identity(s.g, VK_COMPONENT_SWIZZLE_G) && identity(s.b, VK_COMPONENT_SWIZZLE_B)));
+    };
+    const auto target_id = texture_cache.GetRenderTargets().color_buffer_ids[0];
+    auto* target = texture_cache.TryGetImageView(target_id);
+    if (!plain(target, PixelFormat::R16G16B16A16_FLOAT)) {
+        fail("unsupported scene target");
+        return;
+    }
+    const auto read_cb = [&](u32 slot, auto& values) {
+        bool read{};
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                   const auto& binding, u32 size, const auto*,
+                                                   u32) {
+            if (stage != 4 || storage || index != slot || size < sizeof(values) ||
+                buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(values)) ||
+                gpu.HasPendingCPUWrites(binding.device_addr, sizeof(values)))
+                return;
+            device_memory.ReadBlockUnsafe(binding.device_addr, values.data(), sizeof(values));
+            read = true;
+        });
+        return read;
+    };
+    const auto sampled = pipeline.SampledImages();
+    if (tonemap) {
+        scene = {};
+        if (sampled.size() != 9 || sampled[0].stage != 4)
+            return;
+        const auto* depth = texture_cache.TryGetImageView(sampled[0].id);
+        std::array<f32, CameraBytes / 4> camera_data{};
+        std::array<f32, 16> parameters{};
+        if (!plain(depth, PixelFormat::D32_FLOAT_S8_UINT, true) || !read_cb(5, camera_data) ||
+            !read_cb(4, parameters) || parameters[14] != 0.7f || parameters[0] != player * 0.5f ||
+            parameters[1] != 0 || parameters[2] != 0.5f || parameters[3] != 1) {
+            fail("tonemap inputs or transfer changed");
+            return;
+        }
+        const auto camera = DecodeCamera(camera_data, player);
+        if (!camera) {
+            fail("unsupported camera matrices");
+            return;
+        }
+        scene.channel = gpu_memory;
+        scene.frame = render_trace_frame;
+        scene.map_serial = gpu_memory->MapSerial();
+        scene.depth = sampled[0].id;
+        scene.color = target_id;
+        scene.depth_address = depth->gpu_addr;
+        scene.color_address = target->gpu_addr;
+        scene.depth_image = depth->ImageHandle();
+        scene.color_image = target->ImageHandle();
+        scene.camera = {
+            camera->view_projection, camera->projection, camera->view, {2, -2, -1, 1}, {1, 0}};
+        return;
+    }
+    if (scene.channel != gpu_memory || scene.frame != render_trace_frame || scene.evaluated ||
+        scene.map_serial != gpu_memory->MapSerial() || sampled.size() != 1 || sampled[0].stage != 4)
+        return;
+    const auto* color = texture_cache.TryGetImageView(sampled[0].id);
+    const auto* produced = texture_cache.TryGetImageView(scene.color);
+    auto* depth = texture_cache.TryGetImageView(scene.depth);
+    if (!plain(color, PixelFormat::R16G16B16A16_FLOAT) || !produced ||
+        !plain(depth, PixelFormat::D32_FLOAT_S8_UINT, true) ||
+        color->ImageHandle() != scene.color_image || color->gpu_addr != scene.color_address ||
+        produced->ImageHandle() != scene.color_image || produced->gpu_addr != scene.color_address ||
+        color->range != produced->range || depth->ImageHandle() != scene.depth_image ||
+        depth->gpu_addr != scene.depth_address || target->ImageHandle() == scene.depth_image) {
+        fail("scene resource chain changed");
+        return;
+    }
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& stream = regs.vertex_streams[0];
+    const auto& attribute = regs.vertex_attrib_format[0];
+    if (!indexed || indirect || instance_count != 1 || draw.base_instance != 0 ||
+        draw.topology != Maxwell::PrimitiveTopology::Triangles || draw.index_buffer.count != 3 ||
+        draw.index_buffer.FormatSizeInBytes() != 2 || draw.base_index != 0 || !stream.IsEnabled() ||
+        stream.stride != 32 || regs.vertex_stream_instances.IsInstancingEnabled(0) ||
+        attribute.buffer != 0 || attribute.constant || attribute.offset != 0 ||
+        MaxwellToVK::VertexFormat(device, attribute.type, attribute.size) !=
+            VK_FORMAT_R32G32B32A32_SFLOAT) {
+        fail("unsupported fullscreen geometry");
+        return;
+    }
+    const auto read = [&](GPUVAddr address, void* dst, size_t size) {
+        if (!gpu_memory->IsContinuousRange(address, size) ||
+            !gpu_memory->IsFullyMappedRange(address, size))
+            return false;
+        const auto addr = gpu_memory->GpuToCpuAddress(address);
+        if (!addr || buffer_cache.IsRegionGpuModified(*addr, size) ||
+            gpu.HasPendingCPUWrites(*addr, size))
+            return false;
+        gpu_memory->ReadBlockUnsafe(address, dst, size);
+        return true;
+    };
+    std::array<f32, 48> vertices{};
+    std::array<u16, 3> indices{};
+    std::array<f32, 16> fxaa_parameters{};
+    if (!read(stream.Address(), vertices.data(), sizeof(vertices)) ||
+        !read(draw.index_buffer.IndexStart(), indices.data(), sizeof(indices)) ||
+        indices != std::array<u16, 3>{0, 4, 5} || vertices[0] != 1 || vertices[1] != 1 ||
+        vertices[32] != -1 || vertices[33] != 1 || vertices[40] != 1 || vertices[41] != -1 ||
+        !read_cb(4, fxaa_parameters) || fxaa_parameters[8] != 1.f / 1920 ||
+        fxaa_parameters[9] != 1.f / 1080 || fxaa_parameters[10] != 0 || fxaa_parameters[11] != 0) {
+        fail("fullscreen coordinates changed");
+        return;
+    }
+    constexpr auto format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!(target->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        !device.IsFormatSupported(format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT, FormatType::Optimal))
+        return;
+    try {
+        auto& upscaler = orbitals_upscalers[player];
+        if (!upscaler) {
+            upscaler =
+                std::make_unique<SceneUpscaler>(device, scheduler, memory_allocator,
+                                                descriptor_pool, compute_pass_descriptor_queue);
+            LOG_INFO(Render_Vulkan,
+                     "Orbitals NVIDIA scene adapter: player {}, 960x1080 DLAA, "
+                     "reverse D32, independent camera history, scaled sRGB",
+                     player + 1);
+        }
+        NvidiaDlssUpscaler::Inputs inputs{};
+        inputs.color = {
+            color->Handle(Shader::TextureType::Color2D), color->ImageHandle(),      format,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},     VK_IMAGE_ASPECT_COLOR_BIT, {1920, 1080}};
+        inputs.depth = {depth->DepthView(),
+                        depth->ImageHandle(),
+                        VK_FORMAT_D32_SFLOAT_S8_UINT,
+                        {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+                        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                        {1920, 1080}};
+        inputs.render_size = {960, 1080};
+        inputs.upscale_size = {960, 1080};
+        inputs.depth_inverted = true;
+        inputs.hdr = true;
+        const auto x = static_cast<s32>(player * 960);
+        const SceneUpscaler::Region region{{x, 0}, {x, 0}, {x, 0}, {1920, 1080}, true, 0.7f};
+        const auto output =
+            target->StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
+        scene.evaluated = true;
+        if (!upscaler->Record(inputs, output, scene.camera, render_trace_frame, format, &region)) {
+            fail("DLSS declined the frame");
+            return;
+        }
+        orbitals_fallback_reason = nullptr;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Orbitals NVIDIA DLSS unavailable: {}", error.what());
+        orbitals_failed = true;
+    }
+#endif
+}
+
+void RasterizerVulkan::TrackRaidersDraw(const GraphicsPipeline& pipeline) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (program_id != 0x0400380020056000ULL || raiders_failed ||
+        !Settings::GetNvidiaDlssRuntimeSettings().enabled)
+        return;
+    using VideoCore::Surface::PixelFormat;
+    const auto plain = [](const ImageView& image) {
+        const auto identity = [](VkComponentSwizzle value, VkComponentSwizzle channel) {
+            return value == VK_COMPONENT_SWIZZLE_IDENTITY || value == channel;
+        };
+        const auto swizzle = image.Swizzle();
+        return image.BackingImage() && !image.IsRescaled() &&
+               image.size.width == 2560 && image.size.height == 1440 && image.size.depth == 1 &&
+               image.type == ImageViewType::e2D && image.Samples() == VK_SAMPLE_COUNT_1_BIT &&
+               image.range == VideoCommon::SubresourceRange{} &&
+               identity(swizzle.r, VK_COMPONENT_SWIZZLE_R) &&
+               (image.format == PixelFormat::D32_FLOAT ||
+                (identity(swizzle.g, VK_COMPONENT_SWIZZLE_G) &&
+                 identity(swizzle.b, VK_COMPONENT_SWIZZLE_B)));
+    };
+    const auto hashes = pipeline.ShaderHashes();
+    const auto& targets = texture_cache.GetRenderTargets();
+    const auto* color = texture_cache.TryGetImageView(targets.color_buffer_ids[0]);
+    if (!color || !plain(*color))
+        return;
+    if ((hashes[1] == 0x106e7d4664680f1fULL || hashes[1] == 0x8e66317e1c876c27ULL) &&
+        color->format == PixelFormat::B10G11R11_FLOAT) {
+        const auto* depth = texture_cache.TryGetImageView(targets.depth_buffer_id);
+        if (!depth || !plain(*depth) || depth->format != PixelFormat::D32_FLOAT)
+            return;
+        const auto& regs = maxwell3d->regs;
+        const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+        const auto& swizzle = regs.viewport_transform[0].swizzle;
+        if (regs.depth_mode != Maxwell::DepthMode::MinusOneToOne ||
+            swizzle.x != Maxwell::ViewportSwizzle::PositiveX ||
+            swizzle.y != Maxwell::ViewportSwizzle::PositiveY ||
+            swizzle.z != Maxwell::ViewportSwizzle::PositiveZ ||
+            swizzle.w != Maxwell::ViewportSwizzle::PositiveW ||
+            viewport.x != 0 || viewport.y != 1440 || viewport.width != 2560 ||
+            viewport.height != -1440 || viewport.minDepth != 0 || viewport.maxDepth != 1)
+            return;
+        if (raiders_scene.channel == gpu_memory && raiders_scene.frame == render_trace_frame &&
+            raiders_scene.map_serial == gpu_memory->MapSerial())
+            return;
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                   const auto& binding, u32 bound_size,
+                                                   const auto*, u32) {
+            std::array<f32, 44> constants{};
+            if (stage != 0 || storage || index != 3 || bound_size < sizeof(constants) ||
+                buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(constants)))
+                return;
+            device_memory.ReadBlockUnsafe(binding.device_addr, constants.data(), sizeof(constants));
+            if (!std::ranges::all_of(constants, [](f32 value) { return std::isfinite(value); }))
+                return;
+            SceneUpscaler::Camera camera{};
+            std::copy_n(constants.begin(), 12, camera.view.begin());
+            std::copy_n(constants.begin() + 12, 16, camera.view_projection.begin());
+            std::copy_n(constants.begin() + 28, 16, camera.projection.begin());
+            const auto& projection = camera.projection;
+            if (projection[14] != -1 || projection[15] != 0 || projection[0] <= 0 ||
+                projection[5] <= 0 || projection[2] != 0 || projection[6] != 0 ||
+                projection[10] >= -1 || projection[11] >= 0)
+                return;
+            for (size_t row = 0; row < 4; ++row) {
+                for (size_t col = 0; col < 4; ++col) {
+                    f32 composed = projection[row * 4 + 3] * (col == 3 ? 1.f : 0.f);
+                    for (size_t k = 0; k < 3; ++k)
+                        composed += projection[row * 4 + k] * camera.view[k * 4 + col];
+                    if (std::abs(composed - camera.view_projection[row * 4 + col]) >
+                        1e-4f * std::max(1.f, std::abs(composed)))
+                        return;
+                }
+            }
+            camera.pixel_to_clip = {2, -2, -1, 1};
+            camera.depth_to_clip = {2, -1};
+            raiders_scene = {};
+            raiders_scene.channel = gpu_memory;
+            raiders_scene.frame = render_trace_frame;
+            raiders_scene.map_serial = gpu_memory->MapSerial();
+            raiders_scene.camera = camera;
+            raiders_scene.depth = targets.depth_buffer_id;
+            raiders_scene.depth_address = depth->gpu_addr;
+            raiders_scene.depth_image = depth->ImageHandle();
+            raiders_scene.hdr_address = color->gpu_addr;
+            raiders_scene.hdr_image = color->ImageHandle();
+        });
+        return;
+    }
+    if (raiders_scene.channel != gpu_memory || raiders_scene.frame != render_trace_frame ||
+        raiders_scene.map_serial != gpu_memory->MapSerial() || raiders_scene.evaluated ||
+        color->format != PixelFormat::A2B10G10R10_UNORM)
+        return;
+    const auto reads = [&](GPUVAddr address, VkImage image) {
+        return std::ranges::any_of(pipeline.SampledImages(), [&](const auto& input) {
+            const auto* source = texture_cache.TryGetImageView(input.id);
+            return input.stage == 4 && source && plain(*source) &&
+                   source->gpu_addr == address && source->ImageHandle() == image;
+        });
+    };
+    if (hashes[1] == 0x5c171536cac96dd2ULL && hashes[5] == 0x75803985c24185fbULL &&
+        reads(raiders_scene.hdr_address, raiders_scene.hdr_image)) {
+        // This exact tonemap writes linear RGB. The subsequent SMAA variant gamma-encodes
+        // its result for NDSR, so retain this linear source for DLSS's own antialiasing.
+        raiders_scene.linear = targets.color_buffer_ids[0];
+        raiders_scene.linear_address = color->gpu_addr;
+        raiders_scene.linear_image = color->ImageHandle();
+        return;
+    }
+    if (hashes[1] != 0x82d076828dae7e64ULL || !raiders_scene.linear ||
+        (hashes[5] != 0x4d8d7af5f06da313ULL && hashes[5] != 0x9f6f2ba6ce48ae1cULL) ||
+        pipeline.SampledImages().size() != 2 ||
+        !reads(raiders_scene.linear_address, raiders_scene.linear_image))
+        return;
+    raiders_scene.resolved = targets.color_buffer_ids[0];
+    raiders_scene.resolved_address = color->gpu_addr;
+    raiders_scene.resolved_image = color->ImageHandle();
+    raiders_scene.gamma_resolve = hashes[5] == 0x4d8d7af5f06da313ULL;
+    if (!raiders_scene.gamma_resolve)
+        TryRaidersUpscale(raiders_scene.resolved, raiders_scene.resolved);
+#endif
+}
+
+void RasterizerVulkan::TrackRaidersCompute(const ComputePipeline& pipeline) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (program_id != 0x0400380020056000ULL || raiders_failed ||
+        !Settings::GetNvidiaDlssRuntimeSettings().enabled ||
+        pipeline.ShaderHash() != 0x15b555dd8463cf5cULL || !raiders_scene.gamma_resolve ||
+        !raiders_scene.resolved || raiders_scene.evaluated ||
+        raiders_scene.channel != gpu_memory || raiders_scene.frame != render_trace_frame ||
+        raiders_scene.map_serial != gpu_memory->MapSerial())
+        return;
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    if (sampled.size() != 1 || written.size() != 1)
+        return;
+    const auto* source = texture_cache.TryGetImageView(sampled[0].id);
+    const auto* produced = texture_cache.TryGetImageView(raiders_scene.resolved);
+    const auto* target = texture_cache.TryGetImageView(written[0]);
+    const auto rgb_identity = [](const ImageView& image) {
+        const auto identity = [](VkComponentSwizzle value, VkComponentSwizzle channel) {
+            return value == VK_COMPONENT_SWIZZLE_IDENTITY || value == channel;
+        };
+        const auto swizzle = image.Swizzle();
+        return identity(swizzle.r, VK_COMPONENT_SWIZZLE_R) &&
+               identity(swizzle.g, VK_COMPONENT_SWIZZLE_G) &&
+               identity(swizzle.b, VK_COMPONENT_SWIZZLE_B);
+    };
+    if (!source || !produced || !target || source->gpu_addr != raiders_scene.resolved_address ||
+        source->ImageHandle() != raiders_scene.resolved_image ||
+        source->format != VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM ||
+        produced->format != source->format || !rgb_identity(*source) ||
+        source->size.width != 2560 || source->size.height != 1440 ||
+        produced->gpu_addr != raiders_scene.resolved_address ||
+        produced->ImageHandle() != raiders_scene.resolved_image || source->range != produced->range ||
+        target->size.width != 3840 || target->size.height != 2160)
+        return;
+    const auto& qmd = kepler_compute->launch_description;
+    const auto& cbuf = qmd.const_buffer_config[0];
+    if (!(qmd.const_buffer_enable_mask & 1) || cbuf.size < 0x30 ||
+        !gpu_memory->IsFullyMappedRange(cbuf.Address(), 0x30))
+        return;
+    std::array<u32, 8> crop{};
+    gpu_memory->ReadBlockUnsafe(cbuf.Address() + 0x10, crop.data(), sizeof(crop));
+    if (crop != std::array<u32, 8>{0, 0, 2559, 1439, 0, 0, 3839, 2159})
+        return;
+    TryRaidersUpscale(raiders_scene.linear, written[0]);
+#endif
+}
+
+bool RasterizerVulkan::TryRaidersUpscale(VideoCommon::ImageViewId color_id,
+                                       VideoCommon::ImageViewId target_id) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    using VideoCore::Surface::PixelFormat;
+    const auto fail = [&](const char* reason) {
+        if (raiders_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Raiders native scene retained: {}", reason);
+            raiders_fallback_reason = reason;
+        }
+        return false;
+    };
+    auto* color = texture_cache.TryGetImageView(color_id);
+    auto* target = texture_cache.TryGetImageView(target_id);
+    auto* depth = texture_cache.TryGetImageView(raiders_scene.depth);
+    const auto plain = [](const ImageView& image) {
+        const auto identity = [](VkComponentSwizzle value, VkComponentSwizzle channel) {
+            return value == VK_COMPONENT_SWIZZLE_IDENTITY || value == channel;
+        };
+        const auto swizzle = image.Swizzle();
+        return image.BackingImage() && !image.IsRescaled() && image.size.depth == 1 &&
+               image.type == ImageViewType::e2D && image.Samples() == VK_SAMPLE_COUNT_1_BIT &&
+               image.range == VideoCommon::SubresourceRange{} &&
+               identity(swizzle.r, VK_COMPONENT_SWIZZLE_R) &&
+               (image.format == PixelFormat::D32_FLOAT ||
+                (identity(swizzle.g, VK_COMPONENT_SWIZZLE_G) &&
+                 identity(swizzle.b, VK_COMPONENT_SWIZZLE_B)));
+    };
+    const bool linear = color_id == raiders_scene.linear;
+    if (!color || !target || !depth || !plain(*color) || !plain(*target) || !plain(*depth) ||
+        raiders_scene.channel != gpu_memory || raiders_scene.frame != render_trace_frame ||
+        raiders_scene.map_serial != gpu_memory->MapSerial() || raiders_scene.evaluated ||
+        color->format != PixelFormat::A2B10G10R10_UNORM ||
+        target->format != PixelFormat::A2B10G10R10_UNORM || depth->format != PixelFormat::D32_FLOAT ||
+        color->size.width != 2560 || color->size.height != 1440 ||
+        depth->size.width != 2560 || depth->size.height != 1440 ||
+        !((target->size.width == 3840 && target->size.height == 2160) ||
+          (target->size.width == 2560 && target->size.height == 1440)) ||
+        depth->ImageHandle() != raiders_scene.depth_image ||
+        depth->gpu_addr != raiders_scene.depth_address ||
+        depth->ImageHandle() == target->ImageHandle() ||
+        color->ImageHandle() != (linear ? raiders_scene.linear_image : raiders_scene.resolved_image) ||
+        color->gpu_addr != (linear ? raiders_scene.linear_address : raiders_scene.resolved_address))
+        return fail("scene resource chain changed");
+    constexpr VkFormat output_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (!device.IsStorageImageExtendedFormatsSupported() ||
+        !device.IsFormatSupported(output_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal) ||
+        !(target->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target->format).format !=
+            output_format)
+        return fail("unsupported output storage image");
+    try {
+        const auto output = target->StorageView(Shader::TextureType::Color2D,
+                                                 Shader::ImageFormat::Typeless, false);
+        const auto input = color->Handle(Shader::TextureType::Color2D);
+        const auto depth_view = depth->DepthView();
+        if (!output || !input || !depth_view)
+            return fail("missing scene view");
+        if (!raiders_upscaler) {
+            raiders_upscaler = std::make_unique<SceneUpscaler>(
+                device, scheduler, memory_allocator, descriptor_pool, compute_pass_descriptor_queue);
+            LOG_INFO(Render_Vulkan, "Raiders NVIDIA scene adapter: linear RGB10A2, standard D32, "
+                                     "camera motion, native alpha preserved");
+        }
+        NvidiaDlssUpscaler::Inputs inputs{};
+        inputs.color.view = input;
+        inputs.depth = {depth_view, depth->ImageHandle(), VK_FORMAT_D32_SFLOAT,
+                        {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1}, VK_IMAGE_ASPECT_DEPTH_BIT};
+        inputs.render_size = {2560, 1440};
+        inputs.upscale_size = {target->size.width, target->size.height};
+        inputs.depth_inverted = false;
+        inputs.hdr = true;
+        raiders_scene.evaluated = true;
+        if (!raiders_upscaler->Record(inputs, output, raiders_scene.camera, render_trace_frame,
+                                      output_format))
+            return fail("DLSS declined the frame");
+        raiders_fallback_reason = nullptr;
+        return true;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Raiders NVIDIA DLSS unavailable: {}", error.what());
+        raiders_failed = true;
+    }
+#endif
+    return false;
+}
+
+void RasterizerVulkan::TrackMarioKartDraw(const GraphicsPipeline& pipeline, bool indexed,
+                                          bool indirect, u32 instance_count) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (program_id != 0x0400C3F00006E000ULL)
+        return;
+    const bool enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+    if (enabled != mario_kart_enabled) {
+        mario_kart_enabled = enabled;
+        mario_kart_scene = {};
+        if (mario_kart_upscaler)
+            mario_kart_upscaler->ResetHistory();
+        if (mario_kart_motion)
+            mario_kart_motion->ResetHistory();
+    }
+    if (!enabled || mario_kart_failed)
+        return;
+    using VideoCore::Surface::PixelFormat;
+    const auto plain = [](const ImageView* image, bool depth = false) {
+        if (!image || !image->BackingImage() || image->IsRescaled() || image->size.depth != 1 ||
+            image->Samples() != VK_SAMPLE_COUNT_1_BIT || image->type != ImageViewType::e2D ||
+            image->range != VideoCommon::SubresourceRange{} ||
+            image->BackingImage()->info.size.width != image->size.width ||
+            image->BackingImage()->info.size.height != image->size.height)
+            return false;
+        const auto identity = [](VkComponentSwizzle actual, VkComponentSwizzle expected) {
+            return actual == VK_COMPONENT_SWIZZLE_IDENTITY || actual == expected;
+        };
+        const auto s = image->Swizzle();
+        return identity(s.r, VK_COMPONENT_SWIZZLE_R) &&
+               (depth ||
+                (identity(s.g, VK_COMPONENT_SWIZZLE_G) && identity(s.b, VK_COMPONENT_SWIZZLE_B)));
+    };
+    const auto is_depth = [](const ImageView& image) {
+        return image.format == PixelFormat::D24_UNORM_S8_UINT ||
+               image.format == PixelFormat::S8_UINT_D24_UNORM;
+    };
+    const auto& regs = maxwell3d->regs;
+    const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+    const auto full_viewport = [&](u32 width, u32 height) {
+        const auto& s = regs.viewport_transform[0].swizzle;
+        const auto scissor = GetScissorState(regs, 0);
+        return scissor.offset.x == 0 && scissor.offset.y == 0 && scissor.extent.width >= width &&
+               scissor.extent.height >= height && viewport.x == 0 && viewport.y == height &&
+               viewport.width == width && viewport.height == -static_cast<float>(height) &&
+               viewport.minDepth == 0 && viewport.maxDepth == 1 &&
+               regs.depth_mode == Maxwell::DepthMode::MinusOneToOne &&
+               s.x == Maxwell::ViewportSwizzle::PositiveX &&
+               s.y == Maxwell::ViewportSwizzle::PositiveY &&
+               s.z == Maxwell::ViewportSwizzle::PositiveZ &&
+               s.w == Maxwell::ViewportSwizzle::PositiveW;
+    };
+    const auto hashes = pipeline.ShaderHashes();
+    const auto& targets = texture_cache.GetRenderTargets();
+    const auto* color = texture_cache.TryGetImageView(targets.color_buffer_ids[0]);
+    if (!plain(color) || color->format != PixelFormat::B10G11R11_FLOAT)
+        return;
+    if ((hashes[1] == 0x1a8ffbac49ad1f2dULL || hashes[1] == 0x5cf6ab8512a29bfaULL) &&
+        hashes[5] == 0x292b3848bd8c1dbfULL) {
+        const auto* depth = texture_cache.TryGetImageView(targets.depth_buffer_id);
+        const u32 width = color->size.width, height = color->size.height;
+        if (!plain(depth, true) || !is_depth(*depth) || depth->size != color->size ||
+            !VideoCommon::MarioKartUpscale::InputExtentSupported(width, height) ||
+            !full_viewport(width, height) || !regs.depth_test_enable || !regs.depth_write_enabled ||
+            (regs.depth_test_func != Maxwell::ComparisonOp::Less_GL &&
+             regs.depth_test_func != Maxwell::ComparisonOp::Less_D3D))
+            return;
+        if (mario_kart_scene.channel == gpu_memory &&
+            mario_kart_scene.frame == render_trace_frame &&
+            mario_kart_scene.map_serial == gpu_memory->MapSerial())
+            return;
+        std::optional<VideoCommon::MarioKartUpscale::Camera> camera;
+        std::optional<VideoCommon::MarioKartUpscale::Curvature> bend;
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                   const auto& binding, u32 size, const auto*,
+                                                   u32) {
+            if (stage != 0 || storage || (index != 4 && index != 9))
+                return;
+            const size_t needed = index == 4 ? 176 : 0x2ac;
+            if (size < needed || buffer_cache.IsRegionGpuModified(binding.device_addr, needed) ||
+                gpu.HasPendingCPUWrites(binding.device_addr, needed))
+                return;
+            if (index == 4) {
+                std::array<float, 44> words{};
+                device_memory.ReadBlockUnsafe(binding.device_addr, words.data(), sizeof(words));
+                camera = VideoCommon::MarioKartUpscale::DecodeCamera(words);
+            } else {
+                std::array<float, 4> words{};
+                device_memory.ReadBlockUnsafe(binding.device_addr + 0x1a0, &words[0], 4);
+                device_memory.ReadBlockUnsafe(binding.device_addr + 0x1a8, &words[1], 4);
+                device_memory.ReadBlockUnsafe(binding.device_addr + 0x2a4, &words[2], 8);
+                bend = VideoCommon::MarioKartUpscale::DecodeCurvature(words);
+            }
+        });
+        if (!camera || !bend)
+            return;
+        mario_kart_scene = {};
+        mario_kart_scene.channel = gpu_memory;
+        mario_kart_scene.frame = render_trace_frame;
+        mario_kart_scene.map_serial = gpu_memory->MapSerial();
+        mario_kart_scene.extent = {width, height};
+        mario_kart_scene.camera = *camera;
+        mario_kart_scene.bend = *bend;
+        mario_kart_scene.depth_address = depth->gpu_addr;
+        mario_kart_scene.depth_image = depth->ImageHandle();
+        mario_kart_scene.depth = targets.depth_buffer_id;
+        mario_kart_scene.color_address = color->gpu_addr;
+        mario_kart_scene.color_image = color->ImageHandle();
+        return;
+    }
+    if (mario_kart_scene.channel != gpu_memory || mario_kart_scene.frame != render_trace_frame ||
+        mario_kart_scene.map_serial != gpu_memory->MapSerial() ||
+        hashes[1] != 0x8e97cea098cfdbc6ULL)
+        return;
+    const auto extent = mario_kart_scene.extent;
+    const bool grading_without_depth = hashes[5] == 0xaa3759a6b406c9a4ULL;
+    if ((hashes[5] == 0x1a9cd661be3e12fdULL || grading_without_depth) &&
+        full_viewport(extent.width, extent.height) &&
+        color->gpu_addr == mario_kart_scene.color_address &&
+        color->ImageHandle() == mario_kart_scene.color_image) {
+        bool sampled_color{};
+        VideoCommon::ImageViewId sampled_depth{};
+        for (const auto& sample : pipeline.SampledImages()) {
+            if (sample.stage != 4)
+                continue;
+            const auto* image = texture_cache.TryGetImageView(sample.id);
+            if (!image || image->size.width != extent.width || image->size.height != extent.height)
+                continue;
+            if (plain(image, true) && is_depth(*image) &&
+                image->gpu_addr == mario_kart_scene.depth_address &&
+                image->ImageHandle() == mario_kart_scene.depth_image)
+                sampled_depth = sample.id;
+            if (plain(image) && image->format == PixelFormat::B10G11R11_FLOAT &&
+                image->gpu_addr == mario_kart_scene.color_address &&
+                image->ImageHandle() == mario_kart_scene.color_image)
+                sampled_color = true;
+        }
+        if (sampled_color && (sampled_depth || grading_without_depth)) {
+            // The sunset LUT variant does not sample depth; retain the exact camera draw's
+            // attachment, whose address/handle/format is revalidated before use.
+            if (sampled_depth)
+                mario_kart_scene.depth = sampled_depth;
+            mario_kart_scene.graded = true;
+        }
+        return;
+    }
+    if (hashes[5] != 0xe43c4b68e728622eULL || !mario_kart_scene.graded ||
+        mario_kart_scene.evaluated || !full_viewport(2560, 1440) || color->size.width != 2560 ||
+        color->size.height != 1440 || !indexed || indirect || regs.blend.enable[0] ||
+        regs.depth_test_enable || !regs.color_mask[0].R || !regs.color_mask[0].G ||
+        !regs.color_mask[0].B)
+        return;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const auto& stream = regs.vertex_streams[0];
+    const auto attribute = [&](u32 location, VkFormat format, u32 offset) {
+        const auto& a = regs.vertex_attrib_format[location];
+        return a.buffer == 0 && !a.constant && a.offset == offset &&
+               MaxwellToVK::VertexFormat(device, a.type, a.size) == format;
+    };
+    if ((draw.topology != Maxwell::PrimitiveTopology::Triangles &&
+         draw.topology != Maxwell::PrimitiveTopology::TriangleStrip &&
+         draw.topology != Maxwell::PrimitiveTopology::TriangleFan) ||
+        draw.index_buffer.count != 3 || draw.index_buffer.FormatSizeInBytes() != 1 ||
+        draw.base_index != 0 || draw.base_instance != 0 || instance_count != 1 ||
+        !stream.IsEnabled() || stream.stride != 16 ||
+        regs.vertex_stream_instances.IsInstancingEnabled(0) ||
+        !attribute(0, VK_FORMAT_R16G16B16A16_SFLOAT, 0) ||
+        !attribute(1, VK_FORMAT_R16G16_SFLOAT, 12))
+        return;
+    const auto read = [&](GPUVAddr address, void* dst, size_t size) {
+        if (!gpu_memory->IsContinuousRange(address, size) ||
+            !gpu_memory->IsFullyMappedRange(address, size))
+            return false;
+        const auto addr = gpu_memory->GpuToCpuAddress(address);
+        if (!addr || buffer_cache.IsRegionGpuModified(*addr, size) ||
+            gpu.HasPendingCPUWrites(*addr, size))
+            return false;
+        gpu_memory->ReadBlockUnsafe(address, dst, size);
+        return true;
+    };
+    std::array<u16, 24> vertices{};
+    std::array<u8, 3> indices{};
+    constexpr std::array<u16, 24> expected{0xb800, 0x3800, 0, 0, 0, 0x3c00, 0,      0,
+                                           0x3e00, 0x3800, 0, 0, 0, 0x3c00, 0x4000, 0,
+                                           0xb800, 0xbe00, 0, 0, 0, 0x3c00, 0,      0x4000};
+    if (!read(stream.Address(), vertices.data(), sizeof(vertices)) || vertices != expected ||
+        !read(draw.index_buffer.IndexStart(), indices.data(), sizeof(indices)) ||
+        indices != std::array<u8, 3>{0, 2, 1})
+        return;
+    std::optional<SceneUpscaler::OutputTransform> transfer;
+    buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                               const auto& binding, u32 size, const auto*, u32) {
+        if (stage != 4 || storage || index != 3 || size < 0x60 ||
+            buffer_cache.IsRegionGpuModified(binding.device_addr, 0x60) ||
+            gpu.HasPendingCPUWrites(binding.device_addr, 0x60))
+            return;
+        std::array<float, 24> cb{};
+        device_memory.ReadBlockUnsafe(binding.device_addr, cb.data(), sizeof(cb));
+        const auto decoded = VideoCommon::MarioKartUpscale::DecodeTransfer(cb);
+        if (!decoded)
+            return;
+        transfer = SceneUpscaler::OutputTransform{decoded->luminance, decoded->shoulder};
+    });
+    if (!transfer)
+        return;
+    for (const auto& sample : pipeline.SampledImages()) {
+        const auto* image = texture_cache.TryGetImageView(sample.id);
+        if (sample.stage != 4 || !plain(image) || image->format != PixelFormat::B10G11R11_FLOAT ||
+            image->size.width != extent.width || image->size.height != extent.height ||
+            image->gpu_addr != mario_kart_scene.color_address ||
+            image->ImageHandle() != mario_kart_scene.color_image)
+            continue;
+        mario_kart_scene.evaluated = true;
+        TryMarioKartUpscale(sample.id, targets.color_buffer_ids[0], *transfer);
+        break;
+    }
+#endif
+}
+
+#ifdef EGLANTINE_NVIDIA_DLSS
+bool RasterizerVulkan::TryMarioKartUpscale(VideoCommon::ImageViewId color_id,
+                                           VideoCommon::ImageViewId target_id,
+                                           const SceneUpscaler::OutputTransform& transfer) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    const auto fail = [&](const char* reason) {
+        if (mario_kart_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Mario Kart native scene retained: {}", reason);
+            mario_kart_fallback_reason = reason;
+        }
+        if (mario_kart_motion)
+            mario_kart_motion->ResetHistory();
+        return false;
+    };
+    if (mario_kart_scene.channel != gpu_memory || mario_kart_scene.frame != render_trace_frame ||
+        mario_kart_scene.map_serial != gpu_memory->MapSerial())
+        return fail("scene mapping changed");
+    auto* depth = texture_cache.TryGetImageView(mario_kart_scene.depth);
+    auto* color = texture_cache.TryGetImageView(color_id);
+    auto* target = texture_cache.TryGetImageView(target_id);
+    if (!depth || !color || !target || !depth->BackingImage() || !color->BackingImage() ||
+        !target->BackingImage() || depth->gpu_addr != mario_kart_scene.depth_address ||
+        depth->ImageHandle() != mario_kart_scene.depth_image ||
+        color->gpu_addr != mario_kart_scene.color_address ||
+        color->ImageHandle() != mario_kart_scene.color_image ||
+        target->ImageHandle() == color->ImageHandle())
+        return fail("scene image invalidated");
+    constexpr auto format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    const auto depth_format = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false,
+                                                         depth->BackingImage()->info.format)
+                                  .format;
+    if (MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, depth->format).format !=
+            depth_format ||
+        (depth_format != VK_FORMAT_D24_UNORM_S8_UINT &&
+         depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+        !device.IsStorageImageExtendedFormatsSupported() ||
+        !device.IsFormatSupported(format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal) ||
+        !(target->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target->format).format !=
+            format)
+        return fail("unsupported host image format");
+    try {
+        const auto output =
+            target->StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
+        const auto source = color->Handle(Shader::TextureType::Color2D);
+        if (!output || !source || !depth->DepthView())
+            return fail("missing image view");
+        if (!mario_kart_upscaler) {
+            mario_kart_upscaler =
+                std::make_unique<SceneUpscaler>(device, scheduler, memory_allocator,
+                                                descriptor_pool, compute_pass_descriptor_queue);
+            mario_kart_motion = std::make_unique<MarioKartMotion>(
+                device, scheduler, memory_allocator, descriptor_pool, compute_pass_descriptor_queue,
+                staging_pool);
+            LOG_INFO(Render_Vulkan,
+                     "Mario Kart NVIDIA scene candidate: dynamic input to 2560x1440, "
+                     "standard D24, curvature-aware camera motion, captured zero jitter, native "
+                     "HDR transfer before HUD");
+        }
+        NvidiaDlssUpscaler::Inputs inputs{};
+        inputs.color.view = source;
+        inputs.depth = {depth->DepthView(),
+                        depth->ImageHandle(),
+                        depth_format,
+                        {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+                        depth->BackingImage()->AspectMask()};
+        inputs.render_size = mario_kart_scene.extent;
+        inputs.upscale_size = {2560, 1440};
+        inputs.hdr = true;
+        inputs.dynamic_resolution = true;
+        // Normalize NR to native HDRCompose exposure; variable gain has an exact inverse.
+        inputs.neural_reference_white = 1.0f / transfer.luminance[0];
+        if (transfer.luminance[1] != 0) {
+            inputs.neural_reference_exposure = {transfer.luminance[0], transfer.luminance[1],
+                                                transfer.luminance[2]};
+        }
+        inputs.depth_inverted = false;
+        inputs.motion_vectors = mario_kart_motion->Record(
+            depth->DepthView(), inputs.render_size, mario_kart_scene.camera, mario_kart_scene.bend,
+            render_trace_frame, inputs.reset);
+        if (!mario_kart_upscaler->RecordWithMotion(inputs, output, render_trace_frame, format,
+                                                   &transfer))
+            return fail("DLSS declined the frame");
+        static const bool trace_contract = [] {
+            const char* value = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE");
+            return value && std::string_view{value} == "1";
+        }();
+        if (trace_contract) {
+            static std::array<f32, 4> previous_luminance{};
+            static u64 accepted_frames{};
+            static u32 exposure_changes{};
+            static u32 samples{};
+            static bool saw_variable_exposure{};
+            const bool changed = transfer.luminance != previous_luminance;
+            const bool first_variable = transfer.luminance[1] != 0 && !saw_variable_exposure;
+            ++accepted_frames;
+            if (samples < 64 && ((changed && exposure_changes < 8) || first_variable ||
+                                 accepted_frames % 120 == 1)) {
+                LOG_INFO(Render_Vulkan,
+                         "Mario Kart HDR contract queued: frame={} input={}x{} output=2560x1440 "
+                         "fs=e43c4b68e728622e base={:.9g} extra={:.9g} cap={:.9g} flag={:.9g}",
+                         render_trace_frame, inputs.render_size.width, inputs.render_size.height,
+                         transfer.luminance[0], transfer.luminance[1], transfer.luminance[2],
+                         transfer.luminance[3]);
+                ++samples;
+            }
+            exposure_changes += changed;
+            previous_luminance = transfer.luminance;
+            saw_variable_exposure |= transfer.luminance[1] != 0;
+        }
+        mario_kart_fallback_reason = nullptr;
+        return true;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Mario Kart NVIDIA DLSS unavailable: {}", error.what());
+        mario_kart_failed = true;
+    }
+#endif
+    return false;
+}
+
+#endif
+
+void RasterizerVulkan::TrackPokopiaDraw(const GraphicsPipeline& pipeline) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (program_id != 0x0400A3A01EE4C000ULL ||
+        !Settings::GetNvidiaDlssRuntimeSettings().enabled || pokopia_failed) return;
+    using VideoCore::Surface::PixelFormat;
+    const auto plain = [](const ImageView& image, bool depth_only = false) {
+        const auto identity = [](VkComponentSwizzle actual, VkComponentSwizzle expected) {
+            return actual == VK_COMPONENT_SWIZZLE_IDENTITY || actual == expected;
+        };
+        const auto swizzle = image.Swizzle();
+        const bool consumed_channels = identity(swizzle.r, VK_COMPONENT_SWIZZLE_R) &&
+            (depth_only || (identity(swizzle.g, VK_COMPONENT_SWIZZLE_G) &&
+                            identity(swizzle.b, VK_COMPONENT_SWIZZLE_B)));
+        return consumed_channels && image.BackingImage() && !image.IsRescaled() && image.size.width == 1920 &&
+               image.size.height == 1080 && image.size.depth == 1 &&
+               image.Samples() == VK_SAMPLE_COUNT_1_BIT && image.type == ImageViewType::e2D &&
+               image.range == VideoCommon::SubresourceRange{};
+    };
+    const auto is_depth = [](const ImageView& image) {
+        return image.format == PixelFormat::D24_UNORM_S8_UINT ||
+               image.format == PixelFormat::S8_UINT_D24_UNORM;
+    };
+    const auto hashes = pipeline.ShaderHashes();
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (!targets.color_buffer_ids[0]) return;
+    const auto* color = texture_cache.TryGetImageView(targets.color_buffer_ids[0]);
+    if (!color || !plain(*color)) return;
+    if (hashes[1] == 0xb6905daf1f849912ULL && targets.depth_buffer_id &&
+        color->format == PixelFormat::A8B8G8R8_SRGB) {
+        const auto* depth = texture_cache.TryGetImageView(targets.depth_buffer_id);
+        if (!depth || !plain(*depth, true) || !is_depth(*depth)) return;
+        const auto& regs = maxwell3d->regs;
+        const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+        const auto& swizzle = regs.viewport_transform[0].swizzle;
+        if (regs.depth_mode != Maxwell::DepthMode::ZeroToOne ||
+            swizzle.x != Maxwell::ViewportSwizzle::PositiveX ||
+            swizzle.y != Maxwell::ViewportSwizzle::PositiveY ||
+            swizzle.z != Maxwell::ViewportSwizzle::PositiveZ ||
+            swizzle.w != Maxwell::ViewportSwizzle::PositiveW ||
+            viewport.x != 0 || viewport.width != 1920 || viewport.minDepth != 0 ||
+            viewport.maxDepth != 1 ||
+            !((viewport.y == 0 && viewport.height == 1080) ||
+              (viewport.y == 1080 && viewport.height == -1080))) return;
+        if (pokopia_scene.channel == gpu_memory && pokopia_scene.frame == render_trace_frame &&
+            pokopia_scene.map_serial == gpu_memory->MapSerial()) return;
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                   const auto& binding, u32 bound_size,
+                                                   const auto*, u32) {
+            std::array<f32,16> vp{};
+            if (stage != 0 || storage || index != 3 || bound_size < 160 ||
+                buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(vp))) return;
+            device_memory.ReadBlockUnsafe(binding.device_addr, vp.data(), sizeof(vp));
+            const auto decoded = VideoCommon::PokopiaUpscale::DecodeCamera(vp);
+            if (!decoded) return;
+            pokopia_scene = {};
+            pokopia_scene.channel = gpu_memory;
+            pokopia_scene.frame = render_trace_frame;
+            pokopia_scene.map_serial = gpu_memory->MapSerial();
+            pokopia_scene.depth_address = depth->gpu_addr;
+            pokopia_scene.depth_image = depth->ImageHandle();
+            pokopia_scene.camera.view_projection = decoded->view_projection;
+            pokopia_scene.camera.projection = decoded->projection;
+            pokopia_scene.camera.view = decoded->view;
+            pokopia_scene.camera.pixel_to_clip = viewport.height < 0 ?
+                std::array<f32,4>{2,-2,-1,1} : std::array<f32,4>{2,2,-1,-1};
+            pokopia_scene.camera.depth_to_clip = {1,0};
+        });
+        return;
+    }
+    if (pokopia_scene.channel != gpu_memory || pokopia_scene.frame != render_trace_frame ||
+        pokopia_scene.map_serial != gpu_memory->MapSerial()) return;
+    if (hashes[1] == 0x42cfaa9991cd7b58ULL && hashes[5] == 0x5cf229d46e0cd486ULL &&
+        color->format == PixelFormat::B10G11R11_FLOAT) {
+        // Exact deferred-lighting pass links the camera attachment to the HDR scene.
+        for (const auto& sampled : pipeline.SampledImages()) {
+            const auto* depth = texture_cache.TryGetImageView(sampled.id);
+            if (sampled.stage != 4 || !depth || !plain(*depth, true) || !is_depth(*depth) ||
+                depth->gpu_addr != pokopia_scene.depth_address ||
+                depth->ImageHandle() != pokopia_scene.depth_image) continue;
+            pokopia_scene.depth = sampled.id;
+            pokopia_scene.hdr = targets.color_buffer_ids[0];
+            pokopia_scene.hdr_address = color->gpu_addr;
+            pokopia_scene.hdr_image = color->ImageHandle();
+            break;
+        }
+        return;
+    }
+    if (hashes[1] != 0x53e11305e82d5d5dULL || hashes[5] != 0x4e61e66d370340f9ULL ||
+        color->format != PixelFormat::B10G11R11_FLOAT || !pokopia_scene.depth ||
+        !pokopia_scene.hdr || pokopia_scene.evaluated) return;
+    const auto* produced = texture_cache.TryGetImageView(pokopia_scene.hdr);
+    if (!produced || produced->gpu_addr != pokopia_scene.hdr_address ||
+        produced->ImageHandle() != pokopia_scene.hdr_image) return;
+    for (const auto& sampled : pipeline.SampledImages()) {
+        const auto* hdr = texture_cache.TryGetImageView(sampled.id);
+        if (sampled.stage != 4 || !hdr || !plain(*hdr) ||
+            hdr->format != PixelFormat::B10G11R11_FLOAT ||
+            hdr->gpu_addr != pokopia_scene.hdr_address ||
+            hdr->ImageHandle() != pokopia_scene.hdr_image) continue;
+        // The native tonemap has run. Copy and evaluate its linear result before FXAA/HUD.
+        pokopia_scene.evaluated = true;
+        TryPokopiaUpscale(targets.color_buffer_ids[0]);
+        break;
+    }
+#endif
+}
+
+bool RasterizerVulkan::TryPokopiaUpscale(VideoCommon::ImageViewId color_id) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    const auto fail = [&](const char* reason) {
+        if (pokopia_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Pokopia native scene retained: {}", reason);
+            pokopia_fallback_reason = reason;
+        }
+        return false;
+    };
+    if (pokopia_scene.channel != gpu_memory || pokopia_scene.frame != render_trace_frame ||
+        pokopia_scene.map_serial != gpu_memory->MapSerial()) return fail("scene mapping changed");
+    auto* depth = texture_cache.TryGetImageView(pokopia_scene.depth);
+    auto* color = texture_cache.TryGetImageView(color_id);
+    if (!depth || !color || !depth->BackingImage() || !color->BackingImage() ||
+        depth->gpu_addr != pokopia_scene.depth_address ||
+        depth->ImageHandle() != pokopia_scene.depth_image ||
+        color->ImageHandle() == depth->ImageHandle()) return fail("scene image invalidated");
+    constexpr auto output_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    const auto depth_format = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false,
+                                                        depth->BackingImage()->info.format).format;
+    const auto depth_view_format = MaxwellToVK::SurfaceFormat(
+        device, FormatType::Optimal, true, depth->format).format;
+    if (depth_view_format != depth_format ||
+        (depth_format != VK_FORMAT_D24_UNORM_S8_UINT &&
+         depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+        !device.IsStorageImageExtendedFormatsSupported() ||
+        !device.IsFormatSupported(output_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal) ||
+        (color->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) == 0 ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, color->format).format !=
+            output_format) return fail("unsupported host image format");
+    try {
+        const auto target = color->StorageView(Shader::TextureType::Color2D,
+                                               Shader::ImageFormat::Typeless, false);
+        const auto source = color->Handle(Shader::TextureType::Color2D);
+        if (!target || !source || !depth->DepthView()) return fail("missing image view");
+        if (!pokopia_upscaler) {
+            pokopia_upscaler = std::make_unique<SceneUpscaler>(device, scheduler, memory_allocator,
+                descriptor_pool, compute_pass_descriptor_queue);
+            LOG_INFO(Render_Vulkan, "Pokopia NVIDIA DLAA candidate: 1920x1080, reverse depth "
+                     "host format {}, camera-only motion, native jitter zero, pre-FXAA/HUD",
+                     static_cast<u32>(depth_format));
+        }
+        NvidiaDlssUpscaler::Inputs inputs{};
+        inputs.color.view = source;
+        inputs.depth = {depth->DepthView(), depth->ImageHandle(), depth_format,
+                        {VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,1}, depth->BackingImage()->AspectMask()};
+        inputs.render_size = {1920,1080};
+        inputs.upscale_size = {1920,1080};
+        inputs.depth_inverted = true;
+        inputs.hdr = true; // Linear display-range scene; the final attachment performs sRGB encoding.
+        if (!pokopia_upscaler->Record(inputs, target, pokopia_scene.camera, render_trace_frame))
+            return fail("DLSS declined the frame");
+        pokopia_fallback_reason = nullptr;
+        return true;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Pokopia NVIDIA DLAA unavailable: {}", error.what());
+        pokopia_failed = true;
+    }
+#endif
+    return false;
+}
+
+#ifdef EGLANTINE_NVIDIA_DLSS
+namespace {
+bool MatchesBananzaSceneImage(const ImageView* producer, VkImage expected,
+                              const ImageView& sampled, VkExtent2D crop) {
+    using VideoCore::Surface::PixelFormat;
+    if (!producer || producer->ImageHandle() != expected ||
+        producer->gpu_addr != sampled.gpu_addr || producer->format != sampled.format ||
+        (sampled.format != PixelFormat::D32_FLOAT &&
+         sampled.format != PixelFormat::B10G11R11_FLOAT))
+        return false;
+    for (const auto* view : {producer, &sampled}) {
+        if (!view->BackingImage() || view->IsRescaled() ||
+            view->type != ImageViewType::e2D || view->Samples() != VK_SAMPLE_COUNT_1_BIT ||
+            view->range != VideoCommon::SubresourceRange{} || view->size.depth != 1 ||
+            view->size.width < crop.width || view->size.width > crop.width + 1 ||
+            view->size.height != crop.height)
+            return false;
+    }
+    if (sampled.ImageHandle() == expected)
+        return true;
+    const auto& source = *producer->BackingImage();
+    const auto& destination = *sampled.BackingImage();
+    using VideoCommon::ImageFlagBits;
+    constexpr auto invalid = ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+    const bool complete_copy = VideoCommon::SynchronizedSceneAliasCovers(
+        destination.aliased_images, producer->image_id, source.modification_tick,
+        destination.modification_tick, {crop.width, crop.height});
+    const bool accepted = False((source.flags | destination.flags) & invalid) &&
+                          source.info.format == destination.info.format && complete_copy;
+    static const bool trace = [] {
+        const char* value = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE");
+        return value && std::string_view{value} == "1";
+    }();
+    static u32 logged{};
+    if (trace && logged++ < 16)
+        LOG_INFO(Render_Vulkan,
+                 "Bananza scene alias: accepted={} addr={:#x} producer={}x{} sampled={}x{} "
+                 "crop={}x{} ticks={},{} registered={} complete_copy={}",
+                 accepted, sampled.gpu_addr, producer->size.width, producer->size.height,
+                 sampled.size.width, sampled.size.height, crop.width, crop.height,
+                 source.modification_tick, destination.modification_tick,
+                 destination.aliased_images.size(), complete_copy);
+    return accepted;
+}
+} // namespace
+#endif
+
+#ifdef EGLANTINE_NVIDIA_DLSS
+namespace {
+bool KirbyImageShape(const ImageView* view, VkExtent2D crop, u32 channels) {
+    if (!view || !view->BackingImage() || view->IsRescaled() || view->type != ImageViewType::e2D ||
+        view->Samples() != VK_SAMPLE_COUNT_1_BIT ||
+        view->range != VideoCommon::SubresourceRange{} || view->size.depth != 1 ||
+        (view->size.width != crop.width && view->size.width != ((crop.width + 15) & ~15U)) ||
+        view->size.height != crop.height)
+        return false;
+    const auto identity = [](VkComponentSwizzle value, VkComponentSwizzle channel) {
+        return value == VK_COMPONENT_SWIZZLE_IDENTITY || value == channel;
+    };
+    const auto s = view->Swizzle();
+    return identity(s.r, VK_COMPONENT_SWIZZLE_R) &&
+           (channels < 2 || identity(s.g, VK_COMPONENT_SWIZZLE_G)) &&
+           (channels < 3 || identity(s.b, VK_COMPONENT_SWIZZLE_B));
+}
+
+bool MatchesKirbySceneImage(const ImageView* producer, VkImage expected, const ImageView* sampled,
+                            VkExtent2D crop, u32 channels) {
+    if (!KirbyImageShape(producer, crop, channels) || !KirbyImageShape(sampled, crop, channels) ||
+        producer->ImageHandle() != expected || producer->gpu_addr != sampled->gpu_addr ||
+        producer->format != sampled->format)
+        return false;
+    if (sampled->ImageHandle() == expected)
+        return true;
+    const auto& source = *producer->BackingImage();
+    const auto& destination = *sampled->BackingImage();
+    using VideoCommon::ImageFlagBits;
+    return False((source.flags | destination.flags) &
+                 (ImageFlagBits::CpuModified | ImageFlagBits::Remapped)) &&
+           source.info.format == destination.info.format &&
+           VideoCommon::SynchronizedSceneAliasCovers(
+               destination.aliased_images, producer->image_id, source.modification_tick,
+               destination.modification_tick, {crop.width, crop.height});
+}
+} // namespace
+#endif
+
+void RasterizerVulkan::TrackKirbyDraw(const GraphicsPipeline& pipeline) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    using namespace VideoCommon::KirbyUpscale;
+    using VideoCore::Surface::PixelFormat;
+    if (!GAMEPLAY_VALIDATED || program_id != PROGRAM_ID || kirby_failed ||
+        !Settings::GetNvidiaDlssRuntimeSettings().enabled)
+        return;
+    const auto hashes = pipeline.ShaderHashes();
+    const auto& targets = texture_cache.GetRenderTargets();
+    const auto* depth = texture_cache.TryGetImageView(targets.depth_buffer_id);
+    const auto* color = texture_cache.TryGetImageView(targets.color_buffer_ids[0]);
+    const auto depth_format = [](const ImageView* view) {
+        return view && (view->format == PixelFormat::D24_UNORM_S8_UINT ||
+                        view->format == PixelFormat::S8_UINT_D24_UNORM);
+    };
+    const auto remember = [](VideoCommon::ImageViewId id, const ImageView& view) {
+        return KirbyImageTrace{id, view.gpu_addr, view.ImageHandle(),
+                               view.BackingImage()->modification_tick};
+    };
+    const auto read_cb = [&](u32 stage_id, u32 slot, auto& bytes) {
+        bool found{};
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                   const auto& binding, u32 bound_size, const auto*,
+                                                   u32) {
+            if (stage != stage_id || storage || index != slot || bound_size < bytes.size() ||
+                buffer_cache.IsRegionGpuModified(binding.device_addr, bytes.size()) ||
+                gpu.HasPendingCPUWrites(binding.device_addr, bytes.size()))
+                return;
+            device_memory.ReadBlockUnsafe(binding.device_addr, bytes.data(), bytes.size());
+            found = true;
+        });
+        return found;
+    };
+    const auto same_frame = [&] {
+        return kirby_scene.channel == gpu_memory && kirby_scene.frame == render_trace_frame &&
+               kirby_scene.map_serial == gpu_memory->MapSerial();
+    };
+    if ((hashes[1] == 0xe275e05bb2a65228ULL || hashes[1] == 0xf216aef5b4268507ULL) &&
+        hashes[5] == 0xcc980d13643c91cbULL && depth_format(depth)) {
+        if (same_frame())
+            return;
+        const auto& regs = maxwell3d->regs;
+        const auto viewport = GetViewportState(device, regs, 0, 1.0f);
+        const auto& swizzle = regs.viewport_transform[0].swizzle;
+        if (regs.depth_mode != Maxwell::DepthMode::ZeroToOne || !regs.depth_test_enable ||
+            !regs.depth_write_enabled || viewport.x != 0 || !std::isfinite(viewport.width) ||
+            !std::isfinite(viewport.height) || viewport.width < 640 || viewport.width > 2560 ||
+            viewport.height > -360 || viewport.height < -1440 ||
+            std::floor(viewport.width) != viewport.width ||
+            std::floor(viewport.height) != viewport.height || viewport.y != -viewport.height ||
+            viewport.minDepth != 0 || viewport.maxDepth != 1 ||
+            swizzle.x != Maxwell::ViewportSwizzle::PositiveX ||
+            swizzle.y != Maxwell::ViewportSwizzle::PositiveY ||
+            swizzle.z != Maxwell::ViewportSwizzle::PositiveZ ||
+            swizzle.w != Maxwell::ViewportSwizzle::PositiveW)
+            return;
+        const VkExtent2D extent{static_cast<u32>(viewport.width),
+                                static_cast<u32>(-viewport.height)};
+        if (!KirbyImageShape(depth, extent, 1))
+            return;
+        std::array<std::byte, 0x210> cb{};
+        if (!read_cb(0, 3, cb))
+            return;
+        std::array<s32, 3> origin{};
+        std::memcpy(origin.data(), cb.data() + 0x200, sizeof(origin));
+        auto reference = kirby_origin_channel == gpu_memory ? kirby_reference_origin : origin;
+        auto decoded = DecodeCamera(cb, reference, extent.width, extent.height);
+        bool rebase = kirby_origin_channel != gpu_memory;
+        if (!decoded && reference != origin) {
+            reference = origin;
+            decoded = DecodeCamera(cb, reference, extent.width, extent.height);
+            rebase = decoded.has_value();
+        }
+        if (!decoded)
+            return;
+        if (rebase && kirby_upscaler)
+            kirby_upscaler->ResetHistory();
+        kirby_origin_channel = gpu_memory;
+        kirby_reference_origin = reference;
+        kirby_scene = {};
+        kirby_scene.channel = gpu_memory;
+        kirby_scene.frame = render_trace_frame;
+        kirby_scene.map_serial = gpu_memory->MapSerial();
+        kirby_scene.extent = extent;
+        kirby_scene.camera_bytes = cb;
+        kirby_scene.depth_attachment = remember(targets.depth_buffer_id, *depth);
+        kirby_scene.camera.view = decoded->view;
+        kirby_scene.camera.projection = decoded->projection;
+        kirby_scene.camera.view_projection = decoded->view_projection;
+        kirby_scene.camera.pixel_to_clip = {2, -2, -1, 1};
+        kirby_scene.camera.depth_to_clip = {1, 0};
+        kirby_scene.camera.focal_scale_animation = true;
+        return;
+    }
+    if (!same_frame() || kirby_scene.evaluated)
+        return;
+    const auto extent = kirby_scene.extent;
+    if (!KirbyImageShape(color, extent, 3))
+        return;
+    // Retain scene color attachments linked to the proven depth prepass. The exact tonemap
+    // subsequently selects its actual HDR producer from this bounded set.
+    if (!kirby_scene.tonemapped && depth &&
+        depth->ImageHandle() == kirby_scene.depth_attachment.image &&
+        depth->gpu_addr == kirby_scene.depth_attachment.address &&
+        color->format == PixelFormat::B10G11R11_FLOAT) {
+        const bool known = std::ranges::any_of(
+            kirby_scene.hdr, [&](const auto& t) { return t.image == color->ImageHandle(); });
+        if (!known) {
+            const auto slot =
+                std::ranges::find_if(kirby_scene.hdr, [](const auto& t) { return !t.id; });
+            if (slot != kirby_scene.hdr.end())
+                *slot = remember(targets.color_buffer_ids[0], *color);
+        }
+    }
+    const auto sampled = pipeline.SampledImages();
+    const auto logical_crop = [&](const GraphicsPipeline::SampledImage& sample,
+                                  const ImageView* view) {
+        if (!view || sample.stage != 4 || sample.tic > maxwell3d->regs.tex_header.limit)
+            return false;
+        const u64 offset = u64{sample.tic} * sizeof(Tegra::Texture::TICEntry);
+        const auto base = maxwell3d->regs.tex_header.Address();
+        if (base > std::numeric_limits<u64>::max() - offset ||
+            !gpu_memory->IsFullyMappedRange(base + offset, sizeof(Tegra::Texture::TICEntry)))
+            return false;
+        Tegra::Texture::TICEntry tic{};
+        gpu_memory->ReadBlockUnsafe(base + offset, &tic, sizeof(tic));
+        return tic.Address() == view->gpu_addr && tic.Width() == extent.width &&
+               tic.Height() == extent.height;
+    };
+    if (hashes[1] == TONEMAP_VERTEX && hashes[5] == TONEMAP_FRAGMENT &&
+        color->format == PixelFormat::B10G11R11_FLOAT && sampled.size() == 4) {
+        const auto* hdr = texture_cache.TryGetImageView(sampled[0].id);
+        const auto* sampled_depth = texture_cache.TryGetImageView(sampled[1].id);
+        std::array<std::byte, 0x1f0> cb{};
+        if (!logical_crop(sampled[0], hdr) || !logical_crop(sampled[1], sampled_depth) ||
+            !depth_format(sampled_depth) || !read_cb(4, 4, cb) ||
+            !std::equal(cb.begin(), cb.end(), kirby_scene.camera_bytes.begin()) ||
+            !MatchesKirbySceneImage(texture_cache.TryGetImageView(kirby_scene.depth_attachment.id),
+                                    kirby_scene.depth_attachment.image, sampled_depth, extent, 1))
+            return;
+        const bool linked = std::ranges::any_of(kirby_scene.hdr, [&](const auto& producer) {
+            return producer.id && hdr && producer.address == hdr->gpu_addr &&
+                   MatchesKirbySceneImage(texture_cache.TryGetImageView(producer.id),
+                                          producer.image, hdr, extent, 3);
+        });
+        if (!linked || !hdr || hdr->format != PixelFormat::B10G11R11_FLOAT)
+            return;
+        kirby_scene.depth = remember(sampled[1].id, *sampled_depth);
+        kirby_scene.linear = remember(targets.color_buffer_ids[0], *color);
+        kirby_scene.tonemapped = true;
+        return;
+    }
+    if (hashes[1] != SMAA_VERTEX || hashes[5] != SMAA_FRAGMENT || !kirby_scene.tonemapped ||
+        sampled.size() != 2 || color->format != PixelFormat::A2B10G10R10_UNORM)
+        return;
+    const auto* linear = texture_cache.TryGetImageView(sampled[0].id);
+    if (!logical_crop(sampled[0], linear) || !linear ||
+        linear->gpu_addr != kirby_scene.linear.address ||
+        !MatchesKirbySceneImage(texture_cache.TryGetImageView(kirby_scene.linear.id),
+                                kirby_scene.linear.image, linear, extent, 3))
+        return;
+    kirby_scene.linear = remember(sampled[0].id, *linear);
+    kirby_scene.resolved = remember(targets.color_buffer_ids[0], *color);
+#endif
+}
+
+void RasterizerVulkan::TrackKirbyCompute(const ComputePipeline& pipeline, u64 native_key) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    using namespace VideoCommon::KirbyUpscale;
+    if (!GAMEPLAY_VALIDATED || program_id != PROGRAM_ID || kirby_failed ||
+        !Settings::GetNvidiaDlssRuntimeSettings().enabled ||
+        !IsNetwork(native_key, pipeline.ShaderHash()))
+        return;
+    const auto fail = [&](const char* reason) {
+        if (kirby_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Kirby native upscale retained: {}", reason);
+            kirby_fallback_reason = reason;
+        }
+    };
+    if (kirby_scene.channel != gpu_memory || kirby_scene.frame != render_trace_frame ||
+        kirby_scene.map_serial != gpu_memory->MapSerial() || !kirby_scene.resolved.id ||
+        kirby_scene.evaluated) {
+        fail("missing same-frame camera/tonemap/resolve");
+        return;
+    }
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    if (sampled.size() != 1 || written.size() != 1) {
+        fail("native descriptors changed");
+        return;
+    }
+    const auto* color = texture_cache.TryGetImageView(sampled[0].id);
+    const auto descriptor = kepler_compute->ConstBuffer0Image(0x80);
+    const auto extent = kirby_scene.extent;
+    if (!descriptor || !color || descriptor->Address() != color->gpu_addr ||
+        descriptor->Width() != extent.width || descriptor->Height() != extent.height ||
+        color->gpu_addr != kirby_scene.resolved.address ||
+        !MatchesKirbySceneImage(texture_cache.TryGetImageView(kirby_scene.resolved.id),
+                                kirby_scene.resolved.image, color, extent, 3)) {
+        fail("native resolve alias changed");
+        return;
+    }
+    const auto& qmd = kepler_compute->launch_description;
+    const auto& cb = qmd.const_buffer_config[0];
+    std::array<u32, 8> crop{};
+    if (!(qmd.const_buffer_enable_mask & 1) || cb.size < 0x30 ||
+        !gpu_memory->IsFullyMappedRange(cb.Address(), 0x30))
+        return;
+    gpu_memory->ReadBlockUnsafe(cb.Address() + 0x10, crop.data(), sizeof(crop));
+    if (crop != std::array<u32, 8>{0, 0, extent.width - 1, extent.height - 1, 0, 0, 2559, 1439}) {
+        fail("native crop changed");
+        return;
+    }
+    kirby_scene.evaluated = true;
+    TryKirbyUpscale(written[0]);
+#endif
+}
+
+bool RasterizerVulkan::TryKirbyUpscale(VideoCommon::ImageViewId target_id) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    using VideoCore::Surface::PixelFormat;
+    const auto fail = [&](const char* reason) {
+        if (kirby_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Kirby native upscale retained: {}", reason);
+            kirby_fallback_reason = reason;
+        }
+        return false;
+    };
+    const auto retained = [&](const KirbyImageTrace& trace, u32 channels) -> ImageView* {
+        auto* view = texture_cache.TryGetImageView(trace.id);
+        if (!KirbyImageShape(view, kirby_scene.extent, channels) ||
+            view->gpu_addr != trace.address || view->ImageHandle() != trace.image ||
+            view->BackingImage()->modification_tick != trace.tick)
+            return nullptr;
+        const auto& image = *view->BackingImage();
+        using VideoCommon::ImageFlagBits;
+        if (True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Remapped)) ||
+            !image.guest_size_bytes || image.gpu_addr != view->gpu_addr ||
+            !gpu_memory->IsFullyMappedRange(image.gpu_addr, image.guest_size_bytes))
+            return nullptr;
+        return view;
+    };
+    // These exact aliases preserve the depth seen by tonemapping and the linear color seen by
+    // SMAA, even if later native stencil work updates the original depth attachment's tick.
+    auto* depth = retained(kirby_scene.depth, 1);
+    auto* color = retained(kirby_scene.linear, 3);
+    auto* target = texture_cache.TryGetImageView(target_id);
+    if (!depth || !color || !KirbyImageShape(target, {2560, 1440}, 3) ||
+        color->format != PixelFormat::B10G11R11_FLOAT ||
+        target->format != PixelFormat::A2B10G10R10_UNORM ||
+        target->ImageHandle() == depth->ImageHandle() ||
+        target->ImageHandle() == color->ImageHandle())
+        return fail("scene images changed");
+    const auto& target_image = *target->BackingImage();
+    using VideoCommon::ImageFlagBits;
+    if (True(target_image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::Remapped)) ||
+        !target_image.guest_size_bytes || target_image.gpu_addr != target->gpu_addr ||
+        !gpu_memory->IsFullyMappedRange(target_image.gpu_addr, target_image.guest_size_bytes))
+        return fail("output mapping changed");
+    constexpr auto output_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    const auto depth_format = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false,
+                                                         depth->BackingImage()->info.format)
+                                  .format;
+    if (MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, depth->format).format !=
+            depth_format ||
+        (depth_format != VK_FORMAT_D24_UNORM_S8_UINT &&
+         depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target->format).format !=
+            output_format ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, target_image.info.format)
+                .format != output_format ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false,
+                                   color->BackingImage()->info.format)
+                .format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+        !(target->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        !device.IsFormatSupported(output_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal))
+        return fail("unsupported host format");
+    try {
+        const auto output =
+            target->StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
+        if (!output || !depth->DepthView())
+            return fail("missing host image view");
+        if (!kirby_upscaler) {
+            kirby_upscaler =
+                std::make_unique<SceneUpscaler>(device, scheduler, memory_allocator,
+                                                descriptor_pool, compute_pass_descriptor_queue);
+            LOG_INFO(
+                Render_Vulkan,
+                "Kirby NVIDIA DLSS candidate: reverse D24, camera-only motion, "
+                "zero native jitter; VS e275e05bb2a65228/f216aef5b4268507, tonemap "
+                "bb6be8093b607898, gamma resolve f2eb2333f228f72c, linear NDSR output 2560x1440");
+        }
+        NvidiaDlssUpscaler::Inputs inputs{};
+        inputs.color.view = color->Handle(Shader::TextureType::Color2D);
+        inputs.depth = {depth->DepthView(),
+                        depth->ImageHandle(),
+                        depth_format,
+                        {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+                        depth->BackingImage()->AspectMask()};
+        inputs.render_size = kirby_scene.extent;
+        inputs.upscale_size = {2560, 1440};
+        inputs.dynamic_resolution = true;
+        inputs.depth_inverted = true;
+        // Native SMAA encodes sRGB, but the native NDSR decodes it before the A2 store.
+        inputs.hdr = true;
+        bool recorded{};
+        if (inputs.render_size.width == 854 && inputs.render_size.height == 480) {
+            // NGX advertises a fixed 853x480 UltraPerformance input for this 2560x1440 output.
+            // Resample the complete native crop, preserving its frustum instead of dropping a
+            // column.
+            inputs.color.extent = {color->size.width, color->size.height};
+            inputs.depth.extent = {depth->size.width, depth->size.height};
+            inputs.render_size = {853, 480};
+            recorded = kirby_upscaler->RecordResampled(inputs, output, kirby_scene.camera,
+                                                       render_trace_frame, kirby_scene.extent,
+                                                       output_format);
+        } else {
+            recorded = kirby_upscaler->Record(inputs, output, kirby_scene.camera,
+                                              render_trace_frame, output_format);
+        }
+        if (!recorded)
+            return fail("DLSS declined the frame");
+        kirby_fallback_reason = nullptr;
+        return true;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Kirby NVIDIA DLSS unavailable: {}", error.what());
+        kirby_failed = true;
+    }
+#endif
+    return false;
+}
+
+void RasterizerVulkan::TrackBananzaDraw(const GraphicsPipeline& pipeline) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (program_id != 0x040074A01BF12000ULL || !Settings::GetNvidiaDlssRuntimeSettings().enabled ||
+        bananza_failed)
+        return;
+    using VideoCore::Surface::PixelFormat;
+    const auto hashes = pipeline.ShaderHashes();
+    const auto& targets = texture_cache.GetRenderTargets();
+    if (!targets.color_buffer_ids[0])
+        return;
+    const auto& color = texture_cache.GetImageView(targets.color_buffer_ids[0]);
+    const auto plain = [](const ImageView& image) {
+        return image.BackingImage() && !image.IsRescaled() && image.size.depth == 1 &&
+               image.Samples() == VK_SAMPLE_COUNT_1_BIT && image.type == ImageViewType::e2D &&
+               image.HasIdentitySwizzle() && image.range == VideoCommon::SubresourceRange{};
+    };
+    // SilverStarMaterial variants: CB3 is the shared view, composed VP, and projection; CB4
+    // contains the independent object/skin transform. Both keys were traced to scene depth.
+    if ((hashes[1] == 0x2fbd5d1478dcd75fULL || hashes[1] == 0xa739bb2ea6ed8717ULL) &&
+        targets.depth_buffer_id) {
+        const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+        const auto viewport = GetViewportState(device, maxwell3d->regs, 0, 1.0f);
+        static const bool trace_attachments = [] {
+            const char* value = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE");
+            return value && std::string_view{value} == "1";
+        }();
+        if (trace_attachments && color.size.width >= 640 && color.size.height >= 360) {
+            const std::array shape{color.size.width, color.size.height, depth.size.width,
+                                   depth.size.height, static_cast<u32>(color.format),
+                                   static_cast<u32>(depth.format)};
+            const auto unseen = std::ranges::find(bananza_traced_attachment_shapes, shape) ==
+                                bananza_traced_attachment_shapes.end();
+            auto slot = std::ranges::find_if(bananza_traced_attachment_shapes,
+                                            [](const auto& value) { return value[0] == 0; });
+            if (unseen && slot != bananza_traced_attachment_shapes.end()) {
+                *slot = shape;
+                LOG_INFO(Render_Vulkan,
+                         "Bananza camera attachments: vs={:016x} color={}x{} fmt={} plain={} "
+                         "depth={}x{} fmt={} plain={} viewport={},{},{},{} depth_range={},{}",
+                         hashes[1], color.size.width, color.size.height, shape[4], plain(color),
+                         depth.size.width, depth.size.height, shape[5], plain(depth), viewport.x,
+                         viewport.y, viewport.width, viewport.height, viewport.minDepth,
+                         viewport.maxDepth);
+                for (const auto* view : {&color, &depth}) {
+                    const auto* backing = view->BackingImage();
+                    const auto swizzle = view->Swizzle();
+                    LOG_INFO(Render_Vulkan,
+                             "Bananza camera attachment addr={:#x} backing={}x{} type={} samples={} "
+                             "rescaled={} swizzle={},{},{},{} level={}+{} layer={}+{}",
+                             view->gpu_addr, backing ? backing->info.size.width : 0,
+                             backing ? backing->info.size.height : 0, static_cast<u32>(view->type),
+                             static_cast<u32>(view->Samples()), view->IsRescaled(),
+                             static_cast<u32>(swizzle.r), static_cast<u32>(swizzle.g),
+                             static_cast<u32>(swizzle.b), static_cast<u32>(swizzle.a),
+                             view->range.base.level, view->range.extent.levels,
+                             view->range.base.layer, view->range.extent.layers);
+                }
+            }
+        }
+        if (color.format != PixelFormat::B10G11R11_FLOAT || !plain(color) ||
+            !plain(depth) || depth.format != PixelFormat::D32_FLOAT || depth.size.width < 640 ||
+            depth.size.height < 360 || depth.size.width > 2880 || depth.size.height > 1620 ||
+            color.size.width < depth.size.width || color.size.width > depth.size.width + 1 ||
+            color.size.height != depth.size.height)
+            return;
+        // The native sampled descriptors and NDSR crop exclude the render target's padded
+        // final column. Capture the rasterized extent here, then require both to match it.
+        if (maxwell3d->regs.depth_mode != Maxwell::DepthMode::MinusOneToOne || viewport.x != 0 ||
+            !std::isfinite(viewport.width) || !std::isfinite(viewport.height) ||
+            viewport.width < 640 || viewport.width > depth.size.width ||
+            viewport.width < depth.size.width - 1 ||
+            std::floor(viewport.width) != viewport.width ||
+            viewport.y != static_cast<f32>(depth.size.height) ||
+            viewport.height != -static_cast<f32>(depth.size.height) || viewport.minDepth != 0 ||
+            viewport.maxDepth != 1) {
+            static const bool trace = [] {
+                const char* value = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE");
+                return value && std::string_view{value} == "1";
+            }();
+            constexpr const char* reason = "camera viewport mismatch";
+            if (trace && (!bananza_fallback_reason ||
+                          std::string_view{bananza_fallback_reason} != reason)) {
+                LOG_INFO(Render_Vulkan,
+                         "Bananza native upscale retained: {}; viewport={},{},{},{} depth={},{} "
+                         "attachment={}x{} clip_mode={}",
+                         reason, viewport.x, viewport.y, viewport.width, viewport.height,
+                         viewport.minDepth, viewport.maxDepth, depth.size.width, depth.size.height,
+                         static_cast<u32>(maxwell3d->regs.depth_mode));
+                bananza_fallback_reason = reason;
+            }
+            return;
+        }
+        const VkExtent2D render_extent{static_cast<u32>(viewport.width), depth.size.height};
+        for (const auto& candidate : bananza_cameras) {
+            if (candidate.channel == gpu_memory && candidate.frame == render_trace_frame &&
+                candidate.map_serial == gpu_memory->MapSerial() &&
+                candidate.depth_address == depth.gpu_addr)
+                return;
+        }
+        auto slot = std::ranges::find_if(bananza_cameras,
+                                         [](const auto& candidate) { return !candidate.channel; });
+        if (slot == bananza_cameras.end())
+            return;
+        buffer_cache.ForEachBoundBuffer(false, [&](u32 stage, bool storage, u32 index, bool,
+                                                   const auto& binding, u32 bound_size, const auto*,
+                                                   u32) {
+            std::array<f32, 44> constants{};
+            if (stage != 0 || storage || index != 3 || bound_size < sizeof(constants) ||
+                buffer_cache.IsRegionGpuModified(binding.device_addr, sizeof(constants)))
+                return;
+            device_memory.ReadBlockUnsafe(binding.device_addr, constants.data(), sizeof(constants));
+            if (!std::ranges::all_of(constants, [](f32 x) { return std::isfinite(x); }))
+                return;
+            SceneUpscaler::Camera camera{};
+            std::copy_n(constants.begin(), 12, camera.view.begin());
+            std::copy_n(constants.begin() + 12, 16, camera.view_projection.begin());
+            std::copy_n(constants.begin() + 28, 16, camera.projection.begin());
+            const auto& projection = camera.projection;
+            // Captured standard-depth perspective projection has no jitter. Any other layout
+            // needs its own proof; it must not inherit this reconstruction silently.
+            if (projection[14] != -1 || projection[15] != 0 || projection[0] <= 0 ||
+                projection[5] <= 0 || projection[2] != 0 || projection[6] != 0 ||
+                projection[10] >= -1 || projection[11] >= 0)
+                return;
+            for (size_t row = 0; row < 4; ++row) {
+                for (size_t col = 0; col < 4; ++col) {
+                    f32 composed = projection[row * 4 + 3] * (col == 3 ? 1.f : 0.f);
+                    for (size_t k = 0; k < 3; ++k)
+                        composed += projection[row * 4 + k] * camera.view[k * 4 + col];
+                    if (std::abs(composed - camera.view_projection[row * 4 + col]) >
+                        1e-4f * std::max(1.f, std::abs(composed)))
+                        return;
+                }
+            }
+            camera.pixel_to_clip = {2, -2, -1, 1};
+            camera.depth_to_clip = {2, -1};
+            *slot = {.channel = gpu_memory,
+                     .frame = render_trace_frame,
+                     .map_serial = gpu_memory->MapSerial(),
+                     .color_address = color.gpu_addr,
+                     .depth_address = depth.gpu_addr,
+                     .color_image = color.ImageHandle(),
+                     .depth_image = depth.ImageHandle(),
+                     .color_view = targets.color_buffer_ids[0],
+                     .depth_view = targets.depth_buffer_id,
+                     .extent = render_extent,
+                     .camera = camera};
+        });
+        return;
+    }
+    // The tonemap/color-grade pass samples the camera's scene attachment and writes the
+    // image consumed by SMAA. DRS uses a distinct target here; full resolution aliases it.
+    if (hashes[1] == 0x8e97cea098cfdbc6ULL && hashes[5] == 0xb56763026332db2eULL &&
+        bananza_scene.camera.channel == gpu_memory &&
+        bananza_scene.camera.frame == render_trace_frame &&
+        bananza_scene.camera.map_serial == gpu_memory->MapSerial() && targets.depth_buffer_id &&
+        color.format == PixelFormat::B10G11R11_FLOAT && plain(color)) {
+        const auto& depth = texture_cache.GetImageView(targets.depth_buffer_id);
+        const auto extent = bananza_scene.camera.extent;
+        const auto sampled = pipeline.SampledImages();
+        if (depth.gpu_addr == bananza_scene.camera.depth_address &&
+            depth.ImageHandle() == bananza_scene.camera.depth_image &&
+            color.size.width >= extent.width && color.size.width <= extent.width + 1 &&
+            color.size.height == extent.height &&
+            std::ranges::any_of(sampled, [&](const auto& input) {
+                return input.id && MatchesBananzaSceneImage(
+                           texture_cache.TryGetImageView(bananza_scene.camera.color_view),
+                           bananza_scene.camera.color_image,
+                           texture_cache.GetImageView(input.id), extent);
+            })) {
+            bananza_scene.camera.color_address = color.gpu_addr;
+            bananza_scene.camera.color_image = color.ImageHandle();
+            bananza_scene.camera.color_view = targets.color_buffer_ids[0];
+            bananza_scene.tonemap_frame = render_trace_frame;
+        }
+        return;
+    }
+    // The SMAA neighborhood resolve is the last scene-only color, immediately before NDSR
+    // (when DRS is active), the scene copy, and HUD draws.
+    if (hashes[1] != 0xeb21e6be1d399ddaULL || hashes[5] != 0x40c24603fc78bacaULL ||
+        bananza_scene.camera.channel != gpu_memory ||
+        bananza_scene.camera.frame != render_trace_frame ||
+        bananza_scene.camera.map_serial != gpu_memory->MapSerial() ||
+        bananza_scene.tonemap_frame != render_trace_frame || !bananza_scene.depth ||
+        !plain(color) || color.format != PixelFormat::B10G11R11_FLOAT)
+        return;
+    const auto extent = bananza_scene.camera.extent;
+    if (color.size.height != extent.height || color.size.width < extent.width ||
+        color.size.width > extent.width + 1)
+        return;
+    const auto sampled = pipeline.SampledImages();
+    if (sampled.size() != 2 || std::ranges::none_of(sampled, [&](const auto& input) {
+            return input.id && MatchesBananzaSceneImage(
+                       texture_cache.TryGetImageView(bananza_scene.camera.color_view),
+                       bananza_scene.camera.color_image,
+                       texture_cache.GetImageView(input.id), extent);
+        }))
+        return;
+    bananza_scene.color = targets.color_buffer_ids[0];
+    bananza_scene.color_address = color.gpu_addr;
+    bananza_scene.color_image = color.ImageHandle();
+    bananza_scene.resolve_frame = render_trace_frame;
+    // At full resolution the game omits the neural dispatch. Its resolve is already the
+    // native fallback, so copy it before evaluating and write back only on success.
+    if (extent.width == 2880 && extent.height == 1620)
+        TryBananzaUpscale(bananza_scene.color, bananza_scene.color);
+#endif
+}
+
+void RasterizerVulkan::TrackYoshiCompute(const ComputePipeline& pipeline, u64 native_key) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    using namespace VideoCommon::YoshiUpscale;
+    using VideoCore::Surface::PixelFormat;
+    if (program_id != PROGRAM_ID || yoshi_failed ||
+        !Settings::GetNvidiaDlssRuntimeSettings().enabled)
+        return;
+    const auto sampled = pipeline.SampledImages();
+    const auto written = pipeline.WrittenImages();
+    const auto plain = [&](const ImageView* image, u32 width, u32 height, PixelFormat format,
+                           u32 channels = 4) {
+        if (!image || !image->BackingImage() || image->IsRescaled() || image->format != format ||
+            image->size.width != width || image->size.height != height || image->size.depth != 1 ||
+            image->Samples() != VK_SAMPLE_COUNT_1_BIT || image->type != ImageViewType::e2D ||
+            image->range != VideoCommon::SubresourceRange{})
+            return false;
+        const auto& backing = *image->BackingImage();
+        if (backing.info.size.width != width || backing.info.size.height != height ||
+            backing.info.size.depth != 1 || !backing.guest_size_bytes ||
+            image->gpu_addr != backing.gpu_addr ||
+            !gpu_memory->IsFullyMappedRange(backing.gpu_addr, backing.guest_size_bytes) ||
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, backing.info.format)
+                    .format !=
+                MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, image->format).format)
+            return false;
+        const auto identity = [](VkComponentSwizzle a, VkComponentSwizzle b) {
+            return a == VK_COMPONENT_SWIZZLE_IDENTITY || a == b;
+        };
+        const auto s = image->Swizzle();
+        return identity(s.r, VK_COMPONENT_SWIZZLE_R) &&
+               (channels < 2 || identity(s.g, VK_COMPONENT_SWIZZLE_G)) &&
+               (channels < 3 || identity(s.b, VK_COMPONENT_SWIZZLE_B)) &&
+               (channels < 4 || identity(s.a, VK_COMPONENT_SWIZZLE_A));
+    };
+    const auto read = [&](u32 slot, auto& data) {
+        const auto& qmd = kepler_compute->launch_description;
+        const auto& cb = qmd.const_buffer_config[slot];
+        if (!(qmd.const_buffer_enable_mask & (1u << slot)) || cb.size < sizeof(data) ||
+            !gpu_memory->IsFullyMappedRange(cb.Address(), sizeof(data)))
+            return false;
+        gpu_memory->ReadBlockUnsafe(cb.Address(), data.data(), sizeof(data));
+        return true;
+    };
+    const auto fail = [&](const char* reason) {
+        if (yoshi_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Yoshi native temporal output retained: {}", reason);
+            yoshi_fallback_reason = reason;
+        }
+        if (yoshi_upscaler)
+            yoshi_upscaler->ResetHistory();
+    };
+    if (native_key == MOTION_NATIVE && pipeline.ShaderHash() == MOTION_SHADER) {
+        yoshi_scene = {};
+        if (sampled.size() != 2 || written.size() != 1 || !sampled[0].id || !sampled[1].id ||
+            !written[0])
+            return;
+        auto* encoded = texture_cache.TryGetImageView(sampled[0].id);
+        auto* depth = texture_cache.TryGetImageView(sampled[1].id);
+        auto* motion = texture_cache.TryGetImageView(written[0]);
+        if (!plain(encoded, 960, 540, PixelFormat::R16G16B16A16_UNORM, 2) ||
+            !plain(depth, 960, 540, PixelFormat::D24_UNORM_S8_UINT, 1) ||
+            !plain(motion, 1920, 1080, PixelFormat::R16G16_FLOAT, 2))
+            return;
+        std::array<f32, 512> camera{};
+        if (!read(4, yoshi_scene.constants) || !read(5, camera))
+            return;
+        const auto& p = camera;
+        const auto finite = [&](size_t first, size_t count) {
+            return std::all_of(camera.begin() + first / 4, camera.begin() + first / 4 + count,
+                               [](f32 x) { return std::isfinite(x); });
+        };
+        if (!finite(0xc0, 16) || !finite(0x1c0, 16) || !finite(0x460, 3) || !finite(0x7c0, 16) ||
+            p[0x1c0 / 4] <= 0 || p[0x1d4 / 4] <= 0 || p[0x1e8 / 4] != 0 || p[0x1ec / 4] != 1 ||
+            p[0x1f8 / 4] <= 0 || p[0x1fc / 4] != 0)
+            return;
+        std::memcpy(yoshi_scene.position.data(), camera.data() + 0x460 / 4, 3 * sizeof(f32));
+        yoshi_scene.direction = {camera[0xc8 / 4], camera[0xd8 / 4], camera[0xe8 / 4]};
+        yoshi_scene.projection = {p[0x1c0 / 4], p[0x1d4 / 4], p[0x1f8 / 4]};
+        yoshi_scene.projection_jitter = {p[0x1e0 / 4] * 480.f, p[0x1e4 / 4] * -270.f};
+        yoshi_scene.channel = gpu_memory;
+        yoshi_scene.frame = render_trace_frame;
+        yoshi_scene.map_serial = gpu_memory->MapSerial();
+        yoshi_scene.depth_address = depth->gpu_addr;
+        yoshi_scene.motion_address = motion->gpu_addr;
+        yoshi_scene.depth_image = depth->ImageHandle();
+        yoshi_scene.motion_image = motion->ImageHandle();
+        return;
+    }
+    if (native_key != TEMPORAL_NATIVE || pipeline.ShaderHash() != TEMPORAL_SHADER)
+        return;
+    if (yoshi_scene.channel != gpu_memory || yoshi_scene.frame != render_trace_frame ||
+        yoshi_scene.map_serial != gpu_memory->MapSerial() || sampled.size() != 5 ||
+        written.size() != 4 || std::ranges::any_of(sampled, [](const auto& s) { return !s.id; }) ||
+        std::ranges::any_of(written, [](auto id) { return !id; })) {
+        fail("missing same-frame native motion");
+        return;
+    }
+    std::array<u8, 608> constants{};
+    const auto contract =
+        read(0, constants) ? Decode(yoshi_scene.constants, constants) : std::nullopt;
+    if (!contract || std::abs(contract->jitter[0] - yoshi_scene.projection_jitter[0]) > 1e-5f ||
+        std::abs(contract->jitter[1] - yoshi_scene.projection_jitter[1]) > 1e-5f) {
+        fail("unrecognized temporal crop or jitter");
+        return;
+    }
+    auto* color = texture_cache.TryGetImageView(sampled[0].id);
+    auto* motion = texture_cache.TryGetImageView(sampled[2].id);
+    auto* depth = texture_cache.TryGetImageView(sampled[3].id);
+    auto* target = texture_cache.TryGetImageView(written[3]);
+    if (!plain(color, 960, 540, PixelFormat::B10G11R11_FLOAT, 3) ||
+        !plain(depth, 960, 540, PixelFormat::D24_UNORM_S8_UINT, 1) ||
+        !plain(motion, 1920, 1080, PixelFormat::R16G16_FLOAT, 2) ||
+        !plain(target, 1920, 1080, PixelFormat::R16G16B16A16_FLOAT) ||
+        depth->gpu_addr != yoshi_scene.depth_address ||
+        depth->ImageHandle() != yoshi_scene.depth_image ||
+        motion->gpu_addr != yoshi_scene.motion_address ||
+        motion->ImageHandle() != yoshi_scene.motion_image ||
+        target->ImageHandle() == color->ImageHandle()) {
+        fail("native scene resource link changed");
+        return;
+    }
+    constexpr VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    const auto depth_format = MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false,
+                                                         depth->BackingImage()->info.format)
+                                  .format;
+    if (MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, depth->format).format !=
+            depth_format ||
+        (depth_format != VK_FORMAT_D24_UNORM_S8_UINT &&
+         depth_format != VK_FORMAT_D32_SFLOAT_S8_UINT) ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target->format).format !=
+            format ||
+        !(target->BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) ||
+        !device.IsFormatSupported(format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal)) {
+        fail("unsupported host target or depth format");
+        return;
+    }
+    try {
+        const auto output =
+            target->StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
+        if (!output || !depth->DepthView()) {
+            fail("missing scene image view");
+            return;
+        }
+        if (!yoshi_upscaler) {
+            yoshi_motion =
+                std::make_unique<YoshiMotion>(device, scheduler, memory_allocator, descriptor_pool,
+                                              compute_pass_descriptor_queue);
+            yoshi_upscaler =
+                std::make_unique<SceneUpscaler>(device, scheduler, memory_allocator,
+                                                descriptor_pool, compute_pass_descriptor_queue);
+            LOG_INFO(Render_Vulkan, "Yoshi NVIDIA temporal candidate: 960x540 -> 1920x1080 HDR, "
+                                    "native object/camera motion and projection jitter, native "
+                                    "histories and tonemap retained");
+        }
+        NvidiaDlssUpscaler::Inputs inputs{};
+        inputs.color.view = color->Handle(Shader::TextureType::Color2D);
+        inputs.depth = {depth->DepthView(),
+                        depth->ImageHandle(),
+                        depth_format,
+                        {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+                        depth->BackingImage()->AspectMask()};
+        inputs.render_size = {960, 540};
+        inputs.upscale_size = {1920, 1080};
+        inputs.jitter = contract->jitter;
+        inputs.reset = contract->reset || yoshi_previous.frame + 1 != render_trace_frame ||
+                       yoshi_previous.channel != gpu_memory ||
+                       yoshi_previous.map_serial != gpu_memory->MapSerial();
+        double distance{};
+        f32 direction{};
+        for (size_t i = 0; i < 3; ++i) {
+            distance += std::pow(double(yoshi_scene.position[i]) - yoshi_previous.position[i], 2);
+            direction += yoshi_scene.direction[i] * yoshi_previous.direction[i];
+            inputs.reset |=
+                std::abs(yoshi_scene.projection[i] - yoshi_previous.projection[i]) > 1e-3f;
+        }
+        inputs.reset |= distance > 500. * 500. || direction < .5f;
+        inputs.motion_vectors = yoshi_motion->Record(motion->Handle(Shader::TextureType::Color2D),
+                                                     inputs.render_size, inputs.upscale_size);
+        if (!yoshi_upscaler->RecordWithMotion(inputs, output, render_trace_frame, format)) {
+            fail("DLSS declined the frame");
+            return;
+        }
+        yoshi_previous = yoshi_scene;
+        yoshi_fallback_reason = nullptr;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Yoshi NVIDIA DLSS unavailable: {}", error.what());
+        yoshi_failed = true;
+    }
+#endif
+}
+
+void RasterizerVulkan::TrackBananzaCompute(const ComputePipeline& pipeline) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (program_id != 0x040074A01BF12000ULL || !Settings::GetNvidiaDlssRuntimeSettings().enabled ||
+        bananza_failed)
+        return;
+    const auto sampled = pipeline.SampledImages();
+    if (pipeline.ShaderHash() == 0xfa41bddd07b97523ULL) {
+        // This exact main-scene depth reader uses CB0+0x30. Match its resolved image to
+        // the depth attachment that was drawn with the captured camera, in this frame/channel.
+        if (sampled.size() != 1 || !sampled[0].id)
+            return;
+        const auto& depth = texture_cache.GetImageView(sampled[0].id);
+        const auto descriptor = kepler_compute->ConstBuffer0Image(0x30);
+        if (!descriptor || descriptor->Address() != depth.gpu_addr)
+            return;
+        for (const auto& camera : bananza_cameras) {
+            if (camera.channel == gpu_memory && camera.frame == render_trace_frame &&
+                camera.map_serial == gpu_memory->MapSerial() &&
+                camera.depth_address == depth.gpu_addr &&
+                camera.extent.width == descriptor->Width() &&
+                camera.extent.height == descriptor->Height() &&
+                MatchesBananzaSceneImage(texture_cache.TryGetImageView(camera.depth_view),
+                                         camera.depth_image, depth, camera.extent)) {
+                bananza_scene.camera = camera;
+                bananza_scene.depth = sampled[0].id;
+                bananza_scene.depth_image = depth.ImageHandle();
+                break;
+            }
+        }
+        return;
+    }
+    constexpr std::array native_networks{0xcd25b1bef2c4558aULL, 0x792039712972eb09ULL,
+                                         0xafefd62ccede1c51ULL};
+    if (std::ranges::find(native_networks, pipeline.ShaderHash()) == native_networks.end() ||
+        bananza_scene.resolve_frame != render_trace_frame || !bananza_scene.color)
+        return;
+    const auto written = pipeline.WrittenImages();
+    if (sampled.size() != 1 || written.size() != 1 || !sampled[0].id || !written[0])
+        return;
+    const auto& color = texture_cache.GetImageView(sampled[0].id);
+    if (color.gpu_addr != bananza_scene.color_address ||
+        !MatchesBananzaSceneImage(texture_cache.TryGetImageView(bananza_scene.color),
+                                 bananza_scene.color_image, color, bananza_scene.camera.extent))
+        return;
+    const auto& qmd = kepler_compute->launch_description;
+    const auto& cbuf = qmd.const_buffer_config[0];
+    if (!(qmd.const_buffer_enable_mask & 1) || cbuf.size < 0x30 ||
+        !gpu_memory->IsFullyMappedRange(cbuf.Address(), 0x30))
+        return;
+    std::array<u32, 8> crop{};
+    gpu_memory->ReadBlockUnsafe(cbuf.Address() + 0x10, crop.data(), sizeof(crop));
+    const auto extent = bananza_scene.camera.extent;
+    if (crop != std::array<u32, 8>{0, 0, extent.width - 1, extent.height - 1, 0, 0, 2879, 1619})
+        return;
+    TryBananzaUpscale(sampled[0].id, written[0]);
+#endif
+}
+
+bool RasterizerVulkan::TryBananzaUpscale(VideoCommon::ImageViewId color_id,
+                                         VideoCommon::ImageViewId target_id) {
+#ifdef EGLANTINE_NVIDIA_DLSS
+    using VideoCore::Surface::PixelFormat;
+    const auto fail = [&](const char* reason) {
+        if (bananza_fallback_reason != reason) {
+            LOG_INFO(Render_Vulkan, "Bananza native upscale retained: {}", reason);
+            bananza_fallback_reason = reason;
+        }
+        return false;
+    };
+    if (!bananza_scene.depth || bananza_scene.camera.channel != gpu_memory ||
+        bananza_scene.camera.frame != render_trace_frame ||
+        bananza_scene.camera.map_serial != gpu_memory->MapSerial() ||
+        bananza_scene.resolve_frame != render_trace_frame)
+        return fail("incomplete same-frame scene");
+    auto* depth_view = texture_cache.TryGetImageView(bananza_scene.depth);
+    auto* color_view = texture_cache.TryGetImageView(color_id);
+    auto* target_view = texture_cache.TryGetImageView(target_id);
+    auto* produced = texture_cache.TryGetImageView(bananza_scene.color);
+    if (!depth_view || !color_view || !target_view || !produced ||
+        produced->gpu_addr != bananza_scene.color_address ||
+        produced->ImageHandle() != bananza_scene.color_image ||
+        produced->range != color_view->range)
+        return fail("scene views invalidated");
+    auto& depth = *depth_view;
+    const auto& color = *color_view;
+    auto& target = *target_view;
+    const auto extent = bananza_scene.camera.extent;
+    const auto plain = [](const ImageView& image) {
+        return image.BackingImage() && !image.IsRescaled() && image.size.depth == 1 &&
+               image.Samples() == VK_SAMPLE_COUNT_1_BIT && image.type == ImageViewType::e2D &&
+               image.range == VideoCommon::SubresourceRange{};
+    };
+    // The captured depth descriptor maps R,0,0,1 and B10G11R11 maps R,G,B,1.
+    // Only the channels actually consumed must be identity; DepthView/StorageView create
+    // unswizzled aspect views, and the color conversion explicitly writes opaque alpha.
+    const auto identity = [](VkComponentSwizzle actual, VkComponentSwizzle channel) {
+        return actual == VK_COMPONENT_SWIZZLE_IDENTITY || actual == channel;
+    };
+    const auto rgb_identity = [&](const ImageView& image) {
+        const auto swizzle = image.Swizzle();
+        return identity(swizzle.r, VK_COMPONENT_SWIZZLE_R) &&
+               identity(swizzle.g, VK_COMPONENT_SWIZZLE_G) &&
+               identity(swizzle.b, VK_COMPONENT_SWIZZLE_B);
+    };
+    if (!plain(depth) || !plain(color) || !plain(target) ||
+        !identity(depth.Swizzle().r, VK_COMPONENT_SWIZZLE_R) ||
+        !rgb_identity(color) || !rgb_identity(target) ||
+        depth.format != PixelFormat::D32_FLOAT || color.format != PixelFormat::B10G11R11_FLOAT ||
+        target.format != PixelFormat::B10G11R11_FLOAT ||
+        depth.ImageHandle() == target.ImageHandle() ||
+        depth.ImageHandle() != bananza_scene.depth_image ||
+        depth.gpu_addr != bananza_scene.camera.depth_address ||
+        color.gpu_addr != bananza_scene.color_address ||
+        !MatchesBananzaSceneImage(produced, bananza_scene.color_image, color, extent) ||
+        depth.size.width < extent.width || depth.size.width > extent.width + 1 ||
+        depth.size.height != extent.height || color.size.width < extent.width ||
+        color.size.width > extent.width + 1 || color.size.height != extent.height ||
+        target.size.width != 2880 || target.size.height != 1620) {
+        static const bool trace_contract = [] {
+            const char* value = std::getenv("EDEN_NX2_DLSS_CONTRACT_TRACE");
+            return value && std::string_view{value} == "1";
+        }();
+        if (trace_contract && (!bananza_fallback_reason ||
+                               std::string_view{bananza_fallback_reason} != "scene images changed")) {
+            for (const auto& [name, view] :
+                 std::array{std::pair{"depth", static_cast<const ImageView*>(&depth)},
+                            std::pair{"color", &color},
+                            std::pair{"target", static_cast<const ImageView*>(&target)}}) {
+                const auto* backing = view->BackingImage();
+                const auto swizzle = view->Swizzle();
+                LOG_INFO(Render_Vulkan,
+                         "Bananza scene contract {}: addr={:#x} view={}x{}x{} backing={}x{} "
+                         "format={} type={} samples={} rescaled={} identity={} swizzle={},{},{},{} "
+                         "level={}+{} layer={}+{}",
+                         name, view->gpu_addr, view->size.width, view->size.height, view->size.depth,
+                         backing ? backing->info.size.width : 0,
+                         backing ? backing->info.size.height : 0, static_cast<u32>(view->format),
+                         static_cast<u32>(view->type), static_cast<u32>(view->Samples()),
+                         view->IsRescaled(), view->HasIdentitySwizzle(),
+                         static_cast<u32>(swizzle.r), static_cast<u32>(swizzle.g),
+                         static_cast<u32>(swizzle.b), static_cast<u32>(swizzle.a),
+                         view->range.base.level, view->range.extent.levels,
+                         view->range.base.layer, view->range.extent.layers);
+            }
+            LOG_INFO(Render_Vulkan,
+                     "Bananza scene contract expected: {}x{}, depth_image={} depth_addr={} "
+                     "color_image={} color_addr={} depth_target_alias={}",
+                     extent.width, extent.height,
+                     depth.ImageHandle() == bananza_scene.depth_image,
+                     depth.gpu_addr == bananza_scene.camera.depth_address,
+                     MatchesBananzaSceneImage(produced, bananza_scene.color_image, color, extent),
+                     color.gpu_addr == bananza_scene.color_address,
+                     depth.ImageHandle() == target.ImageHandle());
+        }
+        return fail("scene images changed");
+    }
+    constexpr VkFormat target_format = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    if (!device.IsStorageImageExtendedFormatsSupported() ||
+        !device.IsFormatSupported(target_format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,
+                                  FormatType::Optimal) ||
+        (target.BackingImage()->UsageFlags() & VK_IMAGE_USAGE_STORAGE_BIT) == 0 ||
+        MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, true, target.format).format !=
+            target_format)
+        return fail("unsupported output storage image");
+    try {
+        const auto target_view =
+            target.StorageView(Shader::TextureType::Color2D, Shader::ImageFormat::Typeless, false);
+        const auto color_view = color.Handle(Shader::TextureType::Color2D);
+        if (!target_view || !color_view || !depth.DepthView())
+            return fail("missing image view");
+        if (!bananza_upscaler)
+            bananza_upscaler =
+                std::make_unique<SceneUpscaler>(device, scheduler, memory_allocator,
+                                                descriptor_pool, compute_pass_descriptor_queue);
+        NvidiaDlssUpscaler::Inputs inputs{};
+        inputs.color.view = color_view; // Only the active crop is copied into owned RGBA16F.
+        inputs.depth = {depth.DepthView(),
+                        depth.ImageHandle(),
+                        VK_FORMAT_D32_SFLOAT,
+                        {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+                        VK_IMAGE_ASPECT_DEPTH_BIT};
+        inputs.render_size = extent;
+        inputs.upscale_size = {target.size.width, target.size.height};
+        inputs.dynamic_resolution = true;
+        inputs.depth_inverted = false;
+        // The final guest copy writes an SRGB attachment; the scene before that copy is linear.
+        inputs.hdr = true;
+        if (!bananza_upscaler->Record(inputs, target_view, bananza_scene.camera.camera,
+                                      render_trace_frame))
+            return fail("DLSS declined the frame");
+        bananza_fallback_reason = nullptr;
+        return true;
+    } catch (const vk::Exception& error) {
+        LOG_WARNING(Render_Vulkan, "Bananza NVIDIA DLSS unavailable: {}", error.what());
+        bananza_failed = true;
+    }
+#endif
+    return false;
 }
 
 bool RasterizerVulkan::OcarinaTemporalEnabled() const {
@@ -3436,6 +5580,43 @@ void RasterizerVulkan::TickFrame() {
     }
     frame_dump.TickFrame();
     ++render_trace_frame;
+#ifdef EGLANTINE_NVIDIA_DLSS
+    if (program_id == 0x0400380020056000ULL) {
+        const bool enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+        if (raiders_upscaler && enabled != raiders_enabled)
+            raiders_upscaler->ResetHistory();
+        raiders_enabled = enabled;
+        raiders_scene = {};
+    }
+    if (program_id == 0x0400A3A01EE4C000ULL) {
+        const bool enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+        if (pokopia_upscaler && enabled != pokopia_enabled) pokopia_upscaler->ResetHistory();
+        pokopia_enabled = enabled;
+        pokopia_scene = {};
+    }
+    if (program_id == VideoCommon::YoshiUpscale::PROGRAM_ID) {
+        const bool enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+        if (yoshi_upscaler && enabled != yoshi_enabled) yoshi_upscaler->ResetHistory();
+        yoshi_enabled = enabled;
+        yoshi_scene = {};
+    }
+    if (program_id == VideoCommon::KirbyUpscale::PROGRAM_ID) {
+        const bool enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+        if (enabled != kirby_enabled) {
+            if (kirby_upscaler) kirby_upscaler->ResetHistory();
+            kirby_origin_channel = nullptr;
+        }
+        kirby_enabled = enabled;
+        kirby_scene = {};
+    }
+    if (program_id == 0x040074A01BF12000ULL) {
+        const bool enabled = Settings::GetNvidiaDlssRuntimeSettings().enabled;
+        if (bananza_upscaler && enabled != bananza_enabled) bananza_upscaler->ResetHistory();
+        bananza_enabled = enabled;
+        bananza_cameras = {};
+        bananza_scene = {};
+    }
+#endif
     if (program_id == 0x0400486024DEC000ULL && oot_backend) {
         const auto backend = ResolveOcarinaUpscaler(device);
         if (backend != *oot_backend) {
@@ -3567,10 +5748,10 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
     std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history,
-    bool reset_history) {
+    bool reset_history, std::optional<std::array<u32, 2>> render_region) {
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
-                                         use_history, reset_history);
+                                         use_history, reset_history, render_region);
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {
