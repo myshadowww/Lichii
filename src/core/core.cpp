@@ -582,6 +582,7 @@ struct System::Impl {
             service_manager->Close();
         }
         kernel.CloseServices();
+        applet_manager.DropPendingProcess();
         kernel.ShutdownCores();
         services.reset();
         service_manager.reset();
