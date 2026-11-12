@@ -2499,3 +2499,40 @@ TEST_CASE("Claimed inner invalidations preserve every write on a GPU-written pag
     REQUIRE(buffer.bytes[0x7ff] == 0x12);
     REQUIRE(buffer.bytes[0x810] == 0x12);
 }
+
+TEST_CASE("DMA clear finds registered buffers beyond its first quarter",
+          "[buffer_ports][dma_clear]") {
+    Fixture f;
+    f.memory->Map(0x200000, 0x10000, 0x30000, Tegra::PTEKind::PITCH, true);
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    f.cache->CreateChannel(state);
+    f.cache->BindToChannel(0);
+
+    constexpr DAddr address = 0x18000;
+    constexpr GPUVAddr gpu_address = 0x208000;
+    constexpr u64 words = 0x3000;
+    constexpr u64 bytes = words * sizeof(u32);
+    REQUIRE_FALSE(f.cache->DMAClear(gpu_address, words, 0x3c3c3c3c));
+
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x77);
+    Access::Dirty(*f.cache, 0x20000, 0x10000);
+    REQUIRE_FALSE(f.cache->IsRegionRegistered(address, words));
+    REQUIRE(f.cache->IsRegionRegistered(address, bytes));
+    REQUIRE(f.cache->DMAClear(gpu_address, words, 0x3c3c3c3c));
+
+    // The production clear grows the buffer across the unregistered prefix and retains the
+    // original buffer's bytes beyond the clear. Reacquire it after that merge.
+    const auto cleared_id = Access::Find(*f.cache, address, bytes);
+    const auto& cleared = Access::Get(*f.cache, cleared_id);
+    REQUIRE(std::ranges::all_of(
+        std::span{cleared.bytes}.subspan(cleared.Offset(address), bytes),
+        [](u8 byte) { return byte == 0x3c; }));
+    REQUIRE(std::ranges::all_of(
+        std::span{cleared.bytes}.subspan(cleared.Offset(address + bytes), 0xc000),
+        [](u8 byte) { return byte == 0x77; }));
+    REQUIRE_FALSE(Access::Pending(*f.cache, 0x20000, 0x4000));
+    REQUIRE(Access::Pending(*f.cache, 0x24000, 0xc000));
+}
