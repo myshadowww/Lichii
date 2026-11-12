@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <optional>
 
 #include "common/common_types.h"
 
@@ -24,6 +25,25 @@ constexpr u64 MinEvictionAge = 150;
         return mode_age;
     }
     return (std::max)(mode_age, MinEvictionAge);
+}
+
+/// Diagnostic retention may delay routine collection, but never a pressure pass. Aggressive
+/// collection below a known budget still keeps the adaptive floor selected by EvictionAge.
+[[nodiscard]] constexpr u64 TextureGcEffectiveMinAge(u64 mode_age, u64 diagnostic_min_age,
+                                                     u64 usage, u64 limit, bool out_of_memory,
+                                                     bool aggressive_mode) {
+    const u64 age = EvictionAge(mode_age, usage, limit, out_of_memory);
+    const bool at_limit = limit != 0 && usage >= limit;
+    return aggressive_mode || out_of_memory || at_limit ? age
+                                                       : (std::max)(age, diagnostic_min_age);
+}
+
+/// No image is old enough before the age window has elapsed, including one last used at tick 0.
+[[nodiscard]] constexpr std::optional<u64> EvictionCutoff(u64 frame_tick, u64 age) {
+    if (frame_tick < age) {
+        return std::nullopt;
+    }
+    return frame_tick - age;
 }
 
 } // namespace VideoCommon
