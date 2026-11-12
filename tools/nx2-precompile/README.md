@@ -244,7 +244,12 @@ Environments are stored once and shared by the records that use them.
   own pipeline cache.
 - `EDEN_NX2_PRECOMPILED_FORCE=1`: prepare again although `precompiled_prepared.fork-v<N>.txt` says the
   file was prepared for this driver and build.
-- `EDEN_NX2_EVICT_AFTER_FRAMES=<frames>`: frames a graphics pipeline may go unused before it is
-  destroyed (default 9000); `0` keeps every pipeline.
 - `EDEN_NX2_PIPELINE_LOG_LIMIT=<n>`: how many runtime pipeline builds over 2 ms are logged (default
   400; builds over 100 ms are always logged).
+
+Graphics pipelines now remain resident up to an estimated host-memory budget; eviction selects
+pipelines unused for at least 9000 frames. Valid compressed SPIR-V is retained separately so an
+evicted pipeline can be rebuilt without translating its guest shaders again. The old
+`EDEN_NX2_EVICT_AFTER_FRAMES` and `EDEN_NX2_PRELOAD_ALL_PIPELINES` overrides are no longer read.
+Use **Advanced > Shaders > Build all cached shaders before game start** for the latter behavior.
+This setting controls recorded shader caches; recipe preparation remains a separate step.

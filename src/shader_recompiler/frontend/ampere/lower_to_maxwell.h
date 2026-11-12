@@ -1992,10 +1992,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool target_between = std::any_of(relocations.begin(), relocations.end(),
                 [&](const Relocation& relocation) { return relocation.target > compare && relocation.target <= index; });
             if (opcode == 0x887 && native_predicate == 7 && compare < index && !target_between &&
-                condition == 0 && insn.words[1] <= 0x7ffff &&
+                insn.words[1] <= 0x7ffff &&
                 code[compare].Bits(12, 4) == 7 && code[compare].Bits(24, 8) == insn.Bits(24, 8) &&
-                code[compare].words[1] == insn.words[1] && code[compare].words[2] == 0x0bf01070 &&
-                insn.words[2] == 0x08000000) {
+                code[compare].words[1] == insn.words[1] &&
+                code[compare].words[2] == (0x0bf01070U | (condition << 17)) &&
+                insn.words[2] == (0x08000000U | (condition << 23))) {
                 // Preserve the unsigned clamp idiom for indirect-table analysis.
                 emit(0x3820000000070000ULL | target | (u64{a} << 8) |
                      (u64{insn.words[1]} << 20) | (u64{7} << 39));
@@ -2610,7 +2611,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                           dest >= register_limit ||
                           // Up to two taps pack into dest alone (mask 3 with no second register).
                           (std::popcount(mask) > 2 && second_dest >= register_limit))) ||
-                (offsets && ((bindless && (array || source_b >= register_limit)) || source_b == 255 ||
+                (offsets && ((bindless && (array || source_a + 2 > register_limit || source_b >= register_limit)) ||
+                             source_b == 255 ||
                              (source_a != 255 && source_a >= 245))) ||
                 (per_tap && (bindless || depth || insn.Bits(80, 1) || insn.Bits(91, 1))) ||
                 insn.Bits(89, 1) || mask == 0 ||
@@ -3292,13 +3294,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0x845: case 0x906: {
             const bool round_up = opcode == 0x906;
             if (opcode == 0x906 && !insn.Bits(24, 8) && !(insn.words[3] & 0xc00001ffU) &&
-                (insn.words[2] & ~0xdc00U) == 0x00200000U && insn.Bits(75, 2) == 1) {
-                // I2F.F16.U32/S32 immediate (from Orchid): format at 75-76 and rounding at 78-79,
-                // as Maxwell I2F's 8 and 39.
+                (insn.words[2] & ~0x1c00U) == 0x00200000U && insn.Bits(75, 2) == 1) {
+                // I2F.F16.U32/S32 immediate (from Orchid), format at 75-76. Only round to nearest:
+                // the half conversion is emitted without a rounding mode.
                 mov_imm(250, insn.words[1]);
                 emit(base(0x5cb8000000000000ULL) | (u64{1} << 8) | (u64{2} << 10) |
-                     (u64{insn.Bits(74, 1)} << 13) | (u64{250} << 20) |
-                     (u64{insn.Bits(78, 2)} << 39));
+                     (u64{insn.Bits(74, 1)} << 13) | (u64{250} << 20));
                 break;
             }
             if (insn.Bits(24, 8) || (insn.words[3] & 0xc00001ffU) ||

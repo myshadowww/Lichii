@@ -291,6 +291,12 @@ private:
     void DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd);
     void RememberDlssMotionVectors();
     bool TryFireEmblemUpscale(bool allow_history = true);
+    bool ScaleDlssRenderRegion(
+        GPUVAddr constants, const std::optional<Texture::TICEntry>& input,
+        const std::optional<Texture::TICEntry>& output,
+        const std::optional<VideoCommon::FireEmblemUpscale::JitterSample>& jitter,
+        const std::optional<Texture::TICEntry>& motion,
+        const std::optional<Texture::TICEntry>& depth, bool allow_history);
     void CaptureFireEmblemJitter();
     bool FinishDlssEvaluation();
     void CheckDlssNetwork();
@@ -304,6 +310,7 @@ private:
     struct DlssChain {
         bool active{};
         bool star_fox{};
+        bool render_region{};
         bool output_pass{};
         u32 rejected{};
         u32 clean_evaluations{};

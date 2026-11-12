@@ -41,6 +41,31 @@ TEST_CASE("FE upscale substitute only selects the captured output pass", "[fe_up
     }
 }
 
+TEST_CASE("Captured DLSS passes keep title-specific history and region contracts", "[fe_upscale]") {
+    const auto fire_emblem = FE::CapturedPasses(FE::ProgramId);
+    const auto star_fox = FE::CapturedPasses(FE::StarFoxProgramId);
+    const auto duskbloods = FE::CapturedPasses(FE::DuskbloodsProgramId);
+    REQUIRE(fire_emblem);
+    REQUIRE(star_fox);
+    REQUIRE(duskbloods);
+    REQUIRE(fire_emblem->IsPrepass(FE::PrepassProgramKey));
+    REQUIRE(fire_emblem->IsPrepass(FE::AlternatePrepassProgramKey));
+    REQUIRE_FALSE(fire_emblem->star_fox);
+    REQUIRE_FALSE(fire_emblem->render_region);
+    REQUIRE(star_fox->IsPrepass(FE::StarFoxPrepassProgramKey));
+    REQUIRE(star_fox->IsPrepass(FE::StarFoxCutscenePrepassProgramKey));
+    REQUIRE(star_fox->star_fox);
+    REQUIRE_FALSE(star_fox->render_region);
+    REQUIRE(duskbloods->IsPrepass(FE::DuskbloodsPrepassProgramKey));
+    REQUIRE_FALSE(duskbloods->IsPrepass(0));
+    REQUIRE_FALSE(duskbloods->IsPrepass(FE::AlternatePrepassProgramKey));
+    REQUIRE_FALSE(duskbloods->IsPrepass(FE::StarFoxCutscenePrepassProgramKey));
+    REQUIRE_FALSE(duskbloods->star_fox);
+    REQUIRE(duskbloods->render_region);
+    REQUIRE(FE::UseReplacement(FE::DuskbloodsProgramId, FE::DuskbloodsOutputProgramKey, nullptr));
+    REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::DuskbloodsOutputProgramKey, nullptr));
+}
+
 TEST_CASE("FE upscale substitute validates both surface descriptors", "[fe_upscale]") {
     const auto input = Image(0x100000, 1280, 720);
     const auto output = Image(0x800000, 2560, 1440);
