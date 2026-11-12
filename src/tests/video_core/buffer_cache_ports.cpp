@@ -18,6 +18,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
@@ -2450,4 +2451,51 @@ TEST_CASE("Async read-back counts the reading thread's and the GPU side's waits 
     REQUIRE(counters.reader_waits.load() - reader_waits == 1);
     REQUIRE(counters.gpu_side_waits.load() - gpu_side_waits == 1);
     REQUIRE(f.runtime.host_read_waits == 2);
+}
+
+TEST_CASE("Claimed inner invalidations preserve every write on a GPU-written page",
+          "[buffer_ports][inner_invalidation]") {
+    const bool native = GENERATE(false, true);
+    Fixture f;
+    const bool previous = Tegra::g_nx2_ampere.exchange(native);
+    SCOPE_EXIT { Tegra::g_nx2_ampere.store(previous); };
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 0x12);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    std::memset(f.bytes + 0x10100, 0xaa, 0x10);
+    std::memset(f.bytes + 0x10800, 0xbb, 0x10);
+    const std::array<std::pair<DAddr, std::size_t>, 2> ranges{{{0x20100, 0x10},
+                                                            {0x20800, 0x10}}};
+    // Match InnerInvalidation's span and ordering, on the scheduler's owner thread. A separate
+    // thread keeps its GPU-thread marker from affecting other tests.
+    std::thread{[&] {
+        VideoCommon::GpuSplit::MarkGpuThread();
+        f.cache->ClaimCpuWrites(std::span{ranges});
+        for (const auto& [address, size] : ranges) {
+            f.cache->WriteMemory(address, size);
+        }
+    }}.join();
+    REQUIRE(std::ranges::all_of(std::span{f.bytes + 0x10100, 0x10},
+                               [](u8 byte) { return byte == 0xaa; }));
+    REQUIRE(std::ranges::all_of(std::span{f.bytes + 0x10800, 0x10},
+                               [](u8 byte) { return byte == 0xbb; }));
+    if (native) {
+        REQUIRE(f.runtime.downloads == 0);
+        REQUIRE(f.runtime.uploads == 2);
+        REQUIRE(f.bytes[0x10810] == 0);
+    } else {
+        REQUIRE(f.runtime.downloads != 0);
+        REQUIRE(f.bytes[0x10000] == 0x12);
+        REQUIRE(f.bytes[0x10810] == 0x12);
+    }
+    Access::Upload(*f.cache, id, 0x20000, 0x1000);
+    REQUIRE(buffer.bytes[0x100] == 0xaa);
+    REQUIRE(buffer.bytes[0x10f] == 0xaa);
+    REQUIRE(buffer.bytes[0x800] == 0xbb);
+    REQUIRE(buffer.bytes[0x80f] == 0xbb);
+    REQUIRE(buffer.bytes[0xff] == 0x12);
+    REQUIRE(buffer.bytes[0x110] == 0x12);
+    REQUIRE(buffer.bytes[0x7ff] == 0x12);
+    REQUIRE(buffer.bytes[0x810] == 0x12);
 }
