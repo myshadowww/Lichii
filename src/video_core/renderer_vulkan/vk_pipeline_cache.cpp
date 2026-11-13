@@ -28,12 +28,11 @@
 #include <vector>
 #include <zstd.h>
 #include "common/cityhash.h"
-#include "common/fs/file_lock.h"
-#include "common/settings.h"
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
+#include "common/settings.h"
 #include "common/scope_exit.h"
 #include "common/shutdown_progress.h"
 #include "common/thread.h"

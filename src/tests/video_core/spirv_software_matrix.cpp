@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <vector>
+#include <catch2/generators/catch_generators.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -308,6 +309,65 @@ TEST_CASE("Software HMMA rounds once per uniform K8 group", "[video_core][tensor
         REQUIRE(fma_operations == 32);
         REQUIRE(Instructions(code, 345).size() == 16); // OpGroupNonUniformShuffle
         REQUIRE(Instructions(code, 247).empty());      // No per-pair rounding branch.
+    }
+}
+
+TEST_CASE("Software HMMA native half rounding requests compatible float controls",
+          "[video_core][tensor][ampere]") {
+    const bool shared_with_fp64 = GENERATE(false, true);
+    TensorProgram fixture{1, 16};
+    auto& profile = fixture.profile;
+    profile.support_float_controls = true;
+    profile.support_fp16_rounding_rte = true;
+    profile.support_fp16_denorm_preserve = true;
+    profile.fp16_float_controls_independent_of_fp32 = true;
+    profile.support_separate_denorm_behavior = !shared_with_fp64;
+    profile.support_separate_rounding_mode = !shared_with_fp64;
+    profile.fp16_float_controls_shared_with_fp64 = shared_with_fp64;
+    profile.support_fp64_rounding_rte = true;
+    profile.support_fp64_denorm_preserve = true;
+    bool native = true;
+    SECTION("Supported controls") {}
+    SECTION("Broken proprietary fp16 controls") {
+        profile.has_broken_fp16_float_controls = true;
+        native = false;
+    }
+    SECTION("Guest flushes half denormals") {
+        fixture.program.info.uses_fp16_denorms_flush = true;
+        native = false;
+    }
+    SECTION("Half controls cannot differ from fp32") {
+        profile.fp16_float_controls_independent_of_fp32 = false;
+        native = false;
+    }
+    SECTION("Half rounding unsupported") {
+        profile.support_fp16_rounding_rte = false;
+        native = false;
+    }
+    SECTION("Shared double controls unsupported") {
+        profile.support_fp64_denorm_preserve = false;
+        native = !shared_with_fp64;
+    }
+    const auto code = fixture.Emit();
+    const auto conversions = Instructions(code, 115); // OpFConvert
+    REQUIRE(conversions.size() == (native ? 8 : 0));
+    const auto decorations = Instructions(code, 71); // OpDecorate
+    for (const auto& conversion : conversions) {
+        REQUIRE(std::ranges::any_of(decorations, [&](const auto& words) {
+            return words[0] == conversion[1] && words[1] == 42; // NoContraction
+        }));
+    }
+    const auto modes = Instructions(code, 16); // OpExecutionMode
+    const auto has_mode = [&](u32 mode, u32 width) {
+        return std::ranges::any_of(modes, [&](const auto& words) {
+            return words.size() == 3 && words[1] == mode && words[2] == width;
+        });
+    };
+    REQUIRE(has_mode(4462, 16) == native); // RoundingModeRTE
+    REQUIRE(has_mode(4459, 64) == (native && shared_with_fp64)); // DenormPreserve
+    REQUIRE(has_mode(4462, 64) == (native && shared_with_fp64));
+    if (native) {
+        REQUIRE(has_mode(4459, 16));
     }
 }
 
