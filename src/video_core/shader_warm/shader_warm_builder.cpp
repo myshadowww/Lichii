@@ -92,7 +92,7 @@ std::optional<std::string> OpenGame(Core::System& system, const fs::path& game_p
         filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
     }
     const auto file =
-        filesystem->OpenFile(Common::FS::PathToUTF8String(game_path), FileSys::OpenMode::Read);
+        Core::GetGameFileFromPath(filesystem, Common::FS::PathToUTF8String(game_path));
     if (file == nullptr) {
         return "Cannot open the game file";
     }
@@ -560,7 +560,7 @@ FileSys::VirtualDir OpenEffectiveRomFS(Core::System& system, const fs::path& gam
         filesystem = std::make_shared<FileSys::RealVfsFilesystem>();
     }
     const auto file =
-        filesystem->OpenFile(Common::FS::PathToUTF8String(game_path), FileSys::OpenMode::Read);
+        Core::GetGameFileFromPath(filesystem, Common::FS::PathToUTF8String(game_path));
     auto loader = file ? Loader::GetLoader(system, file) : nullptr;
     u64 program_id{};
     if (!loader || loader->ReadProgramId(program_id) != Loader::ResultStatus::Success ||

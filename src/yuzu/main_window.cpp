@@ -4645,11 +4645,7 @@ void MainWindow::StartShaderWarm(u64 program_id, const std::string& game_path,
         return;
     }
 
-    auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
-    // Loose dumps are listed by their exefs folder (FormatGameName); the loader opens its main.
-    if (std::error_code ec; std::filesystem::is_directory(path, ec)) {
-        path /= "main";
-    }
+    const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
     shader_warm_dialog = new ShaderWarmDialog(*QtCommon::system, path, program_id,
                                               GameTitleName(game_path), this, recipe);
     connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);

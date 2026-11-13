@@ -12,7 +12,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
 
+#include "core/core.h"
 #include "shader_recompiler/exception.h"
+#include "tests/core/system_test_context.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/shader_archives.h"
@@ -242,6 +244,47 @@ TEST_CASE("ShaderPrecache: a file from an older builder or another cache version
     malformed.pop_back();
     WriteBytes(warm, malformed);
     REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+}
+
+TEST_CASE("ShaderPrecache: a loose dump builds from its directory or main path",
+          "[video_core]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    TempDir dir;
+    const auto exefs = dir.path / "exefs";
+    const auto effects = dir.path / "romfs" / "Effect" / "Particle";
+    std::filesystem::create_directories(exefs);
+    std::filesystem::create_directories(effects);
+    // The archive scan only needs a recognizable ExeFS and a RomFS, not executable code.
+    WriteBytes(exefs / "main", "");
+    WriteBytes(exefs / "main.npdm", "");
+    std::string effect(64, '\0');
+    effect.replace(0, 4, "VFXB");
+    WriteBytes(effects / "Magic.ptcl", effect);
+
+    ShaderWarm::BuildOptions options;
+    options.threads = 1;
+    std::optional<ShaderWarm::WarmStamp> first;
+    for (const auto& input : {exefs, exefs / "main"}) {
+        INFO(input.string());
+        options.output_dir = dir.path / (first ? "from-main" : "from-directory");
+        const auto result = ShaderWarm::BuildWarmFilesWith(system, input, 0, options, {}, {});
+        INFO(result.error);
+        REQUIRE(result.ok);
+        REQUIRE(result.archives == 1);
+        REQUIRE(result.compute_programs == 0);
+        REQUIRE(result.skipped == 0);
+        const auto warm = options.output_dir / "warm-compute.bin";
+        REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
+        const auto stamp = ShaderWarm::CurrentWarmStamp(warm, 0, 0, 0,
+                                                       ShaderWarm::WarmCacheVersion);
+        REQUIRE(stamp.has_value());
+        if (first) {
+            REQUIRE(first->Matches(*stamp));
+        } else {
+            first = stamp;
+        }
+    }
 }
 
 TEST_CASE("ShaderPrecache: a compute entry reads back like a pipeline cache entry",
