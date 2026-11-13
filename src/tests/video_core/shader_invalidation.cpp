@@ -9,7 +9,14 @@
 #include <string_view>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "core/core.h"
 #include "core/device_memory.h"
+#include "tests/core/system_test_context.h"
+#include "video_core/dirty_flags.h"
+#include "video_core/engines/maxwell_3d.h"
+#include "video_core/gpu.h"
+#include "video_core/memory_manager.h"
+#include "video_core/renderer_null/null_rasterizer.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/shader_cache.h"
 
@@ -17,6 +24,17 @@ namespace VideoCommon {
 struct ShaderCacheTestAccess {
     static std::unique_ptr<ShaderCache> Create(Tegra::MaxwellDeviceMemoryManager& memory) {
         return std::unique_ptr<ShaderCache>{new ShaderCache{memory}};
+    }
+    static void BindGraphics(ShaderCache& cache, Tegra::Engines::Maxwell3D& engine,
+                             Tegra::MemoryManager& memory) {
+        cache.maxwell3d = &engine;
+        cache.gpu_memory = &memory;
+    }
+    static bool RefreshStages(ShaderCache& cache, std::array<u64, 6>& hashes) {
+        return cache.RefreshStages(hashes);
+    }
+    static const ShaderInfo* StageInfo(const ShaderCache& cache, size_t stage) {
+        return cache.shader_infos[stage];
     }
     static void Register(ShaderCache& cache, VAddr address, size_t size, u64 hash) {
         auto data = std::make_unique<ShaderInfo>();
@@ -106,6 +124,56 @@ TEST_CASE("Shader empty batches preserve pending invalidations", "[shader_invali
     const std::array unrelated{std::pair<DAddr, size_t>{address + 0x100000, 4096}};
     cache->InvalidateRegions(unrelated);
     REQUIRE_FALSE(ShaderCacheTestAccess::Find(*cache, address));
+}
+
+TEST_CASE("Shader stages refresh after invalidation without a shader register write",
+          "[shader_invalidation]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 31};
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Tegra::Engines::Maxwell3D engine{memory};
+    memory.BindRasterizer(&rasterizer);
+    engine.BindRasterizer(&rasterizer);
+    constexpr GPUVAddr gpu_address = 0x100000;
+    constexpr DAddr device_address = 0x200000;
+    constexpr size_t vertex = 1;
+    memory.Map(gpu_address, device_address, 0x1000, Tegra::PTEKind::PITCH, false);
+    for (auto& pipeline : engine.regs.pipelines) {
+        pipeline.enable = 0;
+        pipeline.offset = 0;
+    }
+    engine.regs.program_region.address_high = 0;
+    engine.regs.program_region.address_low = gpu_address;
+    engine.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+    auto cache = ShaderCacheTestAccess::Create(device_memory);
+    ShaderCacheTestAccess::BindGraphics(*cache, engine, memory);
+    ShaderCacheTestAccess::Register(*cache, device_address, 0x100, 123);
+    std::array<u64, 6> hashes{};
+    REQUIRE(ShaderCacheTestAccess::RefreshStages(*cache, hashes));
+    REQUIRE(hashes[vertex] == 123);
+    REQUIRE_FALSE(engine.dirty.flags[VideoCommon::Dirty::Shaders]);
+
+    SECTION("An immediate invalidation frees the bound program") {
+        cache->InvalidateRegion(device_address, 1);
+    }
+    SECTION("A deferred invalidation frees the bound program when synchronized") {
+        cache->OnCacheInvalidation(device_address, 1);
+        cache->SyncGuestHost();
+    }
+    REQUIRE_FALSE(ShaderCacheTestAccess::Find(*cache, device_address));
+    ShaderCacheTestAccess::Register(*cache, device_address, 0x100, 456);
+    REQUIRE_FALSE(engine.dirty.flags[VideoCommon::Dirty::Shaders]);
+    REQUIRE(ShaderCacheTestAccess::RefreshStages(*cache, hashes));
+    REQUIRE(hashes[vertex] == 456);
+    REQUIRE(ShaderCacheTestAccess::StageInfo(*cache, vertex) ==
+            ShaderCacheTestAccess::Find(*cache, device_address));
+    REQUIRE_FALSE(engine.dirty.flags[VideoCommon::Dirty::Shaders]);
+    REQUIRE(ShaderCacheTestAccess::RefreshStages(*cache, hashes));
+    REQUIRE(hashes[vertex] == 456);
 }
 
 TEST_CASE("Debug server rejections drop matching native programs", "[shader_invalidation]") {

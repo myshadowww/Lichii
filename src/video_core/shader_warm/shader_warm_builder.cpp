@@ -403,7 +403,7 @@ std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries
         hash = Common::CityHash64WithSeed(chunk.data(), got, hash);
         read_total += got;
     }
-    if (read_total != size) {
+    if (in.bad() || read_total != size) {
         return std::nullopt;
     }
     return WarmStamp{.size = size,

@@ -103,6 +103,51 @@ TEST_CASE("ShaderPrecache: the marker matches only the same file and driver", "[
     REQUIRE_FALSE(marker->Matches(*ShaderWarm::CurrentWarmStamp(warm, 12, 0x1234, 0x2206, 53)));
 }
 
+TEST_CASE("ShaderPrecache: content stamps ignore timestamps and cover every file chunk",
+          "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    // Cross the 8 MiB read boundary so a change in the last chunk must invalidate the marker.
+    std::string bytes((8u << 20) + 17, 'a');
+    WriteBytes(warm, bytes);
+    const auto original_time = std::filesystem::last_write_time(warm);
+    const auto original = ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 53, 7);
+    REQUIRE(original.has_value());
+
+    std::filesystem::last_write_time(warm, original_time + std::chrono::seconds{10});
+    const auto touched = ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 53, 7);
+    REQUIRE(touched.has_value());
+    REQUIRE(original->Matches(*touched));
+
+    bytes.back() = 'b';
+    WriteBytes(warm, bytes);
+    std::filesystem::last_write_time(warm, original_time);
+    const auto changed = ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 53, 7);
+    REQUIRE(changed.has_value());
+    REQUIRE(changed->size == original->size);
+    REQUIRE_FALSE(original->Matches(*changed));
+
+    std::filesystem::resize_file(warm, bytes.size() - 1);
+    const auto truncated = ShaderWarm::CurrentWarmStamp(warm, 12, 1, 2, 53, 7);
+    REQUIRE(truncated.has_value());
+    REQUIRE_FALSE(changed->Matches(*truncated));
+    REQUIRE_FALSE(ShaderWarm::CurrentWarmStamp(dir.path, 12, 1, 2, 53, 7).has_value());
+}
+
+TEST_CASE("ShaderPrecache: old and incomplete markers must be rebuilt", "[video_core]") {
+    TempDir dir;
+    const auto warm = dir.path / "warm-compute.bin";
+    const auto marker = ShaderWarm::WarmMarkerPath(warm);
+    for (const auto text : {"8 12345 12 1 2 53\n", "v2 8 12345 12 1 2 53\n",
+                            "v2 8 12345 12 1 2 53 broken\n", "v3 8 12345 12 1 2 53 7\n"}) {
+        INFO(text);
+        WriteBytes(marker, text);
+        REQUIRE_FALSE(ShaderWarm::ReadWarmMarker(warm).has_value());
+    }
+    WriteBytes(marker, "v2 8 12345 12 1 2 53 7\n");
+    REQUIRE(ShaderWarm::ReadWarmMarker(warm).has_value());
+}
+
 TEST_CASE("ShaderPrecache: a rebuild with the same contents keeps the marker", "[video_core]") {
     TempDir dir;
     const auto warm = dir.path / "warm-compute.bin";
@@ -182,9 +227,20 @@ TEST_CASE("ShaderPrecache: a file from an older builder or another cache version
     WriteBytes(count, fmt::format("0 12 {}\n", ShaderWarm::WarmBuilderVersion));
     // The emulator loads a file of a compatible older version, so it is not built again.
     const auto& compatible = VideoCommon::CompatibleVulkanPipelineCacheVersions;
-    WriteBytes(warm, header(compatible.front()));
-    REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
-    WriteBytes(warm, header(compatible.back() - 1));
+    for (const auto version : compatible) {
+        CAPTURE(version);
+        WriteBytes(warm, header(version));
+        REQUIRE_FALSE(ShaderWarm::WarmFilesStale(warm).has_value());
+    }
+    WriteBytes(warm, header(0));
+    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+    auto malformed = header(ShaderWarm::WarmCacheVersion);
+    malformed.front() = '!';
+    WriteBytes(warm, malformed);
+    REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
+    malformed = header(ShaderWarm::WarmCacheVersion);
+    malformed.pop_back();
+    WriteBytes(warm, malformed);
     REQUIRE(ShaderWarm::WarmFilesStale(warm).has_value());
 }
 
