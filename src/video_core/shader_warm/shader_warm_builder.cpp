@@ -294,7 +294,7 @@ void WriteWarmCount(const fs::path& warm_file, u64 entries) {
         return;
     }
     std::ofstream out(WarmCountPath(warm_file), std::ios::trunc);
-    out << entries << ' ' << size << '\n';
+    out << entries << ' ' << size << ' ' << WarmBuilderVersion << '\n';
 }
 
 } // Anonymous namespace
@@ -731,6 +731,37 @@ Result BuildNativeFiles(Core::System& system, const fs::path& game_path, u64 tit
 }
 
 } // Anonymous namespace
+
+std::optional<std::string> WarmFilesStale(const fs::path& warm_file) {
+    std::error_code ec;
+    if (!fs::exists(warm_file, ec)) {
+        return "none built yet";
+    }
+    {
+        std::ifstream in(warm_file, std::ios::binary);
+        std::array<char, 8> magic{};
+        u32 version{};
+        in.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version));
+        const auto& compatible = VideoCommon::CompatibleVulkanPipelineCacheVersions;
+        if (!in || magic != VideoCommon::PipelineCacheMagic ||
+            (version != WarmCacheVersion &&
+             std::ranges::find(compatible, version) == compatible.end())) {
+            return "built for another cache version";
+        }
+    }
+    std::ifstream in(WarmCountPath(warm_file));
+    u64 entries{};
+    u64 size{};
+    u32 builder{};
+    if (!(in >> entries >> size >> builder) || builder != WarmBuilderVersion) {
+        return "built by an older version";
+    }
+    if (fs::file_size(warm_file, ec) != size || ec) {
+        return "changed since it was built";
+    }
+    return std::nullopt;
+}
 
 Result BuildWarmFiles(Core::System& system, const fs::path& game_path, u64 title_id,
                       const std::function<void(const Progress&)>& progress,

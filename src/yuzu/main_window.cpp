@@ -4659,8 +4659,9 @@ void MainWindow::StartShaderWarm(u64 program_id, const std::string& game_path,
 
 /// With precache_shaders on: a title precached before is precached again only when the driver or
 /// its precache file changed (the renderer checks). For one never precached, Ask asks whether to
-/// precache before the game starts, and a title without a precache file gets one built from its
-/// game files first. A stopped or failed build starts the game without precaching.
+/// precache before the game starts. A title whose precache file is missing or stale (another cache
+/// version, an older builder) gets one built from its game files first. A stopped or failed build
+/// starts the game with the file it had, or without precaching when there is none.
 void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     ShaderWarm::RequestWarmBeforeStart(false);
@@ -4670,12 +4671,15 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         !Settings::values.use_disk_shader_cache.GetValue()) {
         return;
     }
-    if (!ShaderWarm::WarmPending(title_id)) {
+    const auto warm_file = ShaderWarm::ComputeWarmPath(title_id);
+    const auto stale = ShaderWarm::WarmFilesStale(warm_file);
+    const bool pending = ShaderWarm::WarmPending(title_id);
+    if (!pending && !stale) {
         // Precached before: the renderer runs it again only when the driver or the file changed.
         ShaderWarm::RequestWarmBeforeStart(true);
         return;
     }
-    if (mode == Settings::PrecacheShaders::Ask) {
+    if (pending && mode == Settings::PrecacheShaders::Ask) {
         QMessageBox box(QMessageBox::Question, tr("Precache Shaders"),
                         tr("The shaders of this game are not precached yet. Precache them now?\n\n"
                            "The game starts when they are done. The first time, the game files "
@@ -4697,9 +4701,12 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
     }
     std::error_code ec;
     // A recipe (kept, or shipped in recipes\) not assembled yet is assembled too.
-    if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec) ||
+    if (stale ||
         (!std::filesystem::exists(ShaderWarm::NativePreparationPath(title_id), ec) &&
          !ShaderWarm::FindNativeRecipe(title_id).empty())) {
+        if (stale) {
+            LOG_INFO(Frontend, "Shader precache for {:016x}: {}, building it", title_id, *stale);
+        }
         ShaderWarmDialog dialog(*QtCommon::system, game_path, title_id,
                                 GameTitleName(Common::FS::PathToUTF8String(game_path)), this);
         connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {
@@ -4709,7 +4716,7 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         });
         dialog.Start();
         dialog.exec();
-        if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
+        if (!std::filesystem::exists(warm_file, ec)) {
             return;
         }
     }
