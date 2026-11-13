@@ -1128,6 +1128,15 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     };
     const auto [pair, is_new]{compute_cache.try_emplace(key)};
     auto& entry{pair->second};
+    const auto reject_rebuild = [&](const ComputePipeline* pipeline) {
+        if (pipeline && pipeline->IsPrecompiled()) {
+            // Retry from the live environment if a prepared replacement cannot be built.
+            precompiled_rejected.insert(key.Hash());
+            precompiled_failed.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            entry.rebuilds = MaxComputeRebuilds;
+        }
+    };
     const auto replace = [&](ComputePipelineCacheEntry&& rebuilt) {
         if (entry.pipeline) {
             retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
@@ -1153,9 +1162,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             } else {
                 LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed to compile",
                             key.unique_hash);
+                reject_rebuild(rebuilt.pipeline.get());
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                        std::move(rebuilt.pipeline));
-                entry.rebuilds = MaxComputeRebuilds;
             }
         }
     } else if (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
@@ -1173,15 +1182,15 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
         } else {
             // Keep the working translation when the new one cannot be built (for example a
             // narrow access that now stays global across two buffers) or its driver compile
-            // already failed, and stop retrying.
+            // already failed. Prepared replacements can still fall back to live translation.
             LOG_WARNING(Render_Vulkan, "Keeping compute shader {:016x}: rebuild failed: {}",
                         key.unique_hash,
                         rebuilt.pipeline ? std::string{"driver compile failed"} : rebuilt.failure);
+            reject_rebuild(rebuilt.pipeline.get());
             if (rebuilt.pipeline) {
                 retired_compute_pipelines.emplace_back(scheduler.CurrentTick(),
                                                        std::move(rebuilt.pipeline));
             }
-            entry.rebuilds = MaxComputeRebuilds;
         }
     }
     if (VideoCommon::StutterTrace::Enabled() && !std::exchange(entry.used, true)) {
