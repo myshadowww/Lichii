@@ -177,6 +177,7 @@ add_executable(tests
     frontend_common/install_keys.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/memory_detect.cpp
     common/host_memory_failure.cpp
     common/host_memory_test_access.h
     core/host_memory_failure.cpp
