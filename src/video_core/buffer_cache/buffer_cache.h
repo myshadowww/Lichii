@@ -1610,10 +1610,12 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 }
 
 template <class P>
-void BufferCache<P>::UpdateComputeBuffers() {
+void BufferCache<P>::UpdateComputeBuffers(std::optional<GPUVAddr> indirect_address) {
+    const auto indirect_device = indirect_address ? gpu_memory->GpuToCpuAddress(*indirect_address)
+                                                 : std::nullopt;
     do {
         channel_state->has_deleted_buffers = false;
-        DoUpdateComputeBuffers();
+        DoUpdateComputeBuffers(indirect_device);
     } while (channel_state->has_deleted_buffers);
 }
 
@@ -2997,9 +2999,14 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
 }
 
 template <class P>
-void BufferCache<P>::DoUpdateComputeBuffers() {
+void BufferCache<P>::DoUpdateComputeBuffers(std::optional<DAddr> indirect_device) {
     compute_segments.clear();
     BufferOperations([&]() {
+        // Resolve arguments before host descriptors are bound. A page-only overlap can retire
+        // a large SSBO, and both ranges must participate in the same deletion retry loop.
+        if (indirect_device) {
+            (void)FindBuffer(*indirect_device, 12, false);
+        }
         UpdateComputeUniformBuffers();
         UpdateComputeStorageBuffers();
         UpdateComputeTextureBuffers();

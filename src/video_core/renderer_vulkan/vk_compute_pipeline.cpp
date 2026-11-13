@@ -669,7 +669,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
-    buffer_cache.UpdateComputeBuffers();
+    buffer_cache.UpdateComputeBuffers(kepler_compute.GetIndirectComputeAddress());
     buffer_cache.BindHostComputeBuffers();
     if (buffer_cache.any_buffer_uploaded) {
         buffer_cache.runtime.PostCopyBarrier();

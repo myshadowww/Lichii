@@ -348,7 +348,7 @@ public:
 
     void UpdateGraphicsBuffers(bool is_indexed);
 
-    void UpdateComputeBuffers();
+    void UpdateComputeBuffers(std::optional<GPUVAddr> indirect_address = std::nullopt);
 
     void BindHostGeometryBuffers(bool is_indexed);
 
@@ -606,7 +606,7 @@ private:
 
     void DoUpdateGraphicsBuffers(bool is_indexed);
 
-    void DoUpdateComputeBuffers();
+    void DoUpdateComputeBuffers(std::optional<DAddr> indirect_device);
 
     void UpdateIndexBuffer();
 
