@@ -2,10 +2,10 @@
 
 #include <algorithm>
 #include <array>
-#include <cstring>
-#include <exception>
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <exception>
 #include <map>
 #include <mutex>
 #include <string>
@@ -651,4 +651,43 @@ TEST_CASE("NX2 released memory loses the device addresses of the ranges inside i
     REQUIRE_FALSE(registry.DeviceAddressOf(0x11000));
     REQUIRE(registry.DeviceAddressOf(0x13800) == 0x300800U);
     REQUIRE(registry.DeviceAddressOf(0x14000) == 0x400000U);
+}
+
+TEST_CASE("NX2 listener removal drains copied callbacks while sparse backings stay immediate",
+          "[video_core][nx2_mapping]") {
+    Service::Nvidia::Devices::Nx2GpuMemoryRegistry registry;
+    Recorder recorder;
+    Gate gate;
+    registry.AddListener(
+        &recorder,
+        [&](u64, u64, u64) {
+            gate.Hold();
+            recorder.Add("map finished");
+        }, {}, {}, {},
+        [&](u64, u64, u64) { recorder.Add("sparse backed"); });
+    std::thread mapper{[&] { registry.MapAt(0x8000, 0x4000, 0x1000); }};
+    gate.WaitEntered();
+    // The GPU back must finish this callback while the guest's ordered map is still waiting.
+    registry.BackSparse(0x8000, 0x4000, 0x1000);
+    const bool backed_immediately = recorder.Get() == std::vector<std::string>{"sparse backed"};
+    std::atomic<bool> removing{}, removed{};
+    std::thread remover{[&] {
+        removing = true;
+        registry.RemoveListener(&recorder);
+        removed = true;
+    }};
+    while (!removing) {
+        std::this_thread::yield();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    const bool waited_for_callback = !removed;
+    gate.open = true;
+    mapper.join();
+    remover.join();
+    REQUIRE(backed_immediately);
+    REQUIRE(waited_for_callback);
+    REQUIRE(removed);
+    REQUIRE(recorder.Get() == std::vector<std::string>{"sparse backed", "map finished"});
+    registry.MapAt(0x9000, 0x5000, 0x1000);
+    REQUIRE(recorder.Get().size() == 2);
 }
