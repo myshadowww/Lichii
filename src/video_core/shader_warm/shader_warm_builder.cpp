@@ -438,6 +438,18 @@ bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     return static_cast<bool>(out);
 }
 
+void DropStaleWarmMarker(const fs::path& warm_file, const fs::path& new_file) {
+    if (const auto marker = ReadWarmMarker(warm_file)) {
+        const auto incoming = CurrentWarmStamp(new_file, 0, 0, 0, 0);
+        if (incoming && incoming->size == marker->size &&
+            incoming->content_hash == marker->content_hash) {
+            return;
+        }
+    }
+    std::error_code ignored;
+    fs::remove(WarmMarkerPath(warm_file), ignored);
+}
+
 bool WarmPending(u64 title_id) {
     const auto file = ComputeWarmPath(title_id);
     std::error_code ec;
@@ -982,9 +994,10 @@ Result BuildComputeWarmFiles(Core::System& system, const fs::path& game_path, u6
     if (!compute_out) {
         return fail("Writing the precache file failed");
     }
-    // A new file: the marker and count of the old one no longer apply.
+    // A new file: the count of the old one no longer applies, and its marker only when the
+    // contents changed (the marker also carries the driver and lowering, checked at boot).
+    DropStaleWarmMarker(compute_path, compute_tmp);
     std::error_code ignored;
-    fs::remove(WarmMarkerPath(compute_path), ignored);
     fs::remove(WarmCountPath(compute_path), ignored);
     fs::rename(compute_tmp, compute_path, ec);
     if (ec) {
