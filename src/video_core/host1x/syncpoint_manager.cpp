@@ -66,9 +66,26 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
               syncpoint_id);
 }
 
-void SyncpointManager::SetGuestMirror(GuestMirror mirror) {
+SyncpointManager::GuestMirrorHandle SyncpointManager::RegisterGuestMirror(GuestMirror mirror) {
+    if (!mirror) {
+        return {};
+    }
     std::scoped_lock lk(guard);
-    guest_mirror = std::move(mirror);
+    // No increment can slip between this initial copy and registering for subsequent values.
+    for (u32 id = 0; id < NUM_MAX_SYNCPOINTS; ++id) {
+        mirror(id, syncpoints_guest[id].load(std::memory_order_relaxed));
+    }
+    const GuestMirrorHandle handle = ++last_guest_mirror_id;
+    guest_mirrors.emplace(handle, std::move(mirror));
+    return handle;
+}
+
+void SyncpointManager::DeregisterGuestMirror(GuestMirrorHandle handle) {
+    if (handle == 0) {
+        return;
+    }
+    std::scoped_lock lk(guard);
+    guest_mirrors.erase(handle);
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
@@ -90,10 +107,13 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
                                  std::list<RegisteredAction>& action_storage,
                                  std::optional<u32> mirrored_id) {
     std::scoped_lock lk(guard);
-    if (mirrored_id && guest_mirror) {
+    if (mirrored_id) {
         // Before the value is published: the lock-free ready checks in RegisterAction and Wait
-        // must not see it ahead of the page.
-        guest_mirror(*mirrored_id, syncpoint.load(std::memory_order_relaxed) + 1);
+        // must not see it ahead of any session's page.
+        const u32 value = syncpoint.load(std::memory_order_relaxed) + 1;
+        for (const auto& [handle, mirror] : guest_mirrors) {
+            mirror(*mirrored_id, value);
+        }
     }
     const u32 new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
     auto it = action_storage.begin();

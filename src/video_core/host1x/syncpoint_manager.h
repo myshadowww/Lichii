@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <map>
 #include <mutex>
 #include <optional>
 
@@ -56,12 +57,15 @@ public:
 
     void IncrementGuest(u32 syncpoint_id);
 
-    /// Called with a syncpoint's new guest value on every guest increment, before the value is
-    /// published and the actions it meets run (empty to stop). Switch 2 clients read syncpoint
-    /// values from a page the gsv service fills, and an action may wake a client that reads it
-    /// right away.
+    /// Called with every current guest value during registration, then with each new value
+    /// before it is published and its actions run. All callbacks run under the manager's guard
+    /// and must not call methods that take that guard.
     using GuestMirror = std::function<void(u32 syncpoint_id, u32 value)>;
-    void SetGuestMirror(GuestMirror mirror);
+    using GuestMirrorHandle = u64;
+    [[nodiscard]] GuestMirrorHandle RegisterGuestMirror(GuestMirror mirror);
+
+    /// Removes only this registration and waits for any running mirror callback to finish.
+    void DeregisterGuestMirror(GuestMirrorHandle handle);
 
     /// Runs func with guest increments held off, so a copy of the guest values it makes can't
     /// overwrite a newer value the mirror wrote.
@@ -106,7 +110,8 @@ private:
 
     std::mutex guard;
     u64 last_action_id{};
-    GuestMirror guest_mirror; ///< Guarded by `guard`.
+    GuestMirrorHandle last_guest_mirror_id{};
+    std::map<GuestMirrorHandle, GuestMirror> guest_mirrors; ///< Guarded by `guard`.
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
 };

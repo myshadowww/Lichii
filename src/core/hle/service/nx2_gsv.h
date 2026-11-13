@@ -3901,8 +3901,8 @@ public:
     }
 
     ~INx2GraphicsSystemSession() override {
-        if (m_syncpt_memory != nullptr) {
-            system.Host1x().GetSyncpointManager().SetGuestMirror({});
+        if (m_syncpt_mirror != 0) {
+            system.Host1x().GetSyncpointManager().DeregisterGuestMirror(m_syncpt_mirror);
         }
         if (m_syncpt_poll) {
             system.CoreTiming().UnscheduleEvent(m_syncpt_poll);
@@ -4057,6 +4057,9 @@ private:
         auto rw = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
         auto ro = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(1));
         if (rw.IsNotNull() && ro.IsNotNull() && ro->GetSize() >= 0x2000) {
+            auto& syncpoints = system.Host1x().GetSyncpointManager();
+            syncpoints.DeregisterGuestMirror(m_syncpt_mirror);
+            m_syncpt_mirror = {};
             m_syncpt_memory = &ro->GetOwner()->GetMemory();
             m_syncpt_rw = GetInteger(rw->GetSourceAddress());
             m_syncpt_ro = GetInteger(ro->GetSourceAddress());
@@ -4070,12 +4073,11 @@ private:
             memory.Write32(m_syncpt_ro + 0x14, SyncptRoSummaryOffset);
             memory.Write32(m_syncpt_ro + 0x18, SyncptRwBitsOffset);
             memory.Write32(m_syncpt_ro + 0x1c, SyncptRoBitsOffset);
-            UpdateSyncptValues();
             // Mirror each guest increment as it happens, before the waits it meets are answered:
             // the client's TryWaitNativeSync reads this page, and a client woken by an answered
             // wait (nx2:syncpt 201) before the next poll read the old value. Yoshi and the
             // Mysterious Book's movie player then aborted on purpose (2162-0001) a few minutes in.
-            system.Host1x().GetSyncpointManager().SetGuestMirror(
+            m_syncpt_mirror = syncpoints.RegisterGuestMirror(
                 [memory = m_syncpt_memory, values = m_syncpt_ro + SyncptValuesOffset,
                  count = std::min(m_syncpt_count, HostSyncpoints)](u32 id, u32 value) {
                     if (id < count) {
@@ -4616,6 +4618,7 @@ private:
     std::shared_ptr<Nx2NativeObjects> m_objects{std::make_shared<Nx2NativeObjects>()};
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, 2> m_syncpt_events{};
+    Tegra::Host1x::SyncpointManager::GuestMirrorHandle m_syncpt_mirror{};
     Core::Memory::Memory* m_syncpt_memory{};
     u64 m_syncpt_rw{};
     u64 m_syncpt_ro{};
