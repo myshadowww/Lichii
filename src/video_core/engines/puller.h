@@ -88,6 +88,10 @@ public:
         [[nodiscard]] bool WaitsToReach() const;
     };
 
+    Puller() = default;
+    /// Releases the process-wide waiter slot when a channel is torn down mid-wait.
+    ~Puller();
+
     [[nodiscard]] bool HasPendingAcquire() const {
         return pending_acquire.has_value();
     }

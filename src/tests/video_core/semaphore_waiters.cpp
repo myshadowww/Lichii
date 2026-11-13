@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "video_core/engines/puller.h"
 #include "video_core/nx2.h"
 
 using Tegra::Nx2SemaphoreWaiters;
@@ -111,4 +112,32 @@ TEST_CASE("Semaphore waiters see what the writer wrote before the latch",
             waiters.Remove(&owners[word]);
         }
     }
+}
+
+TEST_CASE("A puller torn down while it waits leaves the semaphore waiters", "[video_core][nx2_waiters]") {
+    // The registry outlives each session. Destroying a suspended channel must release its slot,
+    // even when no ResumeAcquire ran to remove it.
+    auto& waiters = Nx2SemaphoreWaiters::Get();
+    std::array<const void*, Nx2SemaphoreWaiters::MaxWaiters> owners{};
+    {
+        std::array<Tegra::Engines::Puller, Nx2SemaphoreWaiters::MaxWaiters> pullers;
+        for (size_t i = 0; i < pullers.size(); ++i) {
+            owners[i] = &pullers[i];
+            REQUIRE(waiters.Add(owners[i], 0x1000, 5, Nx2SemaphoreWaiters::AcquireGequal));
+        }
+        waiters.OnWrite(0x1000, 4);
+        CHECK_FALSE(waiters.Latched(owners.front()));
+    }
+    waiters.OnWrite(0x1000, 5);
+    for (const auto owner : owners) {
+        CHECK_FALSE(waiters.Latched(owner));
+    }
+    // A distinct owner can take a freed slot, and its latch starts fresh.
+    Tegra::Engines::Puller next;
+    REQUIRE(waiters.Add(&next, 0x2000, 7, Nx2SemaphoreWaiters::AcquireEqual));
+    CHECK_FALSE(waiters.Latched(&next));
+    waiters.OnWrite(0x1000, 7);
+    CHECK_FALSE(waiters.Latched(&next));
+    waiters.OnWrite(0x2000, 7);
+    CHECK(waiters.Latched(&next));
 }
