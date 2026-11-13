@@ -143,7 +143,7 @@ TEST_CASE("Shader stages refresh after invalidation without a shader register wr
     constexpr size_t vertex = 1;
     memory.Map(gpu_address, device_address, 0x1000, Tegra::PTEKind::PITCH, false);
     for (auto& pipeline : engine.regs.pipelines) {
-        pipeline.enable = 0;
+        pipeline.enable.Assign(0);
         pipeline.offset = 0;
     }
     engine.regs.program_region.address_high = 0;
