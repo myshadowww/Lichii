@@ -15,6 +15,7 @@
 #include <source_location>
 #include <vector>
 #include <span>
+#include <unordered_map>
 
 #include "common/common_types.h"
 #include "common/range_mutex.h"
@@ -57,6 +58,7 @@ public:
 
     /// Marks the memory behind [address, address + size) cold (Common::HostMemory::HintCold),
     /// from a low-priority thread: data the host GPU has its own copy of, e.g. uploaded textures.
+    /// Only while the host is short of RAM (Common::IsHostLowOnMemory).
     void HintCold(DAddr address, size_t size);
 
     DAddr Allocate(size_t size);
@@ -66,6 +68,16 @@ public:
     void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
 
     void Unmap(DAddr address, size_t size);
+
+    /// Device pages without memory that keep the bytes written to them until Map gives them
+    /// memory, which then holds those bytes (a Switch 2 sparse block waiting for its memory).
+    /// Reads see the kept bytes meanwhile; Unmap drops them.
+    void KeepWrites(DAddr address, size_t size);
+    /// Read or write [address, +size) when it has kept pages (or pages mapped meanwhile): mapped
+    /// pages as usual, the others from the kept bytes. False, doing nothing that counts, when it
+    /// has neither.
+    bool ReadKept(DAddr address, void* dest_pointer, size_t size);
+    bool WriteKept(DAddr address, const void* src_pointer, size_t size);
 
     void TrackContinuityImpl(DAddr address, VAddr virtual_address, size_t size, Asid asid);
     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
@@ -114,7 +126,8 @@ public:
 
     PAddr GetPhysicalRawAddressFromDAddr(DAddr address) const {
         PAddr subbits = PAddr(address & page_mask);
-        auto paddr = tracked_entries[(address >> page_bits)].compressed_physical_ptr;
+        const auto paddr =
+            tracked_entries[(address >> page_bits)].compressed_physical_ptr.load(std::memory_order_acquire);
         if (paddr == 0) {
             return 0;
         }
@@ -222,10 +235,10 @@ private:
 
     struct TrackedEntry {
         VAddr cpu_backing_address;
-        u32 continuity_tracker;
-        u32 compressed_physical_ptr;
+        std::atomic<u32> continuity_tracker{};
+        std::atomic<u32> compressed_physical_ptr{};
     };
-    Common::SparseLargeVector<u32> compressed_device_addr;
+    Common::SparseLargeVector<std::atomic<u32>> compressed_device_addr;
     Common::SparseLargeVector<TrackedEntry> tracked_entries;
 
     // Process memory interfaces
@@ -241,6 +254,9 @@ private:
     static constexpr size_t asid_start_bit = guest_max_as_bits;
 
     std::pair<Asid, VAddr> ExtractCPUBacking(size_t page_index) {
+        if (tracked_entries[page_index].compressed_physical_ptr.load(std::memory_order_acquire) == 0) {
+            return {Asid{0}, 0};
+        }
         auto content = tracked_entries[page_index].cpu_backing_address;
         const VAddr address = content & guest_mask;
         const Asid asid{static_cast<size_t>(content >> asid_start_bit)};
@@ -286,6 +302,11 @@ private:
     std::unique_ptr<CachedPages> cached_pages;
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
+
+    /// Taken before mapping_guard. The pages KeepWrites keeps, by device page; null reads zero.
+    std::mutex kept_mutex;
+    using KeptPage = std::array<u8, size_t{1} << page_bits>;
+    std::unordered_map<size_t, std::unique_ptr<KeptPage>> kept_pages;
 
 
 };

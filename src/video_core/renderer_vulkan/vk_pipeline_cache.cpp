@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -31,6 +32,7 @@
 #include "common/memory_detect.h"
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
+#include "common/shutdown_progress.h"
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "common/zstd_compression.h"
@@ -613,6 +615,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     kept_stages = decltype(kept_stages){ram != 0 ? ram / 64 : u64{256} << 20};
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY) {
+        const char* const path = std::getenv("__GL_SHADER_DISK_CACHE_PATH");
+        const char* const size = std::getenv("__GL_SHADER_DISK_CACHE_SIZE");
+        LOG_INFO(Render_Vulkan,
+                 "NVIDIA shader disk cache: __GL_SHADER_DISK_CACHE_PATH={}, "
+                 "__GL_SHADER_DISK_CACHE_SIZE={}",
+                 path != nullptr ? path : "unset", size != nullptr ? size : "unset");
+    }
+#endif
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
     const auto subgroup_stage_bit{[subgroup_stages](VkShaderStageFlags flag, Shader::Stage stage) {
         return (subgroup_stages & flag) != 0 ? (1u << static_cast<u32>(stage)) : 0u;
@@ -904,6 +916,23 @@ size_t KeptPipelines() {
     return kept;
 #endif
 }
+
+/// Destroys the pipelines of `pipelines` (a map or a deque of pairs holding unique_ptrs), telling
+/// the frontend every few hundred that the teardown still moves: tens of thousands of them took
+/// longer than the frontend waited for the emulation thread.
+template <typename Container>
+void DestroyPipelinesWithProgress(Container& pipelines) {
+    constexpr size_t ProgressEvery = 256;
+    size_t destroyed = 0;
+    for (auto& entry : pipelines) {
+        entry.second.reset();
+        if (++destroyed % ProgressEvery == 0) {
+            Common::NoteShutdownProgress();
+        }
+    }
+    pipelines.clear();
+    Common::NoteShutdownProgress();
+}
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
@@ -911,17 +940,21 @@ PipelineCache::~PipelineCache() {
     StopBackgroundJobs();
     // The pipelines' builds end before the driver pipeline cache they build into goes.
     shader_jobs->Shutdown();
+    Common::NoteShutdownProgress();
     serialization_thread.WaitForRequests();
+    Common::NoteShutdownProgress();
     SaveUsedPipelines();
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
     }
+    Common::NoteShutdownProgress();
     // After the records the serialization thread queued: its writer drains on destruction
     shader_cache_v2 = nullptr;
     cache_v2.reset();
-    graphics_cache.clear();
-    evicted_pipelines.clear();
+    Common::NoteShutdownProgress();
+    DestroyPipelinesWithProgress(graphics_cache);
+    DestroyPipelinesWithProgress(evicted_pipelines);
     if (pipeline_binaries) {
         pipeline_binaries->LogCounts("at the end of the session");
         pipeline_binaries.reset();
@@ -1750,7 +1783,8 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
     const std::string path = Common::FS::PathToUTF8String(warm_file);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
-                                            device.GetDeviceID(), CACHE_VERSION);
+                                            device.GetDeviceID(), CACHE_VERSION,
+                                            VideoCommon::ShaderCacheV2::LoweringStamp());
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;
@@ -1774,9 +1808,16 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
             file.read(magic.data(), magic.size())
                 .read(reinterpret_cast<char*>(&version), sizeof(version));
             constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
-            if (magic != expected_magic || version != CACHE_VERSION) {
-                LOG_WARNING(Render_Vulkan, "Shader precache: {} is not a version {} file", path,
-                            CACHE_VERSION);
+            // The file holds environments only, which read the same in every compatible version:
+            // one from an older version is built again under this one (the marker carries it).
+            const auto& compatible = VideoCommon::CompatibleVulkanPipelineCacheVersions;
+            if (magic != expected_magic ||
+                (version != CACHE_VERSION &&
+                 std::ranges::find(compatible, version) == compatible.end())) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader precache: {} is a version {} file, not {} or a compatible "
+                            "one; pre-compile the game's shaders again",
+                            path, version, CACHE_VERSION);
                 throw std::runtime_error("wrong version");
             }
             while (file.tellg() != end) {
@@ -4230,7 +4271,15 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
             cache_data.resize(cache_size);
             pipeline_cache.Read(&cache_size, cache_data.data());
         }
-        file.write(cache_data.data(), cache_size);
+        Common::NoteShutdownProgress();
+        // In pieces: a cache of tens of thousands of pipelines is gigabytes, and a shutdown
+        // waiting on it is told the write still moves.
+        constexpr size_t Chunk = size_t{64} << 20;
+        for (size_t offset = 0; offset < cache_size; offset += Chunk) {
+            file.write(cache_data.data() + offset,
+                       static_cast<std::streamsize>((std::min)(Chunk, cache_size - offset)));
+            Common::NoteShutdownProgress();
+        }
         file.close();
     } catch (const std::ios_base::failure& e) {
         // The cache stays as it was: only the file being written goes.

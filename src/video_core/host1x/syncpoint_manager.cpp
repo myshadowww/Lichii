@@ -62,7 +62,30 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
         LOG_ERROR(HW_GPU, "Ignoring increment of invalid syncpoint {:#x}", syncpoint_id);
         return;
     }
-    Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id]);
+    Increment(syncpoints_guest[syncpoint_id], wait_guest_cv, guest_action_storage[syncpoint_id],
+              syncpoint_id);
+}
+
+SyncpointManager::GuestMirrorHandle SyncpointManager::RegisterGuestMirror(GuestMirror mirror) {
+    if (!mirror) {
+        return {};
+    }
+    std::scoped_lock lk(guard);
+    // No increment can slip between this initial copy and registering for subsequent values.
+    for (u32 id = 0; id < NUM_MAX_SYNCPOINTS; ++id) {
+        mirror(id, syncpoints_guest[id].load(std::memory_order_relaxed));
+    }
+    const GuestMirrorHandle handle = ++last_guest_mirror_id;
+    guest_mirrors.emplace(handle, std::move(mirror));
+    return handle;
+}
+
+void SyncpointManager::DeregisterGuestMirror(GuestMirrorHandle handle) {
+    if (handle == 0) {
+        return;
+    }
+    std::scoped_lock lk(guard);
+    guest_mirrors.erase(handle);
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
@@ -81,10 +104,18 @@ void SyncpointManager::WaitHost(u32 syncpoint_id, u32 expected_value) {
 }
 
 void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
-                                 std::list<RegisteredAction>& action_storage) {
-    auto new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
-
+                                 std::list<RegisteredAction>& action_storage,
+                                 std::optional<u32> mirrored_id) {
     std::scoped_lock lk(guard);
+    if (mirrored_id) {
+        // Before the value is published: the lock-free ready checks in RegisterAction and Wait
+        // must not see it ahead of any session's page.
+        const u32 value = syncpoint.load(std::memory_order_relaxed) + 1;
+        for (const auto& [handle, mirror] : guest_mirrors) {
+            mirror(*mirrored_id, value);
+        }
+    }
+    const u32 new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
     auto it = action_storage.begin();
     while (it != action_storage.end()) {
         if (it->expected_value > new_value) {

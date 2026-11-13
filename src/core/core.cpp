@@ -18,6 +18,7 @@
 #include "common/adpf.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/shutdown_progress.h"
 #include "common/string_util.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
@@ -162,7 +163,8 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
-        return Loader::AppLoader_NX::ReadPlatform(file, program_id) == 2;
+        const auto found = Loader::AppLoader_NX::ReadProgramPlatform(file, program_id);
+        return found && found->platform == 2 ? std::optional{found->program_id} : std::nullopt;
     }
     if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
         const FileSys::XCI xci{file, program_id, program_index};
@@ -299,15 +301,16 @@ struct System::Impl {
 
         timezone_service->SetDeviceLocationName(name);
 
-        u64 time_offset = 0;
+        s64 time_offset = 0;
         if (Settings::values.custom_rtc_enabled) {
             time_offset = Settings::values.custom_rtc_offset.GetValue();
         }
 
         const auto posix_time = std::chrono::system_clock::now().time_since_epoch();
-        const u64 current_time =
-            +std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
-        const u64 new_time = current_time + time_offset;
+        const s64 current_time =
+            std::chrono::duration_cast<std::chrono::seconds>(posix_time).count();
+        const s64 target_time = current_time + time_offset;
+        const u64 new_time = static_cast<u64>((std::max<s64>)(0, target_time));
 
         Service::PSC::Time::SystemClockContext context{};
         settings_service->SetUserSystemClockContext(context);
@@ -561,6 +564,11 @@ struct System::Impl {
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
 
+        // Once powered off, services stop writing replies, so a guest thread whose IPC call
+        // completes would read its own request back and abort (2010-0212, a Userspace PANIC on
+        // every stop). Keep guest threads from running again first; the wait for running ones
+        // comes after the GPU has released any that it holds in host code.
+        kernel.RequestSuspendEmulation();
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
@@ -571,16 +579,28 @@ struct System::Impl {
         core_timing.SyncPause(false);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        if (service_manager) {
+            // Services on host threads that still wait for one on the guest cores give up (after
+            // a close during the boot shader load, the guest cores never started).
+            service_manager->Close();
+        }
         kernel.CloseServices();
+        applet_manager.DropPendingProcess();
         kernel.ShutdownCores();
+        // Each step done tells the frontend the teardown still moves (see
+        // Common::ShutdownProgress); the GPU's (pipeline caches) reports its own steps.
+        Common::NoteShutdownProgress();
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
         cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
+        Common::NoteShutdownProgress();
         audio_core.reset();
+        Common::NoteShutdownProgress();
         gpu_core.reset();
+        Common::NoteShutdownProgress();
         host1x_core.reset();
         perf_stats.reset();
         cpu_manager.Shutdown();

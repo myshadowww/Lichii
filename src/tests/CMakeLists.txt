@@ -8,6 +8,7 @@ add_executable(tests
     yuzu/neural_model_sources.cpp
     video_core/neural_rendering_model.cpp
     common/addon_config.cpp
+    common/thread_worker.cpp
     video_core/vulkan_overlay_filter.cpp
     video_core/buffer_cache_ports.cpp
     video_core/unswizzle_workers.cpp
@@ -84,6 +85,7 @@ add_executable(tests
     video_core/framebuffer_clear_layers.cpp
     video_core/framebuffer_limits.cpp
     video_core/unbacked_fallback.cpp
+    video_core/eviction_age.cpp
     video_core/host_memory_limit.cpp
     video_core/fire_emblem_upscale.cpp
     video_core/yoshi_upscale.cpp
@@ -172,8 +174,10 @@ add_executable(tests
     common/event.cpp
     common/fibers.cpp
     common/fs_iterate.cpp
+    frontend_common/install_keys.cpp
     common/game_presets.cpp
     common/host_memory.cpp
+    common/memory_detect.cpp
     common/host_memory_failure.cpp
     common/host_memory_test_access.h
     core/host_memory_failure.cpp
@@ -189,6 +193,7 @@ add_executable(tests
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
+    core/filesystem_buffer_bounds.cpp
     core/thread_startup_policy.cpp
     core/nup_writer.cpp
     core/nup_metadata.cpp
@@ -238,10 +243,18 @@ add_executable(tests
     input_common/calibration_configuration_job.cpp
 )
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    target_sources(tests PRIVATE input_common/any_input.cpp input_common/any_input_sdl.cpp)
+endif()
+
 create_target_directory_groups(tests)
 
 target_link_libraries(tests PRIVATE common core audio_core input_common video_core frontend_common)
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    target_sources(tests PRIVATE frontend_common/nvidia_shader_cache.cpp)
+endif()
 
 if (TARGET dynarmic::dynarmic)
     target_sources(tests PRIVATE core/jit_ordered_loads.cpp core/window_trace.cpp)

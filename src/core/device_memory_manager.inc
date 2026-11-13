@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <source_location>
 #include <string_view>
 #include <type_traits>
@@ -21,6 +22,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "common/memory_detect.h"
 #include "common/paged_scalar.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -183,7 +185,35 @@ struct DeviceMemoryManagerAllocator {
         return addr >= 0 && addr + size <= max_device_area;
     }
 
+    // The main allocator only hands out fresh space until it reaches the end of the address space,
+    // so a range freed and mapped again every frame would climb through it, and caches keyed by
+    // device address would see new memory each time. Freed blocks are kept for the next allocation
+    // of the same size instead, up to this many bytes.
+    static constexpr size_t max_recycled_bytes = 1ULL << 30;
+
+    std::mutex recycle_mutex;
+    std::vector<std::pair<DAddr, size_t>> recycled;
+    size_t recycled_bytes = 0;
+
     DAddr Allocate(size_t size) {
+        std::scoped_lock lock(recycle_mutex);
+        const auto it = std::find_if(recycled.rbegin(), recycled.rend(),
+                                     [size](const auto& block) { return block.second == size; });
+        if (it != recycled.rend()) {
+            const DAddr address = it->first;
+            recycled.erase(std::next(it).base());
+            recycled_bytes -= size;
+            return address;
+        }
+        if (const DAddr address = main_allocator.Allocate(size); address != 0) {
+            return address;
+        }
+        // Out of space: give the kept blocks back so the allocator can merge them.
+        for (const auto& [address, block_size] : recycled) {
+            main_allocator.Free(address, block_size);
+        }
+        recycled.clear();
+        recycled_bytes = 0;
         return main_allocator.Allocate(size);
     }
 
@@ -192,7 +222,15 @@ struct DeviceMemoryManagerAllocator {
     }
 
     void Free(DAddr b_address, size_t b_size) {
-        main_allocator.Free(b_address, b_size);
+        std::scoped_lock lock(recycle_mutex);
+        recycled.emplace_back(b_address, b_size);
+        recycled_bytes += b_size;
+        while (recycled_bytes > max_recycled_bytes) {
+            const auto [address, size] = recycled.front();
+            recycled.erase(recycled.begin());
+            recycled_bytes -= size;
+            main_allocator.Free(address, size);
+        }
     }
 };
 
@@ -215,6 +253,12 @@ template <typename Traits>
 void DeviceMemoryManager<Traits>::HintCold(DAddr address, size_t size) {
     // GPU-only images have synthetic cache addresses, not entries in the device page table.
     if (size == 0 || address >= device_as_size || size > device_as_size - address) {
+        return;
+    }
+    // The hint takes the pages out of the working set at once (VirtualUnlock), whether or not
+    // the host needs the RAM, and an image made again over them faults them all back in during
+    // its upload (Ocarina of Time: 1% lows). Only when RAM is short.
+    if (!Common::IsHostLowOnMemory()) {
         return;
     }
     struct Run {
@@ -284,35 +328,48 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
-    std::scoped_lock lk(mapping_guard);
+    std::scoped_lock lk(kept_mutex, mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
     CutContinuityAt(start_page_d);
     for (size_t i = 0; i < num_pages; i++) {
         const VAddr new_vaddress = virtual_address + i * Memory::YUZU_PAGESIZE;
         auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
+        if (const auto kept = kept_pages.find(start_page_d + i);
+            kept != kept_pages.end() && ptr != nullptr) [[unlikely]] {
+            // The page's memory gets what was written meanwhile before anyone can see it.
+            if (kept->second) {
+                std::memcpy(ptr, kept->second->data(), sizeof(KeptPage));
+            } else {
+                std::memset(ptr, 0, sizeof(KeptPage));
+            }
+            kept_pages.erase(kept);
+        }
         // One page per run unless tracked below: a run left from an earlier mapping of these
         // device pages would make WalkBlock copy the host memory that followed that mapping.
-        tracked_entries.GetUnchecked(start_page_d + i).continuity_tracker = 0;
+        tracked_entries.GetUnchecked(start_page_d + i).continuity_tracker.store(0, std::memory_order_relaxed);
         if (ptr == nullptr) [[unlikely]] {
             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
             continue;
         }
         auto phys_addr = static_cast<u32>(GetRawPhysicalAddr(ptr) >> Memory::YUZU_PAGEBITS) + 1U;
-        tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = phys_addr;
         InsertCPUBacking(start_page_d + i, new_vaddress, asid);
         const u32 base_dev = compressed_device_addr[phys_addr - 1U];
         const u32 new_dev = static_cast<u32>(start_page_d + i);
         if (base_dev == 0) [[likely]] {
             compressed_device_addr.GetAndFault(phys_addr - 1U) = new_dev;
-            continue;
+        } else {
+            u32 start_id = base_dev & MULTI_MASK;
+            if ((base_dev >> MULTI_FLAG_BITS) == 0) {
+                start_id = impl->multi_dev_address.Register(base_dev);
+                compressed_device_addr.GetAndFault(phys_addr - 1U) = MULTI_FLAG | start_id;
+            }
+            impl->multi_dev_address.Register(new_dev, start_id);
         }
-        u32 start_id = base_dev & MULTI_MASK;
-        if ((base_dev >> MULTI_FLAG_BITS) == 0) {
-            start_id = impl->multi_dev_address.Register(base_dev);
-            compressed_device_addr.GetAndFault(phys_addr - 1U) = MULTI_FLAG | start_id;
-        }
-        impl->multi_dev_address.Register(new_dev, start_id);
+        // Readers can use this pointer immediately, including while the reserve worker maps
+        // other pages. Publish it only after the retained bytes and backing metadata are ready.
+        tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr.store(
+            phys_addr, std::memory_order_release);
     }
     translation_generation.fetch_add(1, std::memory_order_release);
     if (track) {
@@ -325,18 +382,23 @@ void DeviceMemoryManager<Traits>::Unmap(DAddr address, size_t size) {
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
     device_inter->InvalidateRegion(address, size);
-    std::scoped_lock lk(mapping_guard);
+    std::scoped_lock lk(kept_mutex, mapping_guard);
+    if (!kept_pages.empty()) {
+        for (size_t i = 0; i < num_pages; i++) {
+            kept_pages.erase(start_page_d + i);
+        }
+    }
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages); // should already be committed, but just in case
     CutContinuityAt(start_page_d);
     for (size_t i = 0; i < num_pages; i++) {
         auto& entry = tracked_entries.GetUnchecked(start_page_d + i);
-        auto phys_addr = entry.compressed_physical_ptr;
+        auto phys_addr = entry.compressed_physical_ptr.load(std::memory_order_acquire);
         entry.compressed_physical_ptr = 0;
         entry.cpu_backing_address = 0;
-        entry.continuity_tracker = 0;
+        entry.continuity_tracker.store(0, std::memory_order_relaxed);
         if (phys_addr != 0) [[likely]] {
-            u32& base_dev = compressed_device_addr.GetAndFault(phys_addr - 1U);
+            auto& base_dev = compressed_device_addr.GetAndFault(phys_addr - 1U);
             if ((base_dev >> MULTI_FLAG_BITS) == 0) [[likely]] {
                 base_dev = 0;
                 continue;
@@ -363,7 +425,8 @@ void DeviceMemoryManager<Traits>::CutContinuityAt(size_t page) {
         if (tracked_entries[index].continuity_tracker <= last_count) {
             break;
         }
-        tracked_entries.GetUnchecked(index).continuity_tracker = static_cast<u32>(last_count);
+        tracked_entries.GetUnchecked(index).continuity_tracker.store(
+            static_cast<u32>(last_count), std::memory_order_relaxed);
     }
 }
 
@@ -388,14 +451,17 @@ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtu
             page_count = 1;
         }
         last_ptr = new_ptr;
-        tracked_entries.GetUnchecked(start_page_d + index).continuity_tracker = static_cast<u32>(page_count) - 1;
+        // A reader that takes the whole run must see the contents of every page in it, not
+        // only the first page published earlier by Map.
+        tracked_entries.GetUnchecked(start_page_d + index).continuity_tracker.store(
+            static_cast<u32>(page_count) - 1, std::memory_order_release);
     }
 }
 template <typename Traits>
 u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) {
     size_t page_index = src_addr >> page_bits;
     size_t subbits = src_addr & page_mask;
-    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
+    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker.load(std::memory_order_acquire) + 1) << page_bits) >= size + subbits) {
         return GetPointer<u8>(src_addr);
     }
     return nullptr;
@@ -405,7 +471,7 @@ template <typename Traits>
 const u8* DeviceMemoryManager<Traits>::GetSpan(const DAddr src_addr, const std::size_t size) const {
     size_t page_index = src_addr >> page_bits;
     size_t subbits = src_addr & page_mask;
-    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker+1) << page_bits) >= size + subbits) {
+    if ((static_cast<size_t>(tracked_entries[page_index].continuity_tracker.load(std::memory_order_acquire) + 1) << page_bits) >= size + subbits) {
         return GetPointer<u8>(src_addr);
     }
     return nullptr;
@@ -430,7 +496,7 @@ template <typename T>
 T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) {
     const size_t index = address >> Memory::YUZU_PAGEBITS;
     const size_t offset = address & Memory::YUZU_PAGEMASK;
-    auto phys_addr = tracked_entries[index].compressed_physical_ptr;
+    auto phys_addr = tracked_entries[index].compressed_physical_ptr.load(std::memory_order_acquire);
     if (phys_addr == 0) [[unlikely]]
         return nullptr;
     return GetPointerFromRaw<T>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS) + offset);
@@ -441,7 +507,7 @@ template <typename T>
 const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
     const size_t index = address >> Memory::YUZU_PAGEBITS;
     const size_t offset = address & Memory::YUZU_PAGEMASK;
-    auto phys_addr = tracked_entries[index].compressed_physical_ptr;
+    auto phys_addr = tracked_entries[index].compressed_physical_ptr.load(std::memory_order_acquire);
     if (phys_addr == 0)
         return nullptr;
     return GetPointerFromRaw<T>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS) + offset);
@@ -464,16 +530,103 @@ T DeviceMemoryManager<Traits>::Read(DAddr address) const {
 }
 
 template <typename Traits>
+void DeviceMemoryManager<Traits>::KeepWrites(DAddr address, size_t size) {
+    if (size == 0 || address >= device_as_size || size > device_as_size - address) {
+        return;
+    }
+    const size_t first = address >> Memory::YUZU_PAGEBITS;
+    const size_t last = (address + size - 1) >> Memory::YUZU_PAGEBITS;
+    std::scoped_lock lk(kept_mutex);
+    for (size_t page = first; page <= last; ++page) {
+        if (tracked_entries[page].compressed_physical_ptr == 0) {
+            kept_pages.try_emplace(page);
+        }
+    }
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::ReadKept(DAddr address, void* dest_pointer, size_t size) {
+    if (size == 0 || address >= device_as_size || size > device_as_size - address) {
+        return false;
+    }
+    // Map may have consumed the final kept page after the caller saw a null pointer.
+    // Always recheck the mapping under the same lock, even when no kept pages remain.
+    std::scoped_lock lk(kept_mutex);
+    bool handled = false;
+    auto* dest = static_cast<u8*>(dest_pointer);
+    while (size != 0) {
+        const size_t page = address >> Memory::YUZU_PAGEBITS;
+        const size_t offset = address & Memory::YUZU_PAGEMASK;
+        const size_t amount = (std::min)(Memory::YUZU_PAGESIZE - offset, size);
+        if (const auto phys =
+                tracked_entries[page].compressed_physical_ptr.load(std::memory_order_acquire);
+            phys != 0) {
+            handled = true; // mapped since the caller looked
+            std::memcpy(dest, GetPointerFromRaw<u8>((PAddr(phys - 1) << Memory::YUZU_PAGEBITS) + offset),
+                        amount);
+        } else if (const auto kept = kept_pages.find(page); kept != kept_pages.end()) {
+            handled = true;
+            if (kept->second) {
+                std::memcpy(dest, kept->second->data() + offset, amount);
+            } else {
+                std::memset(dest, 0, amount);
+            }
+        } else {
+            std::memset(dest, 0, amount);
+        }
+        address += amount;
+        dest += amount;
+        size -= amount;
+    }
+    return handled;
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::WriteKept(DAddr address, const void* src_pointer, size_t size) {
+    if (size == 0 || address >= device_as_size || size > device_as_size - address) {
+        return false;
+    }
+    // Map may have consumed the final kept page after the caller saw a null pointer.
+    // Always recheck the mapping under the same lock, even when no kept pages remain.
+    std::scoped_lock lk(kept_mutex);
+    bool handled = false;
+    const auto* src = static_cast<const u8*>(src_pointer);
+    while (size != 0) {
+        const size_t page = address >> Memory::YUZU_PAGEBITS;
+        const size_t offset = address & Memory::YUZU_PAGEMASK;
+        const size_t amount = (std::min)(Memory::YUZU_PAGESIZE - offset, size);
+        if (const auto phys =
+                tracked_entries[page].compressed_physical_ptr.load(std::memory_order_acquire);
+            phys != 0) {
+            handled = true;
+            std::memcpy(GetPointerFromRaw<u8>((PAddr(phys - 1) << Memory::YUZU_PAGEBITS) + offset), src,
+                        amount);
+        } else if (const auto kept = kept_pages.find(page); kept != kept_pages.end()) {
+            handled = true;
+            if (!kept->second) {
+                kept->second = std::make_unique<KeptPage>();
+            }
+            std::memcpy(kept->second->data() + offset, src, amount);
+        }
+        address += amount;
+        src += amount;
+        size -= amount;
+    }
+    return handled;
+}
+
+template <typename Traits>
 void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto on_unmapped, auto on_memory, auto increment) {
     std::size_t remaining_size = size;
     std::size_t page_index = addr >> Memory::YUZU_PAGEBITS;
     std::size_t page_offset = addr & Memory::YUZU_PAGEMASK;
     while (remaining_size) {
-        const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
+        const auto phys_addr =
+            tracked_entries[page_index].compressed_physical_ptr.load(std::memory_order_acquire);
         // An unmapped page says nothing about the pages after it: its run cannot be trusted, so
         // only this page is handed to on_unmapped before the walk moves on.
         const size_t next_pages =
-            phys_addr == 0 ? 1 : std::size_t(tracked_entries[page_index].continuity_tracker + 1);
+            phys_addr == 0 ? 1 : std::size_t(tracked_entries[page_index].continuity_tracker.load(std::memory_order_acquire) + 1);
         const std::size_t copy_amount = (std::min)((next_pages << Memory::YUZU_PAGEBITS) - page_offset, remaining_size);
         const auto current_vaddr = u64((page_index << Memory::YUZU_PAGEBITS) + page_offset);
         SCOPE_EXIT{
@@ -508,7 +661,8 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
         }
 
         const std::size_t page_index = address >> Memory::YUZU_PAGEBITS;
-        const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
+        const auto phys_addr =
+            tracked_entries[page_index].compressed_physical_ptr.load(std::memory_order_acquire);
         if (phys_addr != 0) {
             auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
             cache.slots[cache.cursor] = TranslationEntry{.guest_page = guest_page, .host_ptr = mem_ptr};
@@ -522,6 +676,9 @@ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, s
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
+            if (ReadKept(current_vaddr, dest_pointer, copy_amount)) {
+                return;
+            }
             if (unmapped_bytes == 0) {
                 first_unmapped = current_vaddr;
             }
@@ -544,6 +701,9 @@ void DeviceMemoryManager<Traits>::WriteBlock(DAddr address, const void* src_poin
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
+            if (WriteKept(current_vaddr, src_pointer, copy_amount)) {
+                return;
+            }
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_ERROR(
@@ -576,7 +736,8 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
         }
 
         const std::size_t page_index = address >> Memory::YUZU_PAGEBITS;
-        const auto phys_addr = tracked_entries[page_index].compressed_physical_ptr;
+        const auto phys_addr =
+            tracked_entries[page_index].compressed_physical_ptr.load(std::memory_order_acquire);
         if (phys_addr != 0) {
             auto* const mem_ptr = GetPointerFromRaw<u8>((PAddr(phys_addr - 1) << Memory::YUZU_PAGEBITS));
             cache.slots[cache.cursor] = TranslationEntry{.guest_page = guest_page, .host_ptr = mem_ptr};
@@ -590,6 +751,9 @@ void DeviceMemoryManager<Traits>::ReadBlockUnsafe(DAddr address, void* dest_poin
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
+            if (ReadKept(current_vaddr, dest_pointer, copy_amount)) {
+                return;
+            }
             if (unmapped_bytes == 0) {
                 first_unmapped = current_vaddr;
             }
@@ -613,6 +777,9 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
     WalkBlock(
         address, size,
         [&](size_t copy_amount, DAddr current_vaddr) {
+            if (WriteKept(current_vaddr, src_pointer, copy_amount)) {
+                return;
+            }
             static std::atomic<u32> reported{};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
                 LOG_ERROR(

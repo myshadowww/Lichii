@@ -100,10 +100,12 @@ ServerManager::ServerManager(Core::System& system)
 ServerManager::~ServerManager() {
     // Signal stop.
     m_stop_source.request_stop();
-    m_wakeup_event->Signal(m_system.Kernel());
+    if (!m_loop_skipped) {
+        m_wakeup_event->Signal(m_system.Kernel());
 
-    // Wait for processing to stop.
-    m_stopped.Wait();
+        // Wait for processing to stop.
+        m_stopped.Wait();
+    }
     m_threads.clear();
 
     // Clean up ports.
@@ -271,6 +273,13 @@ Result ServerManager::LoopProcess() {
     };
 
     R_RETURN(this->LoopProcessImpl());
+}
+
+void ServerManager::SkipLoop() {
+    m_stop_source.request_stop();
+    m_wakeup_event->Signal(m_system.Kernel());
+    m_threads.clear();
+    m_loop_skipped = true;
 }
 
 void ServerManager::LinkToDeferredList(MultiWaitHolder* holder) {

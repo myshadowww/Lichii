@@ -47,33 +47,45 @@ std::filesystem::path WarmCountPath(const std::filesystem::path& warm_file);
 /// file of another size.
 u64 ReadWarmCount(const std::filesystem::path& warm_file);
 
-/// What a marker records: the precache file's size and last-write time, its entry count, the GPU
-/// driver version and device ID and the pipeline cache version.
+/// What a marker records: the precache file's size and content hash, its entry count, the GPU
+/// driver version and device ID, the pipeline cache version and the shader lowering's stamp.
+/// The content, not the last-write time: building the file again with the same shaders ("Precache
+/// Shaders" by hand) rebuilt every compute program (~3000, 8.5 min on a Ryzen 5 5600X). The
+/// lowering stamp: after an update that changes the shader recompiler the programs are built
+/// again at boot, where before the marker still said "done" and they were built during play.
 struct WarmStamp {
     u64 size{};
-    s64 write_time{};
+    u64 content_hash{};
     u64 entries{};
     u32 driver{};
     u32 device_id{};
     u32 cache_version{};
+    u64 lowering{};
 
-    /// True when `other` was written for the same file, driver, device and cache version (the
-    /// entry count is informative).
+    /// True when `other` was written for the same file contents, driver, device, cache version
+    /// and lowering (the entry count is informative).
     [[nodiscard]] bool Matches(const WarmStamp& other) const noexcept {
-        return size == other.size && write_time == other.write_time && driver == other.driver &&
-               device_id == other.device_id && cache_version == other.cache_version;
+        return size == other.size && content_hash == other.content_hash &&
+               driver == other.driver && device_id == other.device_id &&
+               cache_version == other.cache_version && lowering == other.lowering;
     }
 };
 
-/// The stamp of `warm_file` as it is now, empty when its size or time cannot be read.
+/// The stamp of `warm_file` as it is now, empty when it cannot be read.
 std::optional<WarmStamp> CurrentWarmStamp(const std::filesystem::path& warm_file, u64 entries,
-                                          u32 driver, u32 device_id, u32 cache_version);
+                                          u32 driver, u32 device_id, u32 cache_version,
+                                          u64 lowering = 0);
 
 /// The marker of `warm_file`, empty when there is none or it cannot be read.
 std::optional<WarmStamp> ReadWarmMarker(const std::filesystem::path& warm_file);
 
 /// Writes the marker of `warm_file`. Returns false when it cannot be written.
 bool WriteWarmMarker(const std::filesystem::path& warm_file, const WarmStamp& stamp);
+
+/// Removes the marker of `warm_file` before `new_file` replaces it, unless the marker was written
+/// for the same contents: a rebuild that comes out identical stays done.
+void DropStaleWarmMarker(const std::filesystem::path& warm_file,
+                         const std::filesystem::path& new_file);
 
 /// True when the title's precache has never finished: no precache file yet, or no marker next
 /// to it, or a recipe (FindNativeRecipe) not assembled yet. A marker that no longer matches (new
@@ -145,6 +157,11 @@ struct Result {
     size_t compute_programs{};   ///< Entries written to the precache file
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
+
+/// Why a precache file must be built again: missing, of a cache version the emulator does not
+/// load, written by an older builder (WarmBuilderVersion) or changed since. Empty when it is
+/// current.
+std::optional<std::string> WarmFilesStale(const std::filesystem::path& warm_file);
 
 /// Builds the precache file for the game at `game_path` (any format the loader opens, Switch 2
 /// .nup first), from the user's own copy and keys, with no external tools. Runs on the calling

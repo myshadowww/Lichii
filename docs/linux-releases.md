@@ -51,6 +51,15 @@ NVIDIA hardware and drivers; see [the Linux DLSS guide](user/DLSSLinux.md).
 AppImages use the normal Lichii profile unless XDG directories are overridden.
 They do not reproduce a developer's game-specific desktop launcher or copy its saves.
 
+On Linux, the GUI and command-line frontend give NVIDIA's shader disk cache a
+10 GiB limit and a separate `lichii/nvidia` directory under `XDG_CACHE_HOME`
+(or `~/.cache` when that variable is missing or relative). The first run with this
+directory needs to warm the driver cache again. Existing
+`__GL_SHADER_DISK_CACHE_PATH` and `__GL_SHADER_DISK_CACHE_SIZE` settings take
+precedence, including explicitly empty values. The directory is used only when it
+can be created; no existing cache files are moved or deleted. The Vulkan log
+records these settings when using NVIDIA's proprietary driver.
+
 ## Publishing future builds
 
 Push a new `desktop-YYYY-MM-DD` tag, with an optional suffix for another build on the

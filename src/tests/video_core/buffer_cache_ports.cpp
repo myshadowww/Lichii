@@ -18,6 +18,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
@@ -100,6 +101,9 @@ struct Runtime {
         return DownloadStagingBuffer(size);
     }
     void FreeDeferredStagingBuffer(Staging&) {}
+    void OnBufferDeleted(Buffer&) {
+        ++deleted_buffers;
+    }
     void CopyBuffer(Buffer* dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
                     bool) {
         for (const auto& copy : copies) {
@@ -190,7 +194,7 @@ struct Runtime {
     }
 
     u32 alignment{256};
-    u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
+    u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{}, deleted_buffers{};
     u32 host_read_barriers{}, host_read_waits{}, queued_host_reads{};
     u64 upload_bytes{}, waited_tick{};
     u64 submitted_tick{}, completed_tick{};
@@ -408,6 +412,12 @@ struct BufferCacheTestAccess {
     }
     static const auto& ReadChecks(Cache& cache) {
         return cache.read_check;
+    }
+    static BufferCacheChannelInfo& Channel(Cache& cache, s32 bind_id) {
+        return cache.channel_storage[cache.channel_map.find(bind_id)->second];
+    }
+    static void UpdateUniforms(Cache& cache, size_t stage) {
+        cache.UpdateUniformBuffers(stage);
     }
 };
 
@@ -2450,4 +2460,165 @@ TEST_CASE("Async read-back counts the reading thread's and the GPU side's waits 
     REQUIRE(counters.reader_waits.load() - reader_waits == 1);
     REQUIRE(counters.gpu_side_waits.load() - gpu_side_waits == 1);
     REQUIRE(f.runtime.host_read_waits == 2);
+}
+
+TEST_CASE("Claimed inner invalidations preserve every write on a GPU-written page",
+          "[buffer_ports][inner_invalidation]") {
+    const bool native = GENERATE(false, true);
+    Fixture f;
+    const bool previous = Tegra::g_nx2_ampere.exchange(native);
+    SCOPE_EXIT { Tegra::g_nx2_ampere.store(previous); };
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    auto& buffer = Access::Get(*f.cache, id);
+    std::ranges::fill(buffer.bytes, 0x12);
+    Access::Dirty(*f.cache, 0x20000, 0x1000);
+    std::memset(f.bytes + 0x10100, 0xaa, 0x10);
+    std::memset(f.bytes + 0x10800, 0xbb, 0x10);
+    const std::array<std::pair<DAddr, std::size_t>, 2> ranges{{{0x20100, 0x10},
+                                                            {0x20800, 0x10}}};
+    // Match InnerInvalidation's span and ordering, on the scheduler's owner thread. A separate
+    // thread keeps its GPU-thread marker from affecting other tests.
+    std::thread{[&] {
+        VideoCommon::GpuSplit::MarkGpuThread();
+        f.cache->ClaimCpuWrites(std::span{ranges});
+        for (const auto& [address, size] : ranges) {
+            f.cache->WriteMemory(address, size);
+        }
+    }}.join();
+    REQUIRE(std::ranges::all_of(std::span{f.bytes + 0x10100, 0x10},
+                               [](u8 byte) { return byte == 0xaa; }));
+    REQUIRE(std::ranges::all_of(std::span{f.bytes + 0x10800, 0x10},
+                               [](u8 byte) { return byte == 0xbb; }));
+    if (native) {
+        REQUIRE(f.runtime.downloads == 0);
+        REQUIRE(f.runtime.uploads == 2);
+        REQUIRE(f.bytes[0x10810] == 0);
+    } else {
+        REQUIRE(f.runtime.downloads != 0);
+        REQUIRE(f.bytes[0x10000] == 0x12);
+        REQUIRE(f.bytes[0x10810] == 0x12);
+    }
+    Access::Upload(*f.cache, id, 0x20000, 0x1000);
+    REQUIRE(buffer.bytes[0x100] == 0xaa);
+    REQUIRE(buffer.bytes[0x10f] == 0xaa);
+    REQUIRE(buffer.bytes[0x800] == 0xbb);
+    REQUIRE(buffer.bytes[0x80f] == 0xbb);
+    REQUIRE(buffer.bytes[0xff] == 0x12);
+    REQUIRE(buffer.bytes[0x110] == 0x12);
+    REQUIRE(buffer.bytes[0x7ff] == 0x12);
+    REQUIRE(buffer.bytes[0x810] == 0x12);
+}
+
+TEST_CASE("DMA clear finds registered buffers beyond its first quarter",
+          "[buffer_ports][dma_clear]") {
+    Fixture f;
+    f.memory->Map(0x200000, 0x10000, 0x30000, Tegra::PTEKind::PITCH, true);
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    f.cache->CreateChannel(state);
+    f.cache->BindToChannel(0);
+
+    constexpr DAddr address = 0x18000;
+    constexpr GPUVAddr gpu_address = 0x208000;
+    constexpr u64 words = 0x3000;
+    constexpr u64 bytes = words * sizeof(u32);
+    REQUIRE_FALSE(f.cache->DMAClear(gpu_address, words, 0x3c3c3c3c));
+
+    const auto id = Access::Add(*f.cache, 0x20000, 0x10000);
+    std::ranges::fill(Access::Get(*f.cache, id).bytes, 0x77);
+    Access::Dirty(*f.cache, 0x20000, 0x10000);
+    REQUIRE_FALSE(f.cache->IsRegionRegistered(address, words));
+    REQUIRE(f.cache->IsRegionRegistered(address, bytes));
+    REQUIRE(f.cache->DMAClear(gpu_address, words, 0x3c3c3c3c));
+
+    // The production clear grows the buffer across the unregistered prefix and retains the
+    // original buffer's bytes beyond the clear. Reacquire it after that merge.
+    const auto cleared_id = Access::Find(*f.cache, address, bytes);
+    const auto& cleared = Access::Get(*f.cache, cleared_id);
+    REQUIRE(std::ranges::all_of(
+        std::span{cleared.bytes}.subspan(cleared.Offset(address), bytes),
+        [](u8 byte) { return byte == 0x3c; }));
+    REQUIRE(std::ranges::all_of(
+        std::span{cleared.bytes}.subspan(cleared.Offset(address + bytes), 0xc000),
+        [](u8 byte) { return byte == 0x77; }));
+    REQUIRE_FALSE(Access::Pending(*f.cache, 0x20000, 0x4000));
+    REQUIRE(Access::Pending(*f.cache, 0x24000, 0xc000));
+}
+
+TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buffer_ports]") {
+    struct ChannelsFixture : Fixture {
+        ChannelsFixture() {
+            for (auto* state : {&first, &second}) {
+                state->memory_manager = &*memory;
+                state->payload.emplace(system, *memory, *state);
+                cache->CreateChannel(*state);
+            }
+        }
+        ~ChannelsFixture() {
+            cache.reset();
+        }
+        Tegra::Control::ChannelState first{0};
+        Tegra::Control::ChannelState second{1};
+    } f;
+    namespace Dirty = VideoCommon::Dirty;
+    const auto id = Access::Add(*f.cache, 0x10000, 0x10000);
+    const VideoCommon::Binding bound{.device_addr = 0x10800, .size = 0x100, .buffer_id = id};
+    auto& current = Access::Channel(*f.cache, 0);
+    auto& other = Access::Channel(*f.cache, 1);
+    const auto unrelated = Access::Add(*f.cache, 0x40000, 0x10000);
+    const VideoCommon::Binding retained{.device_addr = 0x40800, .size = 0x100,
+                                       .buffer_id = unrelated};
+    current.uniform_buffers[0][0] = bound;
+    other.uniform_buffers[0][1] = retained;
+    other.vertex_buffers[1] = retained;
+    other.index_buffer = bound;
+    other.vertex_buffers[2] = bound;
+    other.uniform_buffers[0][0] = bound;
+    other.storage_buffers[4][1] = bound;
+    other.transform_feedback_buffers[3] = bound;
+    other.count_buffer_binding = bound;
+    other.indirect_buffer_binding = bound;
+    other.compute_uniform_buffers[5] = bound;
+    other.compute_storage_buffers[3] = bound;
+    static_cast<VideoCommon::Binding&>(other.texture_buffers[2][1]) = bound;
+    static_cast<VideoCommon::Binding&>(other.compute_texture_buffers[4]) = bound;
+    other.enabled_uniform_buffer_masks[0] = 1;
+    auto& flags = other.maxwell3d.dirty.flags;
+    flags.reset();
+
+    // Deleted while channel 0 is current; the next buffer takes its slot.
+    f.cache->BindToChannel(0);
+    const auto deletions = f.runtime.deleted_buffers;
+    Access::Delete(*f.cache, id);
+    REQUIRE(f.runtime.deleted_buffers == deletions + 1);
+    REQUIRE(Access::Add(*f.cache, 0x30000, 0x10000) == id);
+
+    REQUIRE(!current.uniform_buffers[0][0].buffer_id);
+    for (const auto* binding : std::initializer_list<const VideoCommon::Binding*>{
+             &other.index_buffer, &other.vertex_buffers[2], &other.uniform_buffers[0][0],
+             &other.storage_buffers[4][1], &other.transform_feedback_buffers[3],
+             &other.count_buffer_binding, &other.indirect_buffer_binding,
+             &other.compute_uniform_buffers[5], &other.compute_storage_buffers[3],
+             &other.texture_buffers[2][1], &other.compute_texture_buffers[4]}) {
+        REQUIRE(!binding->buffer_id);
+        REQUIRE(binding->device_addr == 0x10800);
+    }
+    REQUIRE(other.uniform_buffers[0][1].buffer_id == unrelated);
+    REQUIRE(other.vertex_buffers[1].buffer_id == unrelated);
+    REQUIRE(current.has_deleted_buffers);
+    REQUIRE(other.has_deleted_buffers);
+    REQUIRE(flags[Dirty::IndexBuffer]);
+    REQUIRE(flags[Dirty::VertexBuffers]);
+    REQUIRE(flags[Dirty::VertexBuffer0 + 2]);
+    REQUIRE(!flags[Dirty::VertexBuffer0 + 1]);
+
+    // Channel 1's next draw resolves its uniform buffer again, to a buffer that holds the range.
+    f.cache->BindToChannel(1);
+    Access::UpdateUniforms(*f.cache, 0);
+    const auto resolved = other.uniform_buffers[0][0].buffer_id;
+    REQUIRE(resolved);
+    REQUIRE(resolved != VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(resolved != id);
+    REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x10800, 0x100));
 }

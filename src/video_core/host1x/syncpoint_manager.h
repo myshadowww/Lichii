@@ -8,7 +8,9 @@
 #include <condition_variable>
 #include <functional>
 #include <list>
+#include <map>
 #include <mutex>
+#include <optional>
 
 #include "common/common_types.h"
 
@@ -55,6 +57,24 @@ public:
 
     void IncrementGuest(u32 syncpoint_id);
 
+    /// Called with every current guest value during registration, then with each new value
+    /// before it is published and its actions run. All callbacks run under the manager's guard
+    /// and must not call methods that take that guard.
+    using GuestMirror = std::function<void(u32 syncpoint_id, u32 value)>;
+    using GuestMirrorHandle = u64;
+    [[nodiscard]] GuestMirrorHandle RegisterGuestMirror(GuestMirror mirror);
+
+    /// Removes only this registration and waits for any running mirror callback to finish.
+    void DeregisterGuestMirror(GuestMirrorHandle handle);
+
+    /// Runs func with guest increments held off, so a copy of the guest values it makes can't
+    /// overwrite a newer value the mirror wrote.
+    template <typename Func>
+    void WithGuestValuesStable(Func&& func) {
+        std::scoped_lock lk(guard);
+        func();
+    }
+
     void IncrementHost(u32 syncpoint_id);
 
     void WaitGuest(u32 syncpoint_id, u32 expected_value);
@@ -71,7 +91,8 @@ public:
 
 private:
     void Increment(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
-                   std::list<RegisteredAction>& action_storage);
+                   std::list<RegisteredAction>& action_storage,
+                   std::optional<u32> mirrored_id = std::nullopt);
 
     ActionHandle RegisterAction(std::atomic<u32>& syncpoint,
                                 std::list<RegisteredAction>& action_storage, u32 expected_value,
@@ -89,6 +110,8 @@ private:
 
     std::mutex guard;
     u64 last_action_id{};
+    GuestMirrorHandle last_guest_mirror_id{};
+    std::map<GuestMirrorHandle, GuestMirror> guest_mirrors; ///< Guarded by `guard`.
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
 };
