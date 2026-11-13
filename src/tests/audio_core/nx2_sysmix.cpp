@@ -729,3 +729,23 @@ TEST_CASE("sysmix null output preserves PCM cadence and notification timing", "[
         REQUIRE(stream.GetDataEvent()->Clear(context.system.Kernel()).IsSuccess());
     }
 }
+
+TEST_CASE("sysmix null output drains a 5.1 ring one block per pump", "[sysmix]") {
+    Context context;
+    AudioCore::Sink::NullSink sink{"auto"};
+    Cursor(context, 0, 480);
+    std::vector<float> pcm(480 * 6, 0.25f);
+    REQUIRE(context.Memory().WriteBlock(Context::Base + 0x1040, pcm.data(),
+                                        pcm.size() * sizeof(float)));
+    SysmixOutput stream{context.system, *context.process, sink, 1,
+                        Context::Base,  Context::Size,    0x24};
+    REQUIRE(stream.Open(5, 6, 48000, 480, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    for (u32 tick = 1; tick <= 2; ++tick) {
+        CAPTURE(tick);
+        stream.Pump();
+        REQUIRE(ReadCursor(context) == tick * 240);
+        REQUIRE(stream.GetCounters().admitted_blocks == tick);
+        REQUIRE(stream.GetCounters().nonzero_frames == tick * 240);
+    }
+}
