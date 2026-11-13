@@ -394,6 +394,15 @@ if (NOT ANDROID)
     add_test(NAME profile_import_tests COMMAND profile_import_tests)
 endif()
 
+# The per-title library overrides must not rewrite a game archive or lose an existing override
+# when a replacement cannot be saved. These helpers only need Qt's image/file support.
+if (ENABLE_QT)
+    add_executable(qt_game_metadata_tests qt_common/game_metadata.cpp)
+    target_link_libraries(qt_game_metadata_tests PRIVATE common qt_common Qt6::Widgets
+        Catch2::Catch2WithMain)
+    add_test(NAME qt_game_metadata_tests COMMAND qt_game_metadata_tests)
+endif()
+
 # needed for vma
 if (NOT MSVC)
     target_compile_options(tests PRIVATE
