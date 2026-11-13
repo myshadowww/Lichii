@@ -392,6 +392,9 @@ public:
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
     Id tensor_subgroup_id{};
+    /// The software matrix functions round to fp16 with a native conversion, which needs the
+    /// entry point's fp16 round-to-nearest-even and denorm preserve modes.
+    bool native_half_rounding{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
