@@ -101,6 +101,9 @@ struct Runtime {
         return DownloadStagingBuffer(size);
     }
     void FreeDeferredStagingBuffer(Staging&) {}
+    void OnBufferDeleted(Buffer&) {
+        ++deleted_buffers;
+    }
     void CopyBuffer(Buffer* dst, Buffer& src, std::span<const VideoCommon::BufferCopy> copies,
                     bool) {
         for (const auto& copy : copies) {
@@ -191,7 +194,7 @@ struct Runtime {
     }
 
     u32 alignment{256};
-    u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{};
+    u32 allocations{}, downloads{}, uploads{}, finishes{}, waits{}, deleted_buffers{};
     u32 host_read_barriers{}, host_read_waits{}, queued_host_reads{};
     u64 upload_bytes{}, waited_tick{};
     u64 submitted_tick{}, completed_tick{};
@@ -412,9 +415,6 @@ struct BufferCacheTestAccess {
     }
     static BufferCacheChannelInfo& Channel(Cache& cache, s32 bind_id) {
         return cache.channel_storage[cache.channel_map.find(bind_id)->second];
-    }
-    static void Delete(Cache& cache, BufferId id) {
-        cache.DeleteBuffer(id);
     }
     static void UpdateUniforms(Cache& cache, size_t stage) {
         cache.UpdateUniformBuffers(stage);
@@ -2566,31 +2566,48 @@ TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buf
     const VideoCommon::Binding bound{.device_addr = 0x10800, .size = 0x100, .buffer_id = id};
     auto& current = Access::Channel(*f.cache, 0);
     auto& other = Access::Channel(*f.cache, 1);
+    const auto unrelated = Access::Add(*f.cache, 0x40000, 0x10000);
+    const VideoCommon::Binding retained{.device_addr = 0x40800, .size = 0x100,
+                                       .buffer_id = unrelated};
     current.uniform_buffers[0][0] = bound;
+    other.uniform_buffers[0][1] = retained;
+    other.vertex_buffers[1] = retained;
     other.index_buffer = bound;
     other.vertex_buffers[2] = bound;
     other.uniform_buffers[0][0] = bound;
     other.storage_buffers[4][1] = bound;
     other.transform_feedback_buffers[3] = bound;
+    other.count_buffer_binding = bound;
     other.indirect_buffer_binding = bound;
     other.compute_uniform_buffers[5] = bound;
+    other.compute_storage_buffers[3] = bound;
+    static_cast<VideoCommon::Binding&>(other.texture_buffers[2][1]) = bound;
+    static_cast<VideoCommon::Binding&>(other.compute_texture_buffers[4]) = bound;
     other.enabled_uniform_buffer_masks[0] = 1;
     auto& flags = other.maxwell3d.dirty.flags;
     flags.reset();
 
     // Deleted while channel 0 is current; the next buffer takes its slot.
     f.cache->BindToChannel(0);
+    const auto deletions = f.runtime.deleted_buffers;
     Access::Delete(*f.cache, id);
+    REQUIRE(f.runtime.deleted_buffers == deletions + 1);
     REQUIRE(Access::Add(*f.cache, 0x30000, 0x10000) == id);
 
     REQUIRE(!current.uniform_buffers[0][0].buffer_id);
-    for (const auto* binding :
-         {&other.index_buffer, &other.vertex_buffers[2], &other.uniform_buffers[0][0],
-          &other.storage_buffers[4][1], &other.transform_feedback_buffers[3],
-          &other.indirect_buffer_binding, &other.compute_uniform_buffers[5]}) {
+    for (const auto* binding : std::initializer_list<const VideoCommon::Binding*>{
+             &other.index_buffer, &other.vertex_buffers[2], &other.uniform_buffers[0][0],
+             &other.storage_buffers[4][1], &other.transform_feedback_buffers[3],
+             &other.count_buffer_binding, &other.indirect_buffer_binding,
+             &other.compute_uniform_buffers[5], &other.compute_storage_buffers[3],
+             &other.texture_buffers[2][1], &other.compute_texture_buffers[4]}) {
         REQUIRE(!binding->buffer_id);
         REQUIRE(binding->device_addr == 0x10800);
     }
+    REQUIRE(other.uniform_buffers[0][1].buffer_id == unrelated);
+    REQUIRE(other.vertex_buffers[1].buffer_id == unrelated);
+    REQUIRE(current.has_deleted_buffers);
+    REQUIRE(other.has_deleted_buffers);
     REQUIRE(flags[Dirty::IndexBuffer]);
     REQUIRE(flags[Dirty::VertexBuffers]);
     REQUIRE(flags[Dirty::VertexBuffer0 + 2]);
