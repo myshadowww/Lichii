@@ -972,9 +972,9 @@ QStringList GRenderWindow::GetUnsupportedGLExtensions() const {
 void GRenderWindow::showEvent(QShowEvent* event) {
     QWidget::showEvent(event);
 
-    // windowHandle() is not initialized until the Window is shown, so we connect it here.
-    connect(windowHandle(), &QWindow::screenChanged, this, &GRenderWindow::OnFramebufferSizeChanged,
-            Qt::UniqueConnection);
+    // The top-level window's handle is not initialized until it is shown, so we connect it here.
+    connect(window()->windowHandle(), &QWindow::screenChanged, this,
+            &GRenderWindow::OnFramebufferSizeChanged, Qt::UniqueConnection);
 }
 
 bool GRenderWindow::eventFilter(QObject* object, QEvent* event) {
