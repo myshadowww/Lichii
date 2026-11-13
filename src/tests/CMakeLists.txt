@@ -397,8 +397,9 @@ endif()
 # The per-title library overrides must not rewrite a game archive or lose an existing override
 # when a replacement cannot be saved. These helpers only need Qt's image/file support.
 if (ENABLE_QT)
-    add_executable(qt_game_metadata_tests qt_common/game_metadata.cpp)
-    target_link_libraries(qt_game_metadata_tests PRIVATE common qt_common Qt6::Widgets
+    add_executable(qt_game_metadata_tests qt_common/game_metadata.cpp
+        ../qt_common/util/game_metadata.cpp)
+    target_link_libraries(qt_game_metadata_tests PRIVATE common Qt6::Gui
         Catch2::Catch2WithMain)
     add_test(NAME qt_game_metadata_tests COMMAND qt_game_metadata_tests)
 endif()
