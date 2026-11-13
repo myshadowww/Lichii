@@ -26,6 +26,7 @@
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
@@ -275,6 +276,9 @@ struct BufferCacheTestAccess {
         channel.maxwell3d.dirty.flags[Dirty::IndexBuffer] = true;
         cache.UpdateIndexBuffer();
         return channel.index_buffer.buffer_id;
+    }
+    static void UseGpuMemory(Cache& cache, Tegra::MemoryManager& memory) {
+        cache.gpu_memory = &memory;
     }
     static void Delete(Cache& cache, BufferId id) {
         cache.DeleteBuffer(id);
@@ -2621,4 +2625,25 @@ TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buf
     REQUIRE(resolved != VideoCommon::NULL_BUFFER_ID);
     REQUIRE(resolved != id);
     REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x10800, 0x100));
+}
+
+TEST_CASE("Indirect dispatch arguments remain GPU modified across a neighboring CPU upload",
+          "[buffer_ports]") {
+    Fixture f;
+    const auto id = Access::Add(*f.cache, 0x10000, 0x10000);
+    auto& original = Access::Get(*f.cache, id);
+    std::fill_n(original.bytes.begin() + 0x40, 12, u8{0x73});
+    Access::Dirty(*f.cache, 0x10040, 12);
+    Access::UseGpuMemory(*f.cache, *f.memory);
+    const auto [arguments, offset] = VideoCommon::ObtainIndirectBuffer(*f.cache, 0x100040);
+    REQUIRE(Access::Pending(*f.cache, 0x10040, 12));
+    REQUIRE(arguments->bytes[offset] == 0x73);
+    // A CPU write elsewhere on this tracked page must not re-upload the stale argument bytes.
+    f.bytes[0x80] = 0x42;
+    Access::MarkCpuModified(*f.cache, 0x10000, 0x1000);
+    Access::Upload(*f.cache, id, 0x10000, 0x1000);
+    REQUIRE(arguments->bytes[offset] == 0x73);
+    REQUIRE(arguments->bytes[arguments->Offset(0x10080)] == 0x42);
+    f.cache->DownloadMemory(0x10040, 12);
+    REQUIRE(f.bytes[0x40] == 0x73);
 }

@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "video_core/buffer_cache/indirect_buffer.h"
 #include "common/dkb_frame_trace.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "common/logging.h"
@@ -2314,10 +2315,8 @@ void RasterizerVulkan::DispatchCompute() {
     }
     if (indirect_address) {
         // DispatchIndirect
-        static constexpr auto sync_info = VideoCommon::ObtainBufferSynchronize::FullSynchronize;
-        const auto post_op = VideoCommon::ObtainBufferOperation::DiscardWrite;
         const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
+            VideoCommon::ObtainIndirectBuffer(buffer_cache, *indirect_address);
         scheduler.RequestOutsideRenderPassOperationContext();
         scheduler.NoteComputeWrites();
         scheduler.TraceComputePipeline(pipeline->ShaderHash());
