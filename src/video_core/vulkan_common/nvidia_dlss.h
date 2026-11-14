@@ -11,13 +11,13 @@
 namespace Vulkan::NvidiaDlss {
 
 // Start before creating the renderer instance; attach after enabling the required extensions.
-bool Start();
+bool Start(void* window = nullptr);
 [[nodiscard]] bool WantsDevice();
 [[nodiscard]] std::vector<std::string> InstanceExtensions();
 [[nodiscard]] std::vector<std::string> DeviceExtensions(VkInstance instance,
                                                         VkPhysicalDevice physical);
 bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
-                  u32 graphics_family, vk::DeviceDispatch &dld);
+                  u32 graphics_family, u32 first_streamline_queue, vk::DeviceDispatch& dld);
 [[nodiscard]] bool IsAvailable();
 // Called after upscalers are destroyed and before the Vulkan device is destroyed.
 void Stop();

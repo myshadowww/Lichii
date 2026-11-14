@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <version>
@@ -51,6 +50,8 @@ SWITCHABLE(OotAntiAliasing, false);
 SWITCHABLE(NvidiaDlssQuality, false);
 SWITCHABLE(NeuralRendering, false);
 SWITCHABLE(NvidiaDlssPreset, false);
+SWITCHABLE(HdrMode, false);
+SWITCHABLE(HdrSwapchain, false);
 SWITCHABLE(AspectRatio, true);
 SWITCHABLE(AstcDecodeMode, true);
 SWITCHABLE(AstcRecompression, true);
@@ -91,6 +92,7 @@ Values values;
 namespace {
 // One byte per option; the three percentages default to 100 while quality/style default to zero.
 std::atomic<u64> nvidia_dlss_runtime_options{(u64{100} << 16) | (u64{100} << 24) | (u64{100} << 32)};
+std::atomic<u32> applied_ocarina_render_scale{};
 } // namespace
 
 /// Publish enablement, quality, style and neural percentages after frontend settings are applied.
@@ -105,6 +107,29 @@ void RefreshNvidiaDlssRuntimeSettings() {
         quality | (neural << 8) | (strength << 16) | (tone << 24) | (structure << 32) |
             (enabled << 40) | (static_cast<u64>(values.nvidia_dlss_preset.GetValue()) << 48),
         std::memory_order_relaxed);
+}
+
+std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
+    const auto quality = values.nvidia_dlss_quality.GetValue();
+    if (!values.nvidia_dlss.GetValue() || !IsDockedMode() ||
+        (quality != NvidiaDlssQuality::Balanced && quality != NvidiaDlssQuality::Performance &&
+         quality != NvidiaDlssQuality::UltraPerformance)) {
+        return std::nullopt;
+    }
+    return quality;
+}
+
+void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
+    applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
+                                       std::memory_order_relaxed);
+}
+
+std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
+    const u32 value = applied_ocarina_render_scale.load(std::memory_order_relaxed);
+    if (value == 0) {
+        return std::nullopt;
+    }
+    return static_cast<NvidiaDlssQuality>(value - 1);
 }
 
 /// Decode the atomic option snapshot used by the GPU and scheduler threads.
@@ -265,6 +290,10 @@ static bool current_program_is_switch2 = false;
 
 void SetCurrentProgramIsSwitch2(bool is_switch2) {
     current_program_is_switch2 = is_switch2;
+}
+
+bool ReactiveFlushing() {
+    return values.use_reactive_flushing.GetValue() || values.force_reactive_flushing;
 }
 
 bool CurrentProgramIsSwitch2() {

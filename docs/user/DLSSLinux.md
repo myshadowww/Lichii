@@ -185,7 +185,7 @@ accepts the versioned runtime filename or `libnvidia-ngx-dlss.so`; the in-app
 import/download flow verifies the pinned runtime. NGX caches go under `ngx` in
 Lichii's cache directory.
 
-With `YUZU_TESTS=ON`, the optional GPU smoke test can be run without booting a game:
+With `LICHII_TESTS=ON`, the optional GPU smoke test can be run without booting a game:
 
 ```sh
 cmake --build build --target ngx_smoke

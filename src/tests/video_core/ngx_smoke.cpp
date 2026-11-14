@@ -356,7 +356,7 @@ int main(int argc, char **argv) try {
             Require(!NvidiaDlss::WantsDevice(), "Attached runtime still requests a device");
             auto duplicate_dispatch = device.GetDispatchLoader();
             Require(!NvidiaDlss::AttachDevice(*instance, physical_devices[gpu],
-                                              *device.GetLogical(), device.GetGraphicsFamily(),
+                                              *device.GetLogical(), device.GetGraphicsFamily(), 0,
                                               duplicate_dispatch),
                     "NGX accepted a second device attachment");
             Require(NvidiaDlss::IsAvailable(), "Duplicate attachment disturbed the active device");

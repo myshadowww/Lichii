@@ -55,7 +55,7 @@ target_include_directories(lichii_nr_kernels PRIVATE src volk)
 target_link_libraries(lichii_nr_kernels PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
 set_target_properties(lichii_nr_kernels PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-if (YUZU_TESTS)
+if (LICHII_TESTS)
     add_executable(neural_rendering_smoke EXCLUDE_FROM_ALL
         ${PROJECT_SOURCE_DIR}/src/tests/video_core/neural_rendering_smoke.cpp
         ${PROJECT_SOURCE_DIR}/src/video_core/neural_rendering/model.cpp)

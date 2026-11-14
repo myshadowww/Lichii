@@ -117,7 +117,7 @@ void ReportEvaluation() { evaluations.fetch_add(1, std::memory_order_relaxed); }
 namespace NvidiaDlss {
 
 /// Prepare NGX before Vulkan device creation, even when DLSS will initially be disabled.
-bool Start() {
+bool Start(void*) {
     Stop();
     {
         std::scoped_lock lock{status_mutex};
@@ -197,7 +197,7 @@ std::vector<std::string> DeviceExtensions(VkInstance, VkPhysicalDevice) {
 }
 
 /// Initialize NGX on one supported NVIDIA Vulkan device and verify DLSS availability.
-bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device, u32,
+bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device, u32, u32,
                   vk::DeviceDispatch &dld) {
     State &state = GetState();
     if (!WantsDevice()) {
