@@ -264,3 +264,13 @@ copy the resulting title directory into an empty portable profile's
 `user/cache/shader` and launch with "Build all cached shaders before game start" on. The
 cache format and pipeline state must be compatible with the recipient's build
 and Vulkan features.
+
+### NVIDIA global-memory routing
+
+Pass `--select-global-memory-buffer` to the `shader-sweep` executable to emit
+the NVIDIA variable-pointer routing path, including for `--pipeline` and `--list`
+replay. Without it the fixed offline profile retains per-buffer branches. The
+JSON diagnostic records the enabled option. This assumes the runtime device
+supports variablePointersStorageBuffer and ShaderNonUniform; the offline tool
+does not probe a GPU. Runtime selection remains limited to NVIDIA proprietary
+drivers with those capabilities.

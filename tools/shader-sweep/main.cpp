@@ -45,6 +45,8 @@ using Json = nlohmann::json;
 using Shader::Stage;
 using Shader::Ampere::Instruction;
 
+bool select_global_memory_buffer{};
+
 struct MissingContext : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -577,6 +579,7 @@ Shader::Profile OfflineProfile(const Shader::HostTranslateInfo& host) {
     profile.max_user_clip_distances = 8;
     profile.max_subgroup_size = 32;
     profile.support_typeless_image_loads = true;
+    profile.select_global_memory_buffer = select_global_memory_buffer;
     return profile;
 }
 
@@ -1166,13 +1169,19 @@ int main(int argc, char** argv) {
                              "shader-sweep --pipeline RECORD --cache-version 46..54 "
                              "--output-dir DIR [--path legacy|v2]\n"
                              "shader-sweep --list CACHE --output-dir DIR [--path legacy|v2] "
-                             "[--programs-log V2LOG]\n";
+                             "[--programs-log V2LOG]\n"
+                             "All compilation modes accept --select-global-memory-buffer\n";
                 return 0;
             }
             if (!arg.starts_with("--")) {
                 if (!input.empty())
                     throw std::runtime_error("Multiple input files");
                 input = arg;
+                continue;
+            }
+            if (arg == "--select-global-memory-buffer") {
+                select_global_memory_buffer = true;
+                diagnostic["select_global_memory_buffer"] = true;
                 continue;
             }
             if (arg == "--capture-extent") {

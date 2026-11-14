@@ -723,6 +723,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsUniformTexelBufferArrayNonUniformIndexingSupported(),
         .support_storage_texel_buffer_array_nonuniform_indexing =
             device.IsStorageTexelBufferArrayNonUniformIndexingSupported(),
+        .select_global_memory_buffer = driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+                                       device.IsNonUniformStorageBufferPointerSupported(),
 
         .warp_size_potentially_larger_than_guest = device.IsWarpSizePotentiallyBiggerThanGuest(),
 
@@ -2104,6 +2106,7 @@ std::string PipelineCache::NativePreparationStamp(const std::filesystem::path& p
     setting(profile.support_storage_image_array_nonuniform_indexing);
     setting(profile.support_uniform_texel_buffer_array_nonuniform_indexing);
     setting(profile.support_storage_texel_buffer_array_nonuniform_indexing);
+    setting(profile.select_global_memory_buffer);
     setting(profile.warp_size_potentially_larger_than_guest);
     setting(profile.lower_left_origin_mode);
     setting(profile.need_declared_frag_colors);
