@@ -36,6 +36,7 @@
 #include "core/loader/loader.h"
 #include "video_core/nx2_recipe.h"
 #include "video_core/shader_warm/prepared_store.h"
+#include "video_core/shader_warm/emission_stamp.h"
 #include "video_core/shader_warm/shader_archives.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
@@ -51,7 +52,6 @@ constexpr std::string_view StageConverting = "Converting";
 constexpr std::string_view StageWriting = "Writing";
 /// Conversions in flight (each holds a copy of its program).
 constexpr size_t MaxPendingJobs = 2048;
-constexpr u32 PrecachedPipelinesMagic = 0x31504750; // "PGP1"
 
 fs::path TitleDir(u64 title_id) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
@@ -379,8 +379,12 @@ u64 ReadWarmCount(const fs::path& warm_file) {
     return !ec && actual == size ? entries : 0;
 }
 
+u64 EmissionStamp() {
+    return GeneratedEmissionStamp;
+}
+
 std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries, u32 driver,
-                                          u32 device_id, u32 cache_version, u64 lowering) {
+                                          u32 device_id, u32 cache_version, u64 variant) {
     std::error_code ec;
     const auto size = fs::file_size(warm_file, ec);
     if (ec) {
@@ -412,18 +416,18 @@ std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries
                      .driver = driver,
                      .device_id = device_id,
                      .cache_version = cache_version,
-                     .lowering = lowering};
+                     .variant = variant};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
     std::ifstream in(WarmMarkerPath(warm_file));
     WarmStamp stamp;
-    // A marker of the older format (last-write time, no lowering) fails here: the compute
+    // A marker of the older format (last-write time, no variant) fails here: the compute
     // programs not in the cache are built once more.
     std::string format;
     if (!(in >> format) || format != "v2" ||
         !(in >> stamp.size >> stamp.content_hash >> stamp.entries >> stamp.driver >>
-          stamp.device_id >> stamp.cache_version >> stamp.lowering)) {
+          stamp.device_id >> stamp.cache_version >> stamp.variant)) {
         return std::nullopt;
     }
     return stamp;
@@ -433,7 +437,7 @@ bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     std::ofstream out(WarmMarkerPath(warm_file), std::ios::trunc);
     out << "v2 " << stamp.size << ' ' << stamp.content_hash << ' ' << stamp.entries << ' '
         << stamp.driver << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' '
-        << stamp.lowering << '\n';
+        << stamp.variant << '\n';
     out.close();
     return static_cast<bool>(out);
 }
@@ -480,56 +484,13 @@ bool TakeSkipWarm() {
     return skip_warm.exchange(false, std::memory_order_relaxed);
 }
 
-fs::path PrecachedPipelinesPath(u64 title_id) {
-    return TitleDir(title_id) / "precache-graphics.bin";
-}
-
-std::unordered_set<u64> ReadPrecachedPipelines(const fs::path& file, const DriverStamp& stamp) {
-    std::unordered_set<u64> hashes;
-    std::ifstream in(file, std::ios::binary);
-    u32 magic{};
-    DriverStamp saved;
-    u64 count{};
-    if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
-        magic != PrecachedPipelinesMagic ||
-        !in.read(reinterpret_cast<char*>(&saved.driver), sizeof(saved.driver)) ||
-        !in.read(reinterpret_cast<char*>(&saved.device_id), sizeof(saved.device_id)) ||
-        !in.read(reinterpret_cast<char*>(&saved.cache_version), sizeof(saved.cache_version)) ||
-        !in.read(reinterpret_cast<char*>(&count), sizeof(count)) || saved != stamp) {
-        return hashes;
-    }
-    for (u64 i = 0; i < count; ++i) {
-        u64 hash{};
-        if (!in.read(reinterpret_cast<char*>(&hash), sizeof(hash))) {
-            break;
-        }
-        hashes.insert(hash);
-    }
-    return hashes;
-}
-
-bool WritePrecachedPipelines(const fs::path& file, const DriverStamp& stamp,
-                             const std::unordered_set<u64>& hashes) {
-    std::ofstream out(file, std::ios::binary | std::ios::trunc);
-    Write(out, PrecachedPipelinesMagic);
-    Write(out, stamp.driver);
-    Write(out, stamp.device_id);
-    Write(out, stamp.cache_version);
-    Write(out, static_cast<u64>(hashes.size()));
-    for (const u64 hash : hashes) {
-        Write(out, hash);
-    }
-    out.close();
-    return static_cast<bool>(out);
-}
-
 bool DeleteWarmFiles(u64 title_id, std::string* error) {
     const auto warm = ComputeWarmPath(title_id);
     fs::path tmp = warm;
     tmp += ".tmp";
     bool ok = true;
     for (const auto& path :
-         {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, PrecachedPipelinesPath(title_id),
+         {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, TitleDir(title_id) / "precache-graphics.bin",
           NativeRecipePath(title_id), NativePreparationPath(title_id),
           TitleDir(title_id) / "native-prepared.journal",
           TitleDir(title_id) / "native-source.txt"}) {
@@ -995,7 +956,7 @@ Result BuildComputeWarmFiles(Core::System& system, const fs::path& game_path, u6
         return fail("Writing the precache file failed");
     }
     // A new file: the count of the old one no longer applies, and its marker only when the
-    // contents changed (the marker also carries the driver and lowering, checked at boot).
+    // contents changed (the marker also carries the driver and variant, checked at boot).
     DropStaleWarmMarker(compute_path, compute_tmp);
     std::error_code ignored;
     fs::remove(WarmCountPath(compute_path), ignored);

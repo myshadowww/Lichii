@@ -202,7 +202,7 @@ void ComputePipeline::Configure() {
     std::ranges::for_each(info.texture_buffer_descriptors, add_buffer);
     std::ranges::for_each(info.image_buffer_descriptors, add_buffer);
 
-    buffer_cache.UpdateComputeBuffers();
+    buffer_cache.UpdateComputeBuffers(kepler_compute->GetIndirectComputeAddress());
 
     buffer_cache.runtime.SetEnableStorageBuffers(use_storage_buffers);
     buffer_cache.runtime.SetImagePointers(textures.data(), images.data());

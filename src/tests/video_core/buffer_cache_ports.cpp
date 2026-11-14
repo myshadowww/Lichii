@@ -26,6 +26,7 @@
 #include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/buffer_cache/indirect_buffer.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu.h"
@@ -276,6 +277,9 @@ struct BufferCacheTestAccess {
         cache.UpdateIndexBuffer();
         return channel.index_buffer.buffer_id;
     }
+    static void UseGpuMemory(Cache& cache, Tegra::MemoryManager& memory) {
+        cache.gpu_memory = &memory;
+    }
     static void Delete(Cache& cache, BufferId id) {
         cache.DeleteBuffer(id);
     }
@@ -375,6 +379,7 @@ struct BufferCacheTestAccess {
         cache.BindHostGraphicsUniformBuffer(0, 0, 0, true);
     }
     static void NextFrame(Cache& cache) {
+        cache.frame_created_buffers.clear();
         cache.native_indirect_uniforms_this_frame.clear();
     }
     static u32 CpuMarks(Cache& cache) {
@@ -2621,4 +2626,88 @@ TEST_CASE("Deleting a buffer clears its id from every channel's bindings", "[buf
     REQUIRE(resolved != VideoCommon::NULL_BUFFER_ID);
     REQUIRE(resolved != id);
     REQUIRE(Access::Get(*f.cache, resolved).IsInBounds(0x10800, 0x100));
+}
+
+TEST_CASE("Indirect dispatch arguments remain GPU modified across a neighboring CPU upload",
+          "[buffer_ports]") {
+    Fixture f;
+    const auto id = Access::Add(*f.cache, 0x10000, 0x10000);
+    auto& original = Access::Get(*f.cache, id);
+    std::fill_n(original.bytes.begin() + 0x40, 12, u8{0x73});
+    Access::Dirty(*f.cache, 0x10040, 12);
+    Access::UseGpuMemory(*f.cache, *f.memory);
+    const auto [arguments, offset] = VideoCommon::ObtainIndirectBuffer(*f.cache, 0x100040);
+    REQUIRE(Access::Pending(*f.cache, 0x10040, 12));
+    REQUIRE(arguments->bytes[offset] == 0x73);
+    // A CPU write elsewhere on this tracked page must not re-upload the stale argument bytes.
+    f.bytes[0x80] = 0x42;
+    Access::MarkCpuModified(*f.cache, 0x10000, 0x1000);
+    Access::Upload(*f.cache, id, 0x10000, 0x1000);
+    REQUIRE(arguments->bytes[offset] == 0x73);
+    REQUIRE(arguments->bytes[arguments->Offset(0x10080)] == 0x42);
+    f.cache->DownloadMemory(0x10040, 12);
+    REQUIRE(f.bytes[0x40] == 0x73);
+}
+
+TEST_CASE("Large page-only buffer overlaps download before cutting and join within a frame",
+          "[buffer_ports][buffer_chain]") {
+    Fixture f;
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    f.cache->CreateChannel(state);
+    f.cache->BindToChannel(0);
+    constexpr u32 large_size = 128U << 20;
+    const auto old = Access::Add(*f.cache, 0x10000, large_size);
+    std::fill_n(Access::Get(*f.cache, old).bytes.begin() + 0x40, 12, u8{0x73});
+    Access::Dirty(*f.cache, 0x10040, 12);
+    const auto next = Access::Find(*f.cache, large_size, 0x20000);
+    REQUIRE(f.runtime.deleted_buffers == 1);
+    REQUIRE(f.bytes[0x40] == 0x73);
+    REQUIRE(Access::Get(*f.cache, next).SizeBytes() == 0x20000);
+
+    // Resolving both ranges for one draw must converge, even though the old id can be reused.
+    const auto merged = Access::Find(*f.cache, 0x10000, large_size);
+    const auto deletions = f.runtime.deleted_buffers;
+    REQUIRE(Access::Get(*f.cache, merged).IsInBounds(large_size, 0x20000));
+    REQUIRE(Access::Find(*f.cache, large_size, 0x20000) == merged);
+    REQUIRE(f.runtime.deleted_buffers == deletions);
+    REQUIRE(Access::Find(*f.cache, large_size + 0x10000, 0x20000) != VideoCommon::NULL_BUFFER_ID);
+    REQUIRE(Access::RegisteredBuffers(*f.cache).size() == 1);
+}
+
+TEST_CASE("Indirect arguments and aliased storage bindings converge before descriptor binding",
+          "[buffer_ports][buffer_chain]") {
+    Fixture f;
+    constexpr u32 large_size = 128U << 20;
+    // Arguments straddle the last caching page of the old SSBO and the next page.
+    f.memory->Map(0x200000, large_size, 0x20000, Tegra::PTEKind::PITCH, true);
+    Tegra::Control::ChannelState state{0};
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    f.cache->CreateChannel(state);
+    f.cache->BindToChannel(0);
+    const auto old = Access::Add(*f.cache, 0x10000, large_size);
+    auto& channel = Access::Channel(*f.cache, 0);
+    channel.enabled_compute_storage_buffers = 3;
+    channel.compute_storage_buffers[0] = {.device_addr = 0x10000, .size = large_size,
+                                          .buffer_id = old};
+    channel.compute_storage_buffers[1] = {.device_addr = large_size, .size = 0x10000,
+                                          .buffer_id = old};
+    f.cache->UpdateComputeBuffers(0x20fffc);
+    REQUIRE(f.runtime.deleted_buffers >= 2); // The old SSBO was cut, then both ranges joined.
+    const auto bound = channel.compute_storage_buffers[0].buffer_id;
+    REQUIRE(channel.compute_storage_buffers[1].buffer_id == bound);
+    auto& descriptor_buffer = Access::Get(*f.cache, bound);
+    REQUIRE(descriptor_buffer.IsInBounds(large_size + 0xfffc, 12));
+    const auto deletions = f.runtime.deleted_buffers;
+    // Dispatch's final lookup cannot retire the SSBO whose handle the descriptor now holds.
+    const auto [arguments, offset] = f.cache->ObtainBuffer(
+        0x20fffc, 12, VideoCommon::ObtainBufferSynchronize::NoSynchronize,
+        VideoCommon::ObtainBufferOperation::DoNothing);
+    REQUIRE(arguments == &descriptor_buffer);
+    REQUIRE(offset == descriptor_buffer.Offset(large_size + 0xfffc));
+    REQUIRE(f.runtime.deleted_buffers == deletions);
+    descriptor_buffer.bytes[0x20] = 0x91;
+    REQUIRE(Access::Get(*f.cache, channel.compute_storage_buffers[1].buffer_id).bytes[0x20] == 0x91);
 }

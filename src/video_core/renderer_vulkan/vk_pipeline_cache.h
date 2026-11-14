@@ -122,6 +122,9 @@ struct ComputePipelineCacheEntry {
     u32 rebuilds{};
     /// Whether a dispatch looked it up yet (kept only with EDEN_NX2_STUTTER_TRACE)
     bool used{};
+    /// A rebuild whose driver compile runs on a worker; this entry's pipeline is used until it is
+    /// built (a compile waited on by the dispatch stalled every GPU channel for 2-3 s)
+    std::unique_ptr<ComputePipelineCacheEntry> pending_rebuild;
 
     [[nodiscard]] ComputePipeline* Get(bool native, GPUVAddr address,
                                        const ComputePipelineCacheKey& key) const;
@@ -228,8 +231,7 @@ private:
     void LoadPipelinesV2(u64 title_id, std::shared_ptr<const VideoCommon::ShaderCacheV2::LogFile> log,
                          std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback,
-                         std::chrono::steady_clock::time_point load_begin, bool precache,
-                         std::unordered_set<u64> precached_pipelines);
+                         std::chrono::steady_clock::time_point load_begin, bool precache);
 
     /// Reads a v2 graphics record and translates its pipeline, left for Build(). Null when it
     /// doesn't translate, `incomplete` when the record lacks a value the translation reads.
@@ -263,24 +265,21 @@ private:
     /// only pipelines built during play.
     void QueueVulkanPipelineCacheSave();
 
-    /// One build of the shader precache: a pipeline built and destroyed
+    /// One build of the shader precache: a compute pipeline built and destroyed
     struct PrecacheJob {
-        u64 graphics_hash{}; ///< The cached graphics pipeline it builds, 0 for a compute program
         /// Translates the pipeline and returns its build, which is true when it built (the job's
         /// CPU and driver stages)
         Common::UniqueFunction<Common::UniqueFunction<bool>> translate;
         u64 cpu_bytes{};
     };
 
-    /// Shader precache before the game starts (precache_shaders), on every CPU thread: the cached
-    /// graphics pipelines this boot skipped (`jobs`; `precached` holds those built by earlier
-    /// precaches) and the compute programs of the title's precache file (made from the game files,
-    /// missing reads guessed) are built, then thrown away. They only fill the driver's shader
-    /// cache, so a later build of the same pipeline finds the driver's work done. Reports progress
-    /// through `callback` and returns when it is done, skipped from the loading screen or the load
-    /// is stopped.
-    void PrecacheShaders(u64 title_id, std::vector<PrecacheJob> jobs,
-                         std::unordered_set<u64> precached, std::stop_token stop_loading,
+    /// Shader precache before the game starts (precache_shaders), on every CPU thread: the compute
+    /// programs of the title's precache file (made from the game files, missing reads guessed) are
+    /// built, then thrown away. They only fill the driver's shader cache, so a later build of the
+    /// same pipeline finds the driver's work done. The cached graphics pipelines the boot skipped
+    /// are the background prebuild's. Reports progress through `callback` and returns when it is
+    /// done, skipped from the loading screen or the load is stopped.
+    void PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                          const VideoCore::DiskResourceLoadCallback& callback);
 
     /// The game's native preparation file (native-preparation.bin, assembled locally from a

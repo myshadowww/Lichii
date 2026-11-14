@@ -161,3 +161,28 @@ TEST_CASE("Immediate fence waits still submit outstanding work", "[video_core][s
     }
     REQUIRE(callback.load());
 }
+
+TEST_CASE("Idle fencing threads stop after draining their last callback",
+          "[video_core][split_fence_wait]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Tegra::GPU gpu{system, false, false};
+    Null::RasterizerNull rasterizer{gpu};
+    Cache texture, buffer, query;
+    const auto previous = Settings::values.gpu_fence_behavior.GetValue();
+    SCOPE_EXIT { Settings::values.gpu_fence_behavior.SetValue(previous); };
+    Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Accurate);
+    // Shutdown races the worker returning to its empty-queue wait after the last callback.
+    // Repeat with real fence delivery: a stop notification lost in that window hangs join.
+    for (u32 iteration = 0; iteration < 512; ++iteration) {
+        Submission submission;
+        std::atomic<bool> callback{};
+        {
+            FenceManager manager{rasterizer, gpu, texture, buffer, query, submission};
+            manager.SyncOperation([&] { callback.store(true); });
+            manager.WaitPendingFences(true);
+            REQUIRE(callback.load());
+        }
+        REQUIRE_FALSE(submission.timed_out.load());
+    }
+}

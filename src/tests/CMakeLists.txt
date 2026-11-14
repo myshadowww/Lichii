@@ -67,6 +67,7 @@ add_executable(tests
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
+    core/ncz_io_guards.cpp
     core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
@@ -194,6 +195,7 @@ add_executable(tests
     common/zstd_compression.cpp
     core/core_timing.cpp
     core/filesystem_buffer_bounds.cpp
+    core/filesystem_rename.cpp
     core/thread_startup_policy.cpp
     core/nup_writer.cpp
     core/nup_metadata.cpp
@@ -390,6 +392,16 @@ if (NOT ANDROID)
     target_link_libraries(profile_import_tests PRIVATE common SimpleIni::SimpleIni
         Catch2::Catch2WithMain ${PLATFORM_LIBRARIES})
     add_test(NAME profile_import_tests COMMAND profile_import_tests)
+endif()
+
+# The per-title library overrides must not rewrite a game archive or lose an existing override
+# when a replacement cannot be saved. These helpers only need Qt's image/file support.
+if (ENABLE_QT)
+    add_executable(qt_game_metadata_tests qt_common/game_metadata.cpp
+        ../qt_common/util/game_metadata.cpp)
+    target_link_libraries(qt_game_metadata_tests PRIVATE common Qt6::Gui
+        Catch2::Catch2WithMain)
+    add_test(NAME qt_game_metadata_tests COMMAND qt_game_metadata_tests)
 endif()
 
 # needed for vma

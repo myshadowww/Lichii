@@ -52,6 +52,33 @@ Any changed user-mod bytes in either patch record or the timer state take
 precedence over the entire built-in patch. An incompatible build, original
 instruction, layout, or truncated module leaves both patch records untouched.
 
+## Water ripple passes
+
+The ripple simulation (compute shaders `fb4203a7d928ed42` then `e2ce39e630ce65f3`,
+256x256 ping-pong textures) sets its pass count at `main+0x475F8` as
+`iterations * (int)step`, with `iterations` 6. Truncation is harmless at the
+original step of exactly 1.0, but any step below 1.0 runs no passes: at 120 fps
+the ripples stop, and the grid origin that follows the player keeps moving with
+no pass to apply the shift. Measured before this patch at the save in Zora's
+Domain, frames that ran the simulation out of 10: no patch 10, FPS Unlock capped
+at 60 fps 4 (step 0.998 to 1.003), FPS Unlock at about 99 fps 0.
+
+Both built-ins replace that `fcvtzs` with `bl 0x3C46300` and drop the `mul` that
+followed it. The routine adds `iterations * step` to a remainder kept per water
+object, runs the rounded whole number of passes and keeps the rest, with at least
+one pass whenever the step is positive so the origin shift is always applied. A
+paused game (step 0) still runs none. The final pass `6a7f45ab293a93b1` was never
+affected.
+
+The remainders live in 8 slots of 16 bytes from `0x4E9FE10` (the water object
+from `x21` at the patch site, then the remainder as a float), with the next slot
+to reuse at `0x4E9FE90`. An object without a slot takes the next one in turn, so
+two water objects drawn in the same frame don't pull from one shared fraction.
+The timer state is 0x98 bytes from `0x4E9FE00`. The routine is 148 bytes at
+`0x3C46300-0x3C46393`, clear of the Dynamic FPS routine at `0x3C46200` and of the
+ultrawide caves at `0x3C46400` and up. It uses w8, x9-x12 and s0-s2, none read
+by the game again before it writes them.
+
 ## Timing limits
 
 The routine reads `CNTPCT_EL0` and `CNTFRQ_EL0`. After its first call, it caps
@@ -75,6 +102,32 @@ Those settings alter the elapsed seconds this routine calculates. CPU Clock
 Normal and an unscaled counter are prerequisites for evaluating its timing;
 the Add-On does not change global clock behavior or automatically override
 the user's settings. Correct gameplay speed with the Add-On is unverified.
+
+## FPS Unlock: sound manager at 60 Hz
+
+`FPS Unlock (built-in)` lowers the step below 1.0 above 60 fps (0.5 at 120 fps).
+The game's sound engine expects at least one whole 60 fps step per update: its
+fade and delay timers and parameter ramps count updates from the step it is
+given. With less, some sounds are not released when an area unloads; they pile
+up until the game's voice budget is full, and then most new sounds and the
+music stop until a restart (sword swings, spin and jump attacks, swimming,
+area and shop music; #716, #1092).
+
+The sound manager job at `0x415300` (phase in `w2`: phase 0 reads the step and
+updates the sound engine, phase 1 follows) is entered every frame. FPS Unlock
+replaces its first instruction, `pacibsp`, with `b 0x3C46800` (124-byte gate)
+and its step load at `0x415334`, `ldr s0, [x8, #0x10]`, with `bl 0x3C46280`
+(16 bytes, returns `max(step, 1.0)`). In phase 0 the gate runs the job as before
+when the step is at least 1.0. Below that it adds the step to an accumulator
+at `0x4E9FEA0` and runs the job only once a whole step has built up, keeping
+the remainder; otherwise it returns. Other phases follow that frame's decision
+(flag at `0x4E9FEA4`). So above 60 fps the sound manager runs at 60 Hz with
+whole steps and sound still follows real time; at 60 fps and below nothing
+changes. FPS Unlock's timer state grows to `0xA8` bytes to cover both words.
+Dynamic FPS never lowers the step below 1.0 and does not include the gate.
+
+Both caves are in the executable padding after the text (`0x3C46280` follows
+the FPS routine at `0x3C46200`; `0x3C46800` is past the other caves in use).
 
 ## Tests
 

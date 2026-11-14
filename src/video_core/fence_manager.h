@@ -195,7 +195,12 @@ protected:
 
     virtual ~FenceManager() {
         if constexpr (can_async_check) {
-            fence_thread.request_stop();
+            {
+                // Serialize the stop with the wait predicate so its notification cannot land
+                // between the worker checking the empty queue and entering cv.wait.
+                std::scoped_lock lock{guard};
+                fence_thread.request_stop();
+            }
             cv.notify_all();
             fence_thread.join();
         }

@@ -1113,8 +1113,16 @@ InstallResult RegisteredCache::RawInstallNCA(const NCA& nca, const VfsCopyFuncti
     if (out == nullptr) {
         return InstallResult::ErrorCopyFailed;
     }
-    return copy(in, out, VFS_RC_LARGE_COPY_BLOCK) ? InstallResult::Success
-                                                  : InstallResult::ErrorCopyFailed;
+    if (!copy(in, out, VFS_RC_LARGE_COPY_BLOCK)) {
+        const auto parent = out->GetContainingDirectory();
+        out->Resize(0);
+        out.reset();
+        if (parent) {
+            parent->DeleteFile(Common::FS::GetFilename(path));
+        }
+        return InstallResult::ErrorCopyFailed;
+    }
+    return InstallResult::Success;
 }
 
 bool RegisteredCache::RawInstallYuzuMeta(const CNMT& cnmt) {
