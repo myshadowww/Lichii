@@ -65,7 +65,10 @@ CUDA toolkit is required at runtime.
    Quality, Balanced, Performance and Ultra Performance are also available. An
    explicit mode is used only when NVIDIA reports support for the game's input
    and output sizes; otherwise the backend selects a supported mode and logs the
-   fallback. These choices do not change the game's internal render resolution.
+   fallback. In most games these choices do not change the internal render resolution.
+   Ocarina docked with the Max Resolution add-on is an exception: Balanced,
+   Performance and Ultra Performance change its render scale when the game starts.
+   Restart the game after changing that scale; live changes use the current scene size.
    For Ocarina's 1440p render mode, Native means **2560×1440 → 2560×1440**;
    it does not change the render resolution to match a 4K display.
 5. For neural rendering, click **Import neural rendering model…** and select
@@ -74,8 +77,9 @@ CUDA toolkit is required at runtime.
 6. Apply the settings and start the game. While playing, reopen Graphics, change
    the **NVIDIA DLSS** checkbox, **NVIDIA DLSS quality**, **NVIDIA DLSS model preset**,
    **DLSS neural rendering**, or the neural controls
-   below, and click **Apply** or **OK**. These settings take effect without
-   restarting and support per-game overrides. If a per-game override is active,
+   below, and click **Apply** or **OK**. The runtime choices take effect without
+   restarting and support per-game overrides; Ocarina's render-scale patch still
+   requires a restart. If a per-game override is active,
    change it in the running game's
    configuration rather than the global settings.
 
@@ -197,9 +201,11 @@ build/bin/ngx_smoke /path/to/linux/dlss/runtime/directory 0 1 /path/to/ngx/nr/31
 The numeric arguments are the Vulkan GPU index and image scale (1–8). Scale 8
 uses 2560×1440 input and 3840×2160 upscaled output. The test covers device
 lifecycle (including initially disabled DLSS), SR/DLAA readback, reset, resize,
-HDR/depth modes, motion-view rebinding, live quality/preset/status changes,
+HDR/depth modes, padded depth images with a smaller render region, motion-view
+rebinding, live quality/preset/status changes,
 style/Off changes, strength blending (including zero-strength HDR),
-tone/structure history resets, and injected NGX failure. Use `missing` instead of
+tone/structure history resets, DLSS initialization before neural model allocation,
+and injected NGX failure. Use `missing` instead of
 the NR model path to check missing-model fallback. It is excluded from `ctest`
 because it requires the GPU and separately supplied models. Disable external
 graphics layers for this test.
