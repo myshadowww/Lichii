@@ -79,7 +79,7 @@ InputImage MakeInput(const Device &device, MemoryAllocator &allocator, VkFormat 
 
 /// Check live neural controls, quality, history resets, rebinding and failures with concurrent submits.
 void RenderCases(const Device& device, u32 scale, bool request_neural, bool expect_neural,
-                 bool fail_creation) {
+                 bool fail_creation, bool padded_depth) {
     MemoryAllocator allocator{device};
     StateTracker tracker;
     Scheduler scheduler{device, tracker};
@@ -101,8 +101,10 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
     const VkExtent2D input_extent{320 * scale, 180 * scale};
     auto color = MakeInput(device, allocator, VK_FORMAT_R16G16B16A16_SFLOAT,
                            VK_IMAGE_ASPECT_COLOR_BIT, input_extent);
+    const VkExtent2D depth_extent =
+        padded_depth ? VkExtent2D{input_extent.width + 32, input_extent.height + 16} : input_extent;
     auto depth = MakeInput(device, allocator, VK_FORMAT_D32_SFLOAT,
-                           VK_IMAGE_ASPECT_DEPTH_BIT, input_extent);
+                           VK_IMAGE_ASPECT_DEPTH_BIT, depth_extent);
     auto motion = MakeInput(device, allocator, VK_FORMAT_R16G16_SFLOAT,
                             VK_IMAGE_ASPECT_COLOR_BIT, input_extent);
     auto alternate_motion_view = device.GetLogical().CreateImageView({
@@ -116,6 +118,31 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
     auto &api = const_cast<Ngx::Api &>(Ngx::GetApi());
     const auto create = api.create;
     const auto evaluate = api.evaluate;
+    static decltype(api.evaluate) forward_evaluate;
+    static VkExtent2D observed_depth_extent;
+    static VkExtent2D observed_render_extent;
+    static VkOffset2D observed_depth_base;
+    forward_evaluate = evaluate;
+    const auto observe_evaluate = [](VkCommandBuffer command, const NVSDK_NGX_Handle* feature,
+                                     const NVSDK_NGX_Parameter* parameters,
+                                     PFN_NVSDK_NGX_ProgressCallback progress) {
+        void* resource{};
+        parameters->Get(NVSDK_NGX_Parameter_Depth, &resource);
+        if (resource) {
+            const auto& depth =
+                static_cast<const NVSDK_NGX_Resource_VK*>(resource)->Resource.ImageViewInfo;
+            observed_depth_extent = {depth.Width, depth.Height};
+        }
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
+                        &observed_render_extent.width);
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
+                        &observed_render_extent.height);
+        unsigned base_x = ~0u, base_y = ~0u;
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &base_x);
+        parameters->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &base_y);
+        observed_depth_base = {static_cast<int>(base_x), static_cast<int>(base_y)};
+        return forward_evaluate(command, feature, parameters, progress);
+    };
     SCOPE_EXIT {
         api.create = create;
         api.evaluate = evaluate;
@@ -175,6 +202,10 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
                                       ? input_extent
                                       : VkExtent2D{480 * scale, 270 * scale};
         const bool inject_failure = frame == cases.size() - 1;
+        observed_depth_extent = {};
+        observed_render_extent = {};
+        observed_depth_base = {-1, -1};
+        api.evaluate = observe_evaluate;
         if (inject_failure) {
             api.evaluate = [](VkCommandBuffer, const NVSDK_NGX_Handle *,
                               const NVSDK_NGX_Parameter *, PFN_NVSDK_NGX_ProgressCallback) {
@@ -223,7 +254,8 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
                                   {1, 1},
                                   frame == 0,
                                   frame != 0 && !hdr,
-                                  hdr}),
+                                  hdr,
+                                  padded_depth ? depth_extent : VkExtent2D{}}),
                 "Upscale refused a frame");
         auto readback = allocator.CreateBuffer(
             {
@@ -270,6 +302,13 @@ void RenderCases(const Device& device, u32 scale, bool request_neural, bool expe
         Require(after_status.evaluations == before_status.evaluations + !inject_failure,
                 "DLSS status counted an unsuccessful evaluation");
         if (!inject_failure) {
+            Require(observed_depth_extent.width == depth_extent.width &&
+                        observed_depth_extent.height == depth_extent.height,
+                    "NGX received an incorrect depth image extent");
+            Require(observed_render_extent.width == input_extent.width &&
+                        observed_render_extent.height == input_extent.height &&
+                        observed_depth_base.x == 0 && observed_depth_base.y == 0,
+                    "NGX lost the top-left render subrect in the depth image");
             Require(after_status.requested == options.quality && after_status.preset == options.preset,
                     "DLSS status lost runtime quality or preset");
             Require(after_status.mode != Quality::Automatic, "No evaluated quality reported");
@@ -395,7 +434,7 @@ int main(int argc, char **argv) try {
             Settings::values.nvidia_dlss = true;
             Settings::RefreshNvidiaDlssRuntimeSettings();
             RenderCases(device, static_cast<u32>(scale), request_neural, expect_neural,
-                        fail_creation);
+                        fail_creation, run == 1);
         }
         Require(!NvidiaDlss::IsAvailable(), "Device teardown left NGX active");
         std::printf("PASS device lifecycle %d\n", run + 1);

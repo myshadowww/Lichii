@@ -292,7 +292,9 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
             }
         }
         auto color = Resource(in.color, in.render_size);
-        auto depth = Resource(in.depth, in.render_size);
+        const auto depth_extent = in.depth_size.width && in.depth_size.height ? in.depth_size
+                                                                            : in.render_size;
+        auto depth = Resource(in.depth, depth_extent);
         auto motion = Resource(in.motion_vectors, in.render_size);
         auto output = Resource(out, in.upscale_size, true);
         parameters->Set(NVSDK_NGX_Parameter_Color, static_cast<void *>(&color));
@@ -304,6 +306,8 @@ bool NvidiaDlssUpscaler::Upscale(const Inputs &in) {
         parameters->Set(NVSDK_NGX_Parameter_MV_Scale_X, in.motion_vector_scale[0]);
         parameters->Set(NVSDK_NGX_Parameter_MV_Scale_Y, in.motion_vector_scale[1]);
         parameters->Set(NVSDK_NGX_Parameter_Reset, reset ? 1 : 0);
+        parameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, 0u);
+        parameters->Set(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, 0u);
         parameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width,
                         in.render_size.width);
         parameters->Set(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height,
