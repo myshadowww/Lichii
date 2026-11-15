@@ -189,6 +189,7 @@ def replay_record(pair, sides, root, timeout, keep_spirv):
         directory = root / "spirv" / side["name"] / pair["id"]
         command = [side["compiler"], "--pipeline", record["path"], "--cache-version",
                    str(record["version"]), "--path", side["path"], "--output-dir", str(directory)]
+        command += side.get("compiler_options", [])
         result = invoke(command, timeout)
         stages = result.get("stages") if result["status"] == "ok" else None
         if stages is not None and len(stages) != len(record["environments"]):
@@ -246,6 +247,7 @@ def list_records(side, cache, directory, timeout):
     A v2 side takes the Program records of the v2 log beside the cache, as the boot does."""
     command = [side["compiler"], "--list", str(cache), "--path", side["path"],
                "--output-dir", str(directory)]
+    command += side.get("compiler_options", [])
     programs = cache.parent / V2_LOG_NAME
     if side["path"] == "v2" and programs.is_file():
         command += ["--programs-log", str(programs)]
@@ -388,6 +390,8 @@ def replay(argv):
     parser.add_argument("--path-a", default="legacy", help="compilation path A (shader-sweep --path)")
     parser.add_argument("--path-b", default="legacy", help="compilation path B (shader-sweep --path)")
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--select-global-memory-buffer", action="store_true",
+                        help="emit NVIDIA variable-pointer global-memory routing")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--keep-spirv", action="store_true",
@@ -400,8 +404,10 @@ def replay(argv):
         parser.error("--compiler-a and --compiler-b must name built shader-sweep executables")
     if args.output.exists() and any(args.output.iterdir()):
         parser.error("--output must be a new or empty directory")
+    compiler_options = ["--select-global-memory-buffer"] if args.select_global_memory_buffer else []
     sides = [{"name": name, "compiler": str(compiler.resolve()), "path": path,
-              "label": f"{compiler.name} --path {path}"}
+              "compiler_options": compiler_options,
+              "label": " ".join([compiler.name, "--path", path, *compiler_options])}
              for name, compiler, path in zip("ab", compilers, (args.path_a, args.path_b))]
     files = []
     for path in args.caches:
@@ -485,6 +491,8 @@ def main():
     parser.add_argument("--compiler", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--spirv-val", default="spirv-val")
+    parser.add_argument("--select-global-memory-buffer", action="store_true",
+                        help="emit NVIDIA variable-pointer global-memory routing")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--dump-game", default="Mario Tennis Fever")
@@ -507,6 +515,7 @@ def main():
             parser.error("--native-stage requires a 16-digit lowercase hash and a graphics/compute stage")
         native_stages[key] = stage
     compiler = str(args.compiler.resolve())
+    compiler_options = ["--select-global-memory-buffer"] if args.select_global_memory_buffer else []
     validator = shutil.which(args.spirv_val)
     if not validator:
         parser.error("spirv-val is required, install SPIRV-Tools or pass --spirv-val")
@@ -614,7 +623,7 @@ def main():
 
     def compile_one(job):
         output = records_dir / f"{job['id']}.spv"
-        command = [compiler, "--output", str(output)]
+        command = [compiler, "--output", str(output), *compiler_options]
         if job["kind"] == "native":
             command += [job["source"], "--stage", job["stage"], "--format", job["format"]]
         if "env" in job:

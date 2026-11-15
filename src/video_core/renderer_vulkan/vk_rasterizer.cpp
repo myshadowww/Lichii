@@ -48,8 +48,8 @@
 #include "video_core/indirect_reset.h"
 #include "video_core/native_indirect_reset.h"
 #include "video_core/native_query_trace.h"
-#include "video_core/render_trace.h"
 #include "video_core/ocarina_camera.h"
+#include "video_core/render_trace.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/framebuffer_clear_layers.h"
@@ -5218,8 +5218,8 @@ void RasterizerVulkan::TrackOcarinaCamera() {
     }
     VideoCommon::OcarinaCameraBuffer values;
     device_memory.ReadBlockUnsafe(*device_address, values.data(), sizeof(values));
-    const auto camera = VideoCommon::DecodeOcarinaCamera(
-        values, color.size.width, color.size.height);
+    const auto camera =
+        VideoCommon::DecodeOcarinaCamera(values, color.size.width, color.size.height);
     if (camera.issue != VideoCommon::OcarinaCameraIssue::None) {
         return;
     }

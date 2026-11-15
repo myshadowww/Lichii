@@ -270,7 +270,9 @@ and Vulkan features.
 Pass `--select-global-memory-buffer` to the `shader-sweep` executable to emit
 the NVIDIA variable-pointer routing path, including for `--pipeline` and `--list`
 replay. Without it the fixed offline profile retains per-buffer branches. The
-JSON diagnostic records the enabled option. This assumes the runtime device
+JSON diagnostic records the enabled option. The Python sweep and `replay`
+commands accept the same flag and forward it to their compiler invocations
+(on both sides of a replay). This assumes the runtime device
 supports variablePointersStorageBuffer and ShaderNonUniform; the offline tool
 does not probe a GPU. Runtime selection remains limited to NVIDIA proprietary
 drivers with those capabilities.
