@@ -61,11 +61,19 @@ TEST_CASE("CaStore: SSL_CERT_FILE and SSL_CERT_DIR are left to OpenSSL", "[commo
         ScopedEnv file{"SSL_CERT_FILE", "/nonexistent/ca.pem"};
         ScopedEnv dir{"SSL_CERT_DIR", nullptr};
         REQUIRE(Common::Net::FindSystemCaBundle().empty());
+        FakeClient client;
+        Common::Net::ConfigureCaStore(client);
+        REQUIRE(client.ca_cert_path.empty());
+        REQUIRE_FALSE(client.loaded_store);
     }
     {
         ScopedEnv file{"SSL_CERT_FILE", nullptr};
         ScopedEnv dir{"SSL_CERT_DIR", "/nonexistent/certs"};
         REQUIRE(Common::Net::FindSystemCaBundle().empty());
+        FakeClient client;
+        Common::Net::ConfigureCaStore(client);
+        REQUIRE(client.ca_cert_path.empty());
+        REQUIRE_FALSE(client.loaded_store);
     }
 }
 

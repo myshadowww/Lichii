@@ -118,10 +118,6 @@ inline void LoadCaCertStore(SSL_CTX* ctx, const char* ca_cert, std::size_t size)
 class SSLConnectionBackendOpenSSL final : public SSLConnectionBackend {
 public:
     Result Init() {
-        // on bundled OpenSSL, load ca cert store
-#ifdef YUZU_BUNDLED_OPENSSL
-        LoadCaCertStore(ssl_ctx, kCert, sizeof(kCert));
-#endif
         std::call_once(one_time_init_flag, OneTimeInit);
 
         if (!one_time_init_success) {
@@ -436,6 +432,9 @@ void OneTimeInit() {
         return;
     }
 
+#ifdef YUZU_BUNDLED_OPENSSL
+    LoadCaCertStore(ssl_ctx, kCert, sizeof(kCert));
+#endif
     SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
 
     if (!SSL_CTX_set_default_verify_paths(ssl_ctx)) {

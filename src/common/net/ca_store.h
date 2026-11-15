@@ -51,6 +51,11 @@ std::string BundledCaFile();
 /// Trust the host's CA bundle, else the built-in one when this build has it.
 template <typename Client>
 void ConfigureCaStore(Client& client) {
+#ifndef _WIN32
+    if (std::getenv("SSL_CERT_FILE") != nullptr || std::getenv("SSL_CERT_DIR") != nullptr) {
+        return;
+    }
+#endif
     static const std::string system_bundle = FindSystemCaBundle();
     if (!system_bundle.empty()) {
         client.set_ca_cert_path(system_bundle);
