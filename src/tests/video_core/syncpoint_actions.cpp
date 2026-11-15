@@ -396,3 +396,111 @@ TEST_CASE("Cancelling a running syncpoint action returns once it is done",
     releaser.join();
     incrementer.join();
 }
+
+TEST_CASE("Due syncpoint actions retain their counter and host guest bank",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    bool guest_called{};
+    bool host_called{};
+    const auto guest = manager.RegisterGuestAction(0, 1, [&] { guest_called = true; });
+    const auto host = manager.RegisterHostAction(0, 1, [&] { host_called = true; });
+    manager.RegisterHostAction(0, 1, [&] {
+        manager.DeregisterGuestAction(0, host);
+        manager.DeregisterHostAction(1, host);
+        manager.DeregisterHostAction(0, guest);
+        manager.DeregisterGuestAction(1, guest);
+    });
+    manager.RegisterGuestAction(0, 1, [&] { manager.IncrementHost(0); });
+    manager.IncrementGuest(0);
+    REQUIRE(guest_called);
+    REQUIRE(host_called);
+}
+
+TEST_CASE("Session mirrors can detach and backfill while an action is blocked",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    auto first_page = std::make_shared<u32>();
+    std::weak_ptr<u32> first_lifetime = first_page;
+    const auto first = manager.RegisterGuestMirror([page = first_page](u32 id, u32 value) {
+        if (id == 0) {
+            *page = value;
+        }
+    });
+    u32 second_page{};
+    bool published_early{};
+    const auto second = manager.RegisterGuestMirror([&](u32 id, u32 value) {
+        if (id == 0) {
+            second_page = value;
+            published_early |= value != 0 && manager.IsReadyGuest(id, value);
+        }
+    });
+    std::latch entered{1};
+    std::latch release{1};
+    bool both_mirrored{};
+    manager.RegisterGuestAction(0, 1, [&] {
+        both_mirrored = *first_page == 1 && second_page == 1;
+        entered.count_down();
+        release.wait();
+    });
+    std::thread incrementer{[&] { manager.IncrementGuest(0); }};
+    entered.wait();
+    first_page.reset();
+    manager.DeregisterGuestMirror(first);
+    const bool first_released = first_lifetime.expired();
+    u32 replacement_page{};
+    const auto replacement = manager.RegisterGuestMirror([&](u32 id, u32 value) {
+        if (id == 0) {
+            replacement_page = value;
+        }
+    });
+    const u32 backfilled = replacement_page;
+    manager.DeregisterGuestMirror(first);
+    // Another increment can publish all remaining session pages while the first action waits.
+    manager.IncrementGuest(0);
+    release.count_down();
+    incrementer.join();
+    REQUIRE(both_mirrored);
+    REQUIRE(first_released);
+    REQUIRE(backfilled == 1);
+    REQUIRE(second_page == 2);
+    REQUIRE(replacement_page == 2);
+    REQUIRE_FALSE(published_early);
+    manager.DeregisterGuestMirror(second);
+    manager.DeregisterGuestMirror(replacement);
+}
+
+TEST_CASE("Cancelling a due action releases its captures before returning",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    auto payload = std::make_shared<u32>();
+    std::weak_ptr<u32> lifetime = payload;
+    const auto pending = manager.RegisterGuestAction(0, 1, [payload] {});
+    payload.reset();
+    bool released{};
+    manager.RegisterGuestAction(0, 1, [&] {
+        manager.DeregisterGuestAction(0, pending);
+        released = lifetime.expired();
+        // Re-registering on the now-ready counter is immediate, and can take the guard again.
+        manager.RegisterGuestAction(0, 1, [&] { manager.RegisterHostAction(0, 1, [] {}); });
+    });
+    manager.IncrementGuest(0);
+    REQUIRE(released);
+    manager.IncrementHost(0);
+}
+
+TEST_CASE("Throwing syncpoint callbacks leave unstarted actions cancellable",
+          "[video_core][syncpoint_actions]") {
+    SyncpointManager manager;
+    bool cancelled_called{};
+    bool retained_called{};
+    const auto retained = manager.RegisterGuestAction(0, 1, [&] { retained_called = true; });
+    const auto cancelled = manager.RegisterGuestAction(0, 1, [&] { cancelled_called = true; });
+    const auto failed = manager.RegisterGuestAction(0, 1, [] { throw 42; });
+    REQUIRE_THROWS_AS(manager.IncrementGuest(0), int);
+    manager.DeregisterGuestAction(0, failed);
+    manager.DeregisterGuestAction(0, cancelled);
+    manager.IncrementGuest(0);
+    manager.DeregisterGuestAction(0, retained);
+    REQUIRE_FALSE(cancelled_called);
+    REQUIRE(retained_called);
+}

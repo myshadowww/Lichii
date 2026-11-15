@@ -106,8 +106,9 @@ private:
 
     /// Due actions an Increment took out of storage and runs after releasing `guard`.
     struct DueActions {
-        std::list<RegisteredAction> pending; ///< Not started yet; a cancel removes them.
-        ActionHandle running{};              ///< The one being called now, 0 between calls.
+        const std::list<RegisteredAction>* storage; ///< Original counter and host/guest bank.
+        std::list<RegisteredAction> pending;        ///< Not started yet; a cancel removes them.
+        ActionHandle running{};                     ///< The one being called now, 0 between calls.
         std::thread::id thread{std::this_thread::get_id()};
     };
 
@@ -121,7 +122,7 @@ private:
     u64 last_action_id{};
     GuestMirrorHandle last_guest_mirror_id{};
     std::map<GuestMirrorHandle, GuestMirror> guest_mirrors; ///< Guarded by `guard`.
-    std::vector<DueActions*> due_actions; ///< Guarded by `guard`.
+    std::vector<DueActions*> due_actions;                   ///< Guarded by `guard`.
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
     std::condition_variable action_done_cv;

@@ -7,6 +7,7 @@
 #include <algorithm>
 
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
 namespace Tegra {
@@ -57,6 +58,9 @@ void SyncpointManager::DeregisterAction(std::list<RegisteredAction>& action_stor
     while (true) {
         const DueActions* running_in{};
         for (DueActions* due : due_actions) {
+            if (due->storage != &action_storage) {
+                continue;
+            }
             if (const auto it = std::ranges::find_if(due->pending, matches);
                 it != due->pending.end()) {
                 due->pending.erase(it);
@@ -152,9 +156,21 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
     // block on the display (AcquireNextImage), and the fencing thread's Increment and the guest's
     // RegisterAction (nx2:syncpt RequestSlotEvent) waited on the guard behind it, freezing Donkey
     // Kong Bananza with presents stopped.
-    DueActions due;
-    due.pending.splice(due.pending.end(), action_storage, action_storage.begin(), end);
+    DueActions due{.storage = &action_storage};
     due_actions.push_back(&due);
+    SCOPE_EXIT {
+        if (!lk.owns_lock()) {
+            lk.lock();
+        }
+        // If a callback throws, keep unstarted actions registered and remove the stack batch
+        // before unwinding. Cancels waiting for the failed callback must also wake up.
+        action_storage.merge(due.pending, [](const auto& lhs, const auto& rhs) {
+            return lhs.expected_value < rhs.expected_value;
+        });
+        std::erase(due_actions, &due);
+        action_done_cv.notify_all();
+    };
+    due.pending.splice(due.pending.end(), action_storage, action_storage.begin(), end);
     while (!due.pending.empty()) {
         std::function<void()> action{std::move(due.pending.front().action)};
         due.running = due.pending.front().id;
@@ -166,7 +182,6 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
         due.running = 0;
         action_done_cv.notify_all();
     }
-    std::erase(due_actions, &due);
 }
 
 void SyncpointManager::Wait(std::atomic<u32>& syncpoint, std::condition_variable& wait_cv,
