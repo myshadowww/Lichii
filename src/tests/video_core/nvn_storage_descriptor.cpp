@@ -3,6 +3,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
+#include "video_core/buffer_cache/storage_buffer_size.h"
 
 TEST_CASE("Global fallback identifies NVN buffers by slot", "[shader_recompiler][global_memory]") {
     Shader::Info info{};
@@ -23,4 +24,17 @@ TEST_CASE("Global fallback identifies NVN buffers by slot", "[shader_recompiler]
     REQUIRE_FALSE(Shader::Backend::UsesNvnStorageDescriptor(info, misaligned));
     REQUIRE_FALSE(Shader::Backend::UsesNvnStorageDescriptor(info, out_of_range));
     REQUIRE_FALSE(Shader::Backend::UsesNvnStorageDescriptor(info, before_base));
+}
+
+TEST_CASE("Native graphics NVN descriptors are recognised by slot", "[nvn][global_memory]") {
+    using VideoCommon::IsNvnGraphicsStorageDescriptor;
+    REQUIRE(IsNvnGraphicsStorageDescriptor(0, 0, 0x190, ~0U));
+    REQUIRE(IsNvnGraphicsStorageDescriptor(4, 0, 0x520, ~0U));
+    REQUIRE(IsNvnGraphicsStorageDescriptor(0, 0, 0x200, ~0U));
+    REQUIRE_FALSE(IsNvnGraphicsStorageDescriptor(0, 0, 0x100, ~0U));
+    REQUIRE_FALSE(IsNvnGraphicsStorageDescriptor(0, 0, 0x210, ~0U));
+    REQUIRE_FALSE(IsNvnGraphicsStorageDescriptor(0, 0, 0x191, ~0U));
+    REQUIRE_FALSE(IsNvnGraphicsStorageDescriptor(0, 1, 0x190, ~0U));
+    REQUIRE_FALSE(IsNvnGraphicsStorageDescriptor(0, 0, 0x190, 0));
+    REQUIRE_FALSE(IsNvnGraphicsStorageDescriptor(5, 0, 0x610, ~0U));
 }

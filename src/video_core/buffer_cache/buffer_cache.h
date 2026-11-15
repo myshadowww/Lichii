@@ -20,9 +20,11 @@
 #include <vector>
 #include <fmt/ranges.h>
 
+#include "common/game_presets.h"
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/multi_range_refresh.h"
+#include "video_core/buffer_cache/storage_buffer_size.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -1831,11 +1833,15 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
         }
         ssbo_addr = holder + indirect_offset;
     }
-    channel_state->storage_buffers[stage][ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             maxwell3d->GetNativeMacroEngine().native_turing ||
-                                 indirect_offset != ~0U,
-                             indirect_offset != ~0U);
+    // Mario Kart World's NVN graphics descriptors carry a size, and its light-probe buffer runs
+    // past 8 MiB. Other native titles keep the bare-pointer cap: their next word need not be one.
+    const bool nvn_descriptor =
+        program_id == Settings::MarioKartWorldProgramId &&
+        IsNvnGraphicsStorageDescriptor(stage, cbuf_index, cbuf_offset, indirect_offset);
+    channel_state->storage_buffers[stage][ssbo_index] = StorageBufferBinding(
+        ssbo_addr, cbuf_index, is_written,
+        maxwell3d->GetNativeMacroEngine().native_turing || indirect_offset != ~0U,
+        indirect_offset != ~0U, false, nvn_descriptor);
     if (indirect_offset != ~0U) {
         TraceTablePointer(false, stage, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->storage_buffers[stage][ssbo_index]);
@@ -4301,8 +4307,8 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 
 template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
-                                             bool native_pointer, bool table_pointer,
-                                             bool compute) const {
+                                             bool native_pointer, bool table_pointer, bool compute,
+                                             bool sized) const {
     const GPUVAddr gpu_addr = gpu_memory->Read<u64>(ssbo_addr);
 
     if (gpu_addr == 0) {
@@ -4310,7 +4316,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
 
     const bool reads_size_word =
-        !(table_pointer && !is_written) && (!native_pointer || (compute && !is_written));
+        !(table_pointer && !is_written) && (!native_pointer || sized || (compute && !is_written));
     const u64 next_qword = reads_size_word ? gpu_memory->Read<u64>(ssbo_addr + 8) : 0;
     const u32 alignment = runtime.GetStorageBufferAlignment();
     struct CachedBinding {
@@ -4324,9 +4330,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     };
     constexpr size_t ways = 4;
     thread_local std::array<std::array<CachedBinding, ways>, 512> binding_cache{};
-    const u32 flags =
-        (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
-        (compute ? 8U : 0U);
+    const u32 flags = (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) |
+                      (table_pointer ? 4U : 0U) | (compute ? 8U : 0U) | (sized ? 16U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
     const u64 serial = gpu_memory->MapSerial();
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
@@ -4364,6 +4369,11 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             // bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
                 const u32 bare = (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+                // An NVN descriptor's word is its size. The binding still stops where the mapping
+                // or its device range does.
+                if (sized) {
+                    return next_qword_is_size ? (std::min)(packed_size, limit) : bare;
+                }
                 // Mario Kart World's lighting passes read past 8 MiB from theirs, inside the size
                 // word after the pointer (Eglantine #609 reads it): capped at 8 MiB those reads
                 // came back zero and lit land and characters too dark. A read-only compute binding

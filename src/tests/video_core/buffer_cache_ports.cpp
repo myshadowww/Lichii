@@ -316,9 +316,9 @@ struct BufferCacheTestAccess {
     }
     static Binding Bind(Cache& cache, Tegra::MemoryManager& memory, GPUVAddr descriptor,
                         bool written = false, bool native = false, bool table = false,
-                        bool compute = false) {
+                        bool compute = false, bool sized = false) {
         cache.gpu_memory = &memory;
-        return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute);
+        return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute, sized);
     }
     template <class C>
     static BufferId Add(C& cache, DAddr address, u32 size, bool mapped = false) {
@@ -495,8 +495,8 @@ struct BasicFixture {
         std::memcpy(bytes + 8, &size, sizeof(size));
     }
     VideoCommon::Binding Bind(bool written = false, bool native = false, bool table = false,
-                              bool compute = false) {
-        return Access::Bind(*cache, *memory, 0x100000, written, native, table, compute);
+                              bool compute = false, bool sized = false) {
+        return Access::Bind(*cache, *memory, 0x100000, written, native, table, compute, sized);
     }
 };
 
@@ -852,6 +852,26 @@ TEST_CASE("Storage binding cache preserves native and table size policies", "[bu
     REQUIRE(f.Bind(false, false, true).size == 80 << 20);
     f.Descriptor(base + (79 << 20), 0);
     REQUIRE(f.Bind(false, false, true).size == 1 << 20);
+}
+
+TEST_CASE("NVN graphics descriptors bind their size and stop at a device range gap",
+          "[buffer_ports]") {
+    Fixture f;
+    constexpr GPUVAddr base = 0x4000000;
+    f.memory->Map(base, 0x10000000, 80 << 20, Tegra::PTEKind::PITCH, true);
+    // Mario Kart World's light-probe buffer
+    f.Descriptor(base, 0x102edc0);
+    REQUIRE(f.Bind(false, true).size == 8 << 20);
+    REQUIRE(f.Bind(false, true, false, false, true).size == 0x102f000);
+    REQUIRE(f.Bind(true, true, false, false, true).size == 0x102edc0);
+    f.Descriptor(base, 0);
+    REQUIRE(f.Bind(false, true, false, false, true).size == 8 << 20);
+    f.Descriptor(base, (1ULL << 32) | 256);
+    REQUIRE(f.Bind(false, true, false, false, true).size == 8 << 20);
+    f.Descriptor(base, 0x102edc0);
+    f.memory->Map(base + (16 << 20), 0x20000000, 1 << 20, Tegra::PTEKind::PITCH, true);
+    REQUIRE(f.Bind(true, true, false, false, true).size == 16 << 20);
+    REQUIRE(f.Bind(false, true, false, false, true).size == 16 << 20);
 }
 
 TEST_CASE("Storage binding cache does not reuse a destroyed address space", "[buffer_ports]") {
