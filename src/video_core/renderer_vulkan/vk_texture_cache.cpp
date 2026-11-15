@@ -5505,7 +5505,11 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         });
         total += size;
     }
-    const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
+    // Deferred, and stamped once the copy below is recorded. The decode submits (wait), so a
+    // buffer stamped now carried the tick before that submit while the encode and the copy ran
+    // in the next one: the pool could hand it to the next transcode, or free it, once the GPU
+    // was past the decode, and two textures' blocks met in one buffer.
+    auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
 
     const u64 layer_stride = info.layer_stride;
     const size_t guest_size = image.guest_size_bytes;
@@ -5529,10 +5533,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             ASTCDecoderPass::Target{
                 .image = *pending.image,
                 .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                // A later batch overwrites what the previous batch's encode read: wait for it.
+                // A later batch overwrites what the previous batch's encode read: its barrier
+                // waits for that (initialized).
                 .initialized = base != 0,
                 .level_view = [&pending](s32 level) { return *pending.views[level]; },
-                .wait = true,
+                // Only the last batch submits. `map` carries this tick: a later batch reading it
+                // after a submit could find it freed, or refilled with the next upload.
+                .wait = base + count >= layers,
                 .levels = levels,
             },
             batch_map, swizzles);
@@ -5554,6 +5561,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                                0, barrier);
     });
     image.UploadMemory(output.buffer, output.offset, copies);
+    staging_buffer_pool.FreeDeferred(output);
     pending.tick = scheduler.CurrentTick();
     pending_transcodes.push_back(std::move(pending));
 }
