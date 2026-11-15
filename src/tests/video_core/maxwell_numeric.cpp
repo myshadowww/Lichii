@@ -323,6 +323,33 @@ TEST_CASE("Maxwell unsigned I2F has backend-independent rounding", "[shader][max
     }
 }
 
+TEST_CASE("Unsigned bit-field constant folding handles empty and full-width fields",
+          "[shader][constant_propagation]") {
+    for (const u32 base : {0U, 1U, 0x80000000U, 0x87654321U, 0xffffffffU}) {
+        for (u32 offset = 0; offset <= 32; ++offset) {
+            for (u32 count = 0; count <= 32 - offset; ++count) {
+                CAPTURE(base, offset, count);
+                Shader::ObjectPool<IR::Inst> pool;
+                IR::Block block{pool};
+                IR::IREmitter ir{block};
+                ir.SetReg(IR::Reg::R0,
+                          ir.BitFieldExtract(ir.Imm32(base), ir.Imm32(offset), ir.Imm32(count),
+                                             false));
+                IR::Program program;
+                program.blocks = {&block};
+                program.post_order_blocks = {&block};
+                NumericEnvironment env;
+                Shader::Optimization::ConstantPropagationPass(env, program);
+                const auto result = block.back().Arg(1);
+                REQUIRE(result.IsImmediate());
+                const u32 expected = static_cast<u32>((u64{base} >> offset) &
+                                                       ((u64{1} << count) - 1));
+                CHECK(result.U32() == expected);
+            }
+        }
+    }
+}
+
 TEST_CASE("Maxwell U32 to F32 truncates without backend rounding support", "[shader][maxwell][numeric]") {
     const auto inputs = UnsignedInputs();
     for (u32 modifiers = 0; modifiers < 4; ++modifiers) {
