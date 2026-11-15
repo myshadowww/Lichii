@@ -433,7 +433,9 @@ void OneTimeInit() {
     }
 
 #ifdef YUZU_BUNDLED_OPENSSL
-    LoadCaCertStore(ssl_ctx, kCert, sizeof(kCert));
+    if (!Common::Net::HasCaEnvironmentOverride()) {
+        LoadCaCertStore(ssl_ctx, kCert, sizeof(kCert));
+    }
 #endif
     SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, nullptr);
 
