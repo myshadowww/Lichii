@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#if !defined(_WIN32) && !defined(__APPLE__)
-
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/net/ca_store.h"
 
+#ifndef _WIN32
 namespace {
 
 class ScopedEnv {
@@ -81,5 +83,17 @@ TEST_CASE("CaStore: clients trust the host's CA bundle", "[common]") {
     REQUIRE(client.ca_cert_path == bundle);
     REQUIRE_FALSE(client.loaded_store);
 }
+#endif
 
+#ifdef YUZU_BUNDLED_OPENSSL
+TEST_CASE("CaStore: the built-in CA bundle is handed out as a file", "[common]") {
+    const std::string path = Common::Net::BundledCaFile();
+    REQUIRE_FALSE(path.empty());
+    REQUIRE(Common::Net::BundledCaFile() == path);
+
+    std::ifstream stream{std::filesystem::path{std::u8string{path.begin(), path.end()}},
+                         std::ios::binary};
+    const std::string on_disk{std::istreambuf_iterator<char>{stream}, {}};
+    REQUIRE(on_disk == std::string_view{kCert, sizeof(kCert) - 1});
+}
 #endif
