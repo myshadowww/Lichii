@@ -70,6 +70,7 @@ add_executable(tests
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
     core/ncz_io_guards.cpp
+    core/cmif_out_buffer.cpp
     core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
