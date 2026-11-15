@@ -51,6 +51,7 @@ add_executable(tests
     core/device_memory_cold_hint.cpp
     core/memory_acquire.cpp
     core/memory_span.cpp
+    core/time_zone_fallback.cpp
     core/builtin_patches.cpp
     core/builtin_font_glyphs.cpp
     core/system_test_context.h
