@@ -131,6 +131,7 @@ PlayTimeManager::~PlayTimeManager() {
 }
 
 void PlayTimeManager::SetProgramId(u64 program_id) {
+    std::scoped_lock lock{database_mutex};
     running_program_id = program_id;
 }
 

@@ -48,7 +48,7 @@ private:
     void AutoTimestamp(std::stop_token stop_token);
     /// Writes a copy of the database. Called with save_mutex held from the change being saved
     /// through the write, so saves land in the order of their changes. database_mutex guards the
-    /// database alone, so GetPlayTime never waits on file I/O.
+    /// database and running program ID, so GetPlayTime never waits on file I/O.
     void Save();
 
     std::mutex save_mutex;

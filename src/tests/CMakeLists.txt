@@ -417,6 +417,13 @@ if (NOT ANDROID)
         ${PLATFORM_LIBRARIES})
     add_test(NAME config_tests COMMAND config_tests)
 
+    add_executable(play_time_manager_tests
+        frontend_common/play_time_manager.cpp
+        ../frontend_common/play_time_manager.cpp)
+    target_link_libraries(play_time_manager_tests PRIVATE common Catch2::Catch2WithMain
+        Threads::Threads ${PLATFORM_LIBRARIES})
+    add_test(NAME play_time_manager_tests COMMAND play_time_manager_tests)
+
     add_executable(profile_import_tests
         frontend_common/profile_import.cpp
         ../frontend_common/profile_import.cpp)
