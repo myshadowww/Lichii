@@ -69,7 +69,10 @@ add_executable(tests
     core/nx_archive.cpp
     frontend_common/nx_archive.cpp
     core/vfs_vector.cpp
+    core/ncz_cache.cpp
+    core/ncz_decompressor.cpp
     core/ncz_io_guards.cpp
+    core/ncz_container.cpp
     core/cmif_out_buffer.cpp
     core/file_sys_parsers.cpp
     input_common/calibration_lifetime.cpp
@@ -272,6 +275,23 @@ target_compile_definitions(tests PRIVATE
     LICHII_NX_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/core/nx_fixtures")
 
 add_test(NAME tests COMMAND tests)
+
+add_executable(ncz_tests
+    core/ncz_cache.cpp
+    core/ncz_decompressor.cpp
+    core/ncz_io_guards.cpp
+    ../core/crypto/ncz_cache.cpp
+    ../core/crypto/ncz_decompressor.cpp
+    ../core/crypto/aes_util.cpp
+    ../core/file_sys/vfs/vfs.cpp
+    ../core/file_sys/vfs/vfs_vector.cpp)
+target_sources(ncz_tests PRIVATE
+    ../core/file_sys/fssystem/fssystem_utility.cpp
+    ../core/file_sys/fssystem/fssystem_aes_ctr_storage.cpp
+    ../core/file_sys/fssystem/fssystem_alignment_matching_storage_impl.cpp)
+target_link_libraries(ncz_tests PRIVATE common OpenSSL::Crypto zstd::zstd
+    ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
+add_test(NAME ncz_tests COMMAND ncz_tests)
 
 if (ENABLE_NVIDIA_DLSS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(NR_CROP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/nr_crop_smoke_spv.h)

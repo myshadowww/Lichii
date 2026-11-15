@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "core/file_sys/card_image.h"
+#include "core/file_sys/content_archive.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/fssystem/fssystem_bucket_tree.h"
 #include "core/file_sys/fssystem/fssystem_compression_configuration.h"
@@ -422,6 +423,55 @@ TEST_CASE("NCA rejects a hash region larger than the file behind an indirect lay
     sha.hash_layer_region[0].size = s64{1} << 36;
     sha.hash_layer_region[1].offset = s64{1} << 37;
     REQUIRE(nca.Open() == ResultNcaBaseStorageOutOfRangeC);
+}
+
+// A decrypted NCA with its ExeFS at the start and its logo partition 2 MiB in, as in a program
+// NCA. Reaching the logo of a solid NCZ means decoding everything before it.
+TEST_CASE("NCA opens a section only when it is used", "[core][file_sys]") {
+    constexpr u32 LogoSector = 0x1006;
+    std::vector<u8> bytes(0xC00);
+    NcaHeader header{};
+    header.magic = NcaHeader::MagicDecrypted;
+    header.content_type = NcaHeader::ContentType::Program;
+    header.sdk_addon_version = 0x000C0000;
+    header.fs_info[0].start_sector = 6;
+    header.fs_info[0].end_sector = 0x26;
+    header.fs_info[1].start_sector = LogoSector;
+    header.fs_info[1].end_sector = LogoSector + 0x20;
+    std::memcpy(bytes.data(), &header, sizeof(header));
+    NcaFsHeader fs{};
+    fs.version = 2;
+    fs.fs_type = NcaFsHeader::FsType::PartitionFs;
+    fs.hash_type = NcaFsHeader::HashType::None;
+    fs.encryption_type = NcaFsHeader::EncryptionType::None;
+    std::memcpy(bytes.data() + sizeof(header), &fs, sizeof(fs));
+    std::memcpy(bytes.data() + sizeof(header) + sizeof(fs), &fs, sizeof(fs));
+
+    const auto exefs = MakePfs0({"main", "main.npdm"});
+    const auto logo =
+        MakePfs0({"NintendoLogo.png", "StartupMovie.gif"});
+    bytes.resize(size_t{LogoSector + 0x20} * 0x200);
+    std::copy(exefs.begin(), exefs.end(), bytes.begin() + 0xC00);
+    std::copy(logo.begin(), logo.end(), bytes.begin() + size_t{LogoSector} * 0x200);
+
+    class FarthestRead final : public VectorVfsFile {
+    public:
+        explicit FarthestRead(std::vector<u8> data) : VectorVfsFile(std::move(data), "test.nca") {}
+        std::size_t Read(u8* out, std::size_t size, std::size_t offset) const override {
+            farthest = std::max(farthest, offset + size);
+            return VectorVfsFile::Read(out, size, offset);
+        }
+        mutable std::size_t farthest{};
+    };
+    const auto file = std::make_shared<FarthestRead>(std::move(bytes));
+    const NCA nca{file};
+    REQUIRE(nca.GetStatus() == Loader::ResultStatus::Success);
+    REQUIRE(nca.GetExeFS() != nullptr);
+    CHECK(file->farthest <= size_t{LogoSector} * 0x200);
+
+    REQUIRE(nca.GetLogoPartition() != nullptr);
+    CHECK(file->farthest > size_t{LogoSector} * 0x200);
+    CHECK(nca.GetSubdirectories().size() == 2);
 }
 
 // A card image whose root HFS0 holds empty partitions with the given names.
