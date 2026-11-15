@@ -63,6 +63,12 @@ using StorageInstVector = small_vector<StorageInst, 24>;
 using StorageWritesSet =
     flat_set<StorageBufferAddr, std::less<StorageBufferAddr>, small_vector<StorageBufferAddr, 16>>;
 
+// Dynamically indexed pointer arrays can reach independently bound slots past the search limit.
+struct PointerArray {
+    StorageBufferAddr first;
+    u32 stride;
+};
+
 struct StorageInfo {
     StorageBufferSet set;
     StorageInstVector to_replace;
@@ -83,6 +89,8 @@ struct StorageInfo {
     std::unordered_map<const IR::Inst*, small_vector<StorageBufferAddr, 4>> native_candidates;
     /// Native accesses whose candidates include slots of a dynamically indexed pointer array.
     std::unordered_set<const IR::Inst*> native_dynamic;
+    std::unordered_map<const IR::Inst*, small_vector<PointerArray, 2>> native_arrays;
+    small_vector<PointerArray, 2> written_arrays;
     /// A native access with several candidate pointers was left global.
     bool native_runtime_bounds{};
     /// Paired accesses bind the loaded pointers that compete with their pair; cleared when those
@@ -1156,6 +1164,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                                                            Environment& env, bool& dynamic,
                                                            StorageInfo& info) {
     small_vector<StorageBufferAddr, 4> candidates;
+    auto& arrays = info.native_arrays[low_addr.InstRecursive()];
     small_vector<const IR::Inst*, 16> pending{low_addr.InstRecursive()};
     std::unordered_set<const IR::Inst*> visited{pending.front()};
     const auto enqueue = [&](const IR::Value& value) {
@@ -1176,6 +1185,10 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 std::unordered_set<const IR::Inst*> slot_visited;
                 CollectPointerSlots(offset, slots, slot_visited);
                 for (const auto& [first, stride] : slots) {
+                    if (stride != 0) {
+                        arrays.push_back(
+                            {.first{.index = index.U32(), .offset = first}, .stride = stride});
+                    }
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
@@ -1327,6 +1340,11 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 std::unordered_set<const IR::Inst*> slot_visited;
                 CollectPointerSlots(holder->Arg(1), slots, slot_visited);
                 for (const auto& [first, stride] : slots) {
+                    if (stride != 0) {
+                        arrays.push_back({.first{.index = index, .offset = first,
+                                                .indirect = indirect},
+                                          .stride = stride});
+                    }
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{
                             .index = index, .offset = first + slot * stride, .indirect = indirect};
@@ -1442,6 +1460,11 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                 accepted = true;
             }
             if (accepted) {
+                if (IsGlobalMemoryWrite(inst)) {
+                    const auto& arrays = info.native_arrays.at(start);
+                    info.written_arrays.insert(info.written_arrays.end(), arrays.begin(),
+                                               arrays.end());
+                }
                 info.native_runtime_bounds = true;
                 return true;
             }
@@ -2159,6 +2182,18 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                       info.set.size(), max_ssbos);
     }
     program.info.native_global_bounds |= info.native_runtime_bounds;
+    // The dynamic search enumerates only 16 slots. Full-buffer routing can also write a later
+    // slot bound by another access, so finish its write metadata after all bindings are known.
+    for (const PointerArray& array : info.written_arrays) {
+        for (const StorageBufferAddr& buffer : info.set) {
+            if (buffer.index == array.first.index && buffer.indirect == array.first.indirect &&
+                buffer.offset >= array.first.offset &&
+                (buffer.offset - array.first.offset) % array.stride == 0) {
+                info.writes.insert(buffer);
+                info.unbounded_writes.insert(buffer);
+            }
+        }
+    }
     // Store extents, before the accesses are rebased (the analysis reads the guest addresses).
     // None while a store stays global: the backend routes it to the descriptor whose pointer is the
     // closest one at or below the address, which need not be one of the store's candidates.
