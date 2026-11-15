@@ -199,9 +199,24 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
-        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
-                                Settings::values.gpu_clock.GetValue(),
+        const bool ampere = g_nx2_ampere.load(std::memory_order_relaxed) && !LegacyTimestamps();
+        return ReadGpuTimestamp(system.CoreTiming(), ampere, Settings::values.gpu_clock.GetValue(),
                                 ampere_anchor.load(std::memory_order_relaxed));
+    }
+
+    /// Whether the running title keeps GPU tick timestamps (UsesLegacyAmpereTimestamps). Known
+    /// once the application process exists; until then (program id 0) nanoseconds are used.
+    [[nodiscard]] bool LegacyTimestamps() const {
+        s8 known = legacy_timestamps.load(std::memory_order_relaxed);
+        if (known < 0) {
+            const u64 program_id = system.GetApplicationProcessProgramID();
+            if (program_id == 0) {
+                return false;
+            }
+            known = UsesLegacyAmpereTimestamps(program_id) ? 1 : 0;
+            legacy_timestamps.store(known, std::memory_order_relaxed);
+        }
+        return known != 0;
     }
 
     void RendererFrameEndNotify() {
@@ -442,6 +457,7 @@ struct GPU::Impl {
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
     std::atomic<AmpereAnchor> ampere_anchor{};
+    mutable std::atomic<s8> legacy_timestamps{-1};
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
