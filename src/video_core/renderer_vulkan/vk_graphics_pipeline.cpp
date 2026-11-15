@@ -400,6 +400,7 @@ GraphicsPipeline::GraphicsPipeline(
       mesh_emulation{std::move(mesh_emulation_)} {
     if (shader_notify) {
         shader_notify->MarkShaderBuilding();
+        build_notify = shader_notify;
     }
     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
         const Shader::Info* const info{infos[stage]};
@@ -585,12 +586,12 @@ GraphicsPipeline::GraphicsPipeline(
                 LOG_ERROR(Render_Vulkan, "Graphics pipeline {:016x}: {}", key.Hash(),
                           exception.what());
                 if (shader_notify) {
-                    shader_notify->MarkShaderComplete();
+                    NotifyBuilt();
                 }
                 throw;
             } catch (...) {
                 if (shader_notify) {
-                    shader_notify->MarkShaderComplete();
+                    NotifyBuilt();
                 }
                 throw;
             }
@@ -601,7 +602,7 @@ GraphicsPipeline::GraphicsPipeline(
         const auto begin = std::chrono::steady_clock::now();
         SCOPE_EXIT {
             if (shader_notify) {
-                shader_notify->MarkShaderComplete();
+                NotifyBuilt();
             }
         };
         try {
@@ -700,6 +701,19 @@ std::optional<KeptGraphicsStages> GraphicsPipeline::TakeKeptStages() {
         }
     }
     return kept;
+}
+
+GraphicsPipeline::~GraphicsPipeline() {
+    // A build still queued is dropped (~PipelineBuild): it never ran, and never counted itself
+    // as done.
+    build.reset();
+    NotifyBuilt();
+}
+
+void GraphicsPipeline::NotifyBuilt() noexcept {
+    if (build_notify != nullptr && !build_notified.exchange(true)) {
+        build_notify->MarkShaderComplete();
+    }
 }
 
 void GraphicsPipeline::AddTransition(GraphicsPipeline* transition) {

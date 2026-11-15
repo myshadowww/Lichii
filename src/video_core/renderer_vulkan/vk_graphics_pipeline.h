@@ -237,6 +237,8 @@ public:
     GraphicsPipeline& operator=(const GraphicsPipeline&) = delete;
     GraphicsPipeline(const GraphicsPipeline&) = delete;
 
+    ~GraphicsPipeline();
+
     void AddTransition(GraphicsPipeline* transition);
 
     bool Configure(bool is_indexed) {
@@ -495,6 +497,12 @@ private:
     u32 mesh_capacity{};
 
     std::optional<PipelineBuild> build;
+
+    /// Counts the build as done in the "Building: N shader(s)" status, once: when it ran, or
+    /// when the pipeline went with its build still queued (cancelled, never run).
+    void NotifyBuilt() noexcept;
+    VideoCore::ShaderNotify* build_notify{};
+    std::atomic_bool build_notified{false};
 };
 
 } // namespace Vulkan
