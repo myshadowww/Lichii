@@ -21,9 +21,7 @@
 
 #include "discord_impl.h"
 
-#ifdef YUZU_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
+#include "common/net/ca_store.h"
 
 namespace DiscordRPC {
 
@@ -107,9 +105,7 @@ void DiscordImpl::Update() {
         client.set_read_timeout(3);
         client.set_follow_location(true);
 
-#ifdef YUZU_BUNDLED_OPENSSL
-        client.load_ca_cert_store(kCert, sizeof(kCert));
-#endif
+        Common::Net::ConfigureCaStore(client);
 
         httplib::Request request{
             .method = "HEAD",

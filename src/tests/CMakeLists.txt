@@ -171,6 +171,7 @@ add_executable(tests
     video_core/fsr4_support.cpp
     common/bit_field.cpp
     common/bit_util.cpp
+    common/ca_store.cpp
     common/cityhash.cpp
     common/container_hash.cpp
     common/core_pinning.cpp

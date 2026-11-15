@@ -165,7 +165,7 @@ add_library(
     cpu_features.cpp
     cpu_features.h
     httplib.h
-    net/net.h net/net.cpp
+    net/ca_store.h net/net.h net/net.cpp
     container/unordered_map.h container/unordered_set.h)
 
 # The ZBIC decoder runs once per module at load, so a profile buys it nothing, and the aarch64

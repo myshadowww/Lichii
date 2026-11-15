@@ -19,9 +19,7 @@
 #include "core/internal_network/network.h"
 #include "core/internal_network/sockets.h"
 
-#ifdef YUZU_BUNDLED_OPENSSL
-#include <openssl/cert.h>
-#endif
+#include "common/net/ca_store.h"
 
 using namespace Common::FS;
 
@@ -444,6 +442,10 @@ void OneTimeInit() {
         LOG_ERROR(Service_SSL, "SSL_CTX_set_default_verify_paths failed");
         CheckOpenSSLErrors();
         return;
+    }
+
+    if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {
+        SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);
     }
 
     OneTimeInitLogFile();
