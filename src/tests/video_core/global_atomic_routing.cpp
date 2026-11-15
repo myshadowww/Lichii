@@ -221,7 +221,7 @@ TEST_CASE("Global memory helpers with variable pointers select the buffer and br
     constexpr u32 OpSwitch = 251;
     constexpr u32 OpReturn = 253;
     constexpr u32 OpReturnValue = 254;
-    constexpr u32 VariablePointersStorageBuffer = 4441;
+    constexpr u32 VariablePointers = 4442;
     constexpr u32 ShaderNonUniform = 5301;
     constexpr u32 NonUniform = 5300;
     for (const bool native : {true, false}) {
@@ -233,7 +233,7 @@ TEST_CASE("Global memory helpers with variable pointers select the buffer and br
                 return std::ranges::any_of(Instructions(code, OpCapability),
                                            [&](const auto& ops) { return ops[0] == capability; });
             };
-            CHECK(has_capability(VariablePointersStorageBuffer));
+            CHECK(has_capability(VariablePointers));
             CHECK(has_capability(ShaderNonUniform));
             CHECK(Instructions(code, OpSwitch).empty());
 

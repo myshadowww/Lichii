@@ -504,9 +504,10 @@ FN_MAX_LIMIT_LIST
         return features.descriptor_indexing.shaderStorageTexelBufferArrayNonUniformIndexing;
     }
 
-    /// Returns true if storage buffer pointers can be chosen per invocation and decorated NonUniform.
+    /// Returns true if pointers to different storage buffers can be selected and decorated NonUniform.
     bool IsNonUniformStorageBufferPointerSupported() const {
-        return features.variable_pointer.variablePointersStorageBuffer &&
+        return features.variable_pointer.variablePointers &&
+               features.variable_pointer.variablePointersStorageBuffer &&
                (instance_version >= VK_API_VERSION_1_2 || extensions.descriptor_indexing);
     }
 

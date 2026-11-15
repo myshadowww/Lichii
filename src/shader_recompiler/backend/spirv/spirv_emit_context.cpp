@@ -1108,7 +1108,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
             if (candidates.empty()) {
                 return fallback;
             }
-            AddCapability(spv::Capability::VariablePointersStorageBuffer);
+            // Selecting distinct SSBO variables needs full VariablePointers; the storage-buffer
+            // capability alone only permits pointers into the same Block-decorated structure.
+            AddCapability(spv::Capability::VariablePointers);
             Id ssbo_id{ssbos[candidates[0]].*ssbo_member};
             Id ssbo_index{zero};
             for (size_t i = 0; i < candidates.size(); ++i) {

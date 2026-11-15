@@ -75,7 +75,8 @@ struct Profile {
     bool support_uniform_texel_buffer_array_nonuniform_indexing{};
     bool support_storage_texel_buffer_array_nonuniform_indexing{};
     /// Routed global memory accesses pick their storage buffer with OpSelect on a NonUniform
-    /// variable pointer instead of one branch per candidate buffer. NVIDIA's driver hangs on the
+    /// variable pointer instead of one branch per candidate buffer. Requires full VariablePointers
+    /// because selection crosses storage buffers. NVIDIA's driver hangs on the
     /// branch chain (#619). AMD lowers the NonUniform access to a waterfall loop, which spills in
     /// vertex and mesh shaders that already use every register, so it keeps the chain.
     bool select_global_memory_buffer{};

@@ -8,6 +8,7 @@ With --v2 (shader-sweep built in the tree), also replay them against the shader 
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -130,6 +131,37 @@ class ReplayTests(ReplayCase):
         serial, parallel = (sorted((row["record"], row["slot"], row["spirv_sha256_b"])
                                    for row in report["stages"]) for report in reports)
         self.assertEqual(serial, parallel)
+
+    def test_selected_global_buffers_validate_for_captured_shaders(self):
+        """Cross-buffer OpSelect must validate, not merely match on both compilation paths."""
+        validator = shutil.which("spirv-val")
+        if not validator:
+            self.skipTest("spirv-val is required to validate routed captured shaders")
+        report = self.replay(fixture_cache(), "--select-global-memory-buffer", "--keep-spirv",
+                             "--path-b", "v2" if V2 else "legacy")
+        self.assertEqual(report["collisions"], [])
+        self.assertTrue(all(row["verdict"] in ("match", "collapsed")
+                            for row in report["stages"]), report["stages"])
+        modules = sorted((self.root / f"replay-{self.runs}" / "spirv").rglob("*.spv"))
+        self.assertTrue(modules)
+        routed = 0
+        for module in modules:
+            with self.subTest(module=module.relative_to(self.root)):
+                validated = subprocess.run(
+                    [validator, "--target-env", "vulkan1.1spv1.4", str(module)],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
+                words = struct.unpack("<" + "I" * (module.stat().st_size // 4), module.read_bytes())
+                offset = 5
+                while offset < len(words):
+                    count, opcode = words[offset] >> 16, words[offset] & 0xffff
+                    self.assertGreater(count, 0)
+                    if opcode == 17 and words[offset + 1] == 4442:  # OpCapability VariablePointers
+                        routed += 1
+                        break
+                    offset += count
+        # The captured global-memory and atomic fixtures must exercise the selected-buffer path.
+        self.assertGreaterEqual(routed, 4)
 
     def test_linked_stage_is_emitted_with_the_previous_stage(self):
         """A geometry stage after a vertex stage differs from the same stage alone."""
