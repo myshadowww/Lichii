@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <string_view>
@@ -98,6 +97,10 @@ void EmitGetInBoundsFromOp(EmitContext& ctx) {
 }
 
 void EmitIsbeRead(EmitContext& ctx) {
+    NotImplemented();
+}
+
+void EmitIsbeReadOutput(EmitContext& ctx) {
     NotImplemented();
 }
 

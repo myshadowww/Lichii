@@ -26,7 +26,9 @@ TICEntry Image(u32 address, u32 width, u32 height) {
 
 TEST_CASE("FE upscale substitute only selects the captured output pass", "[fe_upscale]") {
     REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, nullptr));
-    REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, "fsr"));
+    for (const char* option : {"fsr", "dlss", "spatial"}) {
+        REQUIRE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
+    }
     for (const char* option : {"native", "standin", "0", "", "10", "invalid"}) {
         REQUIRE_FALSE(FE::UseReplacement(FE::ProgramId, FE::OutputProgramKey, option));
     }
@@ -49,7 +51,7 @@ TEST_CASE("Captured DLSS passes keep title-specific history and region contracts
     REQUIRE(star_fox);
     REQUIRE(duskbloods);
     REQUIRE(fire_emblem->IsPrepass(FE::PrepassProgramKey));
-    REQUIRE(fire_emblem->IsPrepass(FE::AlternatePrepassProgramKey));
+    REQUIRE(fire_emblem->IsPrepass(FE::PrepassProgramKeyV111));
     REQUIRE_FALSE(fire_emblem->star_fox);
     REQUIRE_FALSE(fire_emblem->render_region);
     REQUIRE(star_fox->IsPrepass(FE::StarFoxPrepassProgramKey));
@@ -58,7 +60,7 @@ TEST_CASE("Captured DLSS passes keep title-specific history and region contracts
     REQUIRE_FALSE(star_fox->render_region);
     REQUIRE(duskbloods->IsPrepass(FE::DuskbloodsPrepassProgramKey));
     REQUIRE_FALSE(duskbloods->IsPrepass(0));
-    REQUIRE_FALSE(duskbloods->IsPrepass(FE::AlternatePrepassProgramKey));
+    REQUIRE_FALSE(duskbloods->IsPrepass(FE::PrepassProgramKeyV111));
     REQUIRE_FALSE(duskbloods->IsPrepass(FE::StarFoxCutscenePrepassProgramKey));
     REQUIRE_FALSE(duskbloods->star_fox);
     REQUIRE(duskbloods->render_region);
@@ -93,20 +95,16 @@ TEST_CASE("FE upscale substitute validates both surface descriptors", "[fe_upsca
     }
 }
 
-TEST_CASE("FE temporal selection follows the live setting and explicit comparisons", "[fe_upscale]") {
-    REQUIRE_FALSE(FE::UseTemporalReplacement(true, false, nullptr));
-    REQUIRE(FE::UseTemporalReplacement(true, true, nullptr));
-    REQUIRE_FALSE(FE::UseTemporalReplacement(true, false, nullptr));
-    for (bool enabled : {false, true}) {
-        for (const char* option : {"fsr", "dlss"}) {
-            REQUIRE(FE::UseTemporalReplacement(true, enabled, option));
-            REQUIRE_FALSE(FE::UseTemporalReplacement(false, enabled, option));
-        }
-        for (const char* option : {"native", "standin", "0", "", "invalid"}) {
-            REQUIRE_FALSE(FE::UseTemporalReplacement(true, enabled, option));
-        }
-        // Star Fox records spatial repair first and selects its own temporal pass separately.
-        REQUIRE_FALSE(FE::UseTemporalReplacement(false, enabled, nullptr));
+TEST_CASE("FE temporal replacement uses history by default and honors the spatial comparison",
+          "[fe_upscale]") {
+    REQUIRE(FE::UseTemporalReplacement(true, nullptr));
+    REQUIRE_FALSE(FE::UseTemporalReplacement(false, nullptr));
+    for (const char* option : {"fsr", "dlss"}) {
+        REQUIRE(FE::UseTemporalReplacement(true, option));
+        REQUIRE_FALSE(FE::UseTemporalReplacement(false, option));
+    }
+    for (const char* option : {"spatial", "native", "standin", "0", "", "invalid"}) {
+        REQUIRE_FALSE(FE::UseTemporalReplacement(true, option));
     }
 }
 

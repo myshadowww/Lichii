@@ -9,7 +9,7 @@
 #include <string>
 #include <system_error>
 
-#ifdef YUZU_BUNDLED_OPENSSL
+#ifdef LICHII_BUNDLED_OPENSSL
 #include <openssl/cert.h>
 #endif
 
@@ -60,7 +60,7 @@ void ConfigureCaStore(Client& client) {
         client.set_ca_cert_path(system_bundle);
         return;
     }
-#ifdef YUZU_BUNDLED_OPENSSL
+#ifdef LICHII_BUNDLED_OPENSSL
     client.load_ca_cert_store(kCert, sizeof(kCert));
 #endif
 }

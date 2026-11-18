@@ -7,6 +7,10 @@ on:
         description: Publish the binaries as a GitHub release
         type: boolean
         default: true
+      nsight_aftermath:
+        description: Build Windows with Nsight Aftermath GPU crash dumps (test builds only, no NVIDIA files shipped)
+        type: boolean
+        default: false
   push:
     branches:
       - nx2-experimental
@@ -14,7 +18,7 @@ on:
     paths:
       - "src/**"
       # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
-      # YUZU_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
+      # LICHII_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
       - "!src/tests/**"
       - "CMakeLists.txt"
       - "CMakeModules/**"
@@ -48,6 +52,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Refuse to publish an Aftermath build
+        if: inputs.nsight_aftermath && inputs.publish_release
+        run: |
+          echo "nsight_aftermath builds are test builds; run them with publish_release=false"
+          exit 1
+
       - name: Prepare release tag
         if: github.event_name == 'push' || inputs.publish_release
         shell: bash
@@ -122,7 +132,7 @@ jobs:
             libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
-            libopus-dev libasound2-dev ccache \
+            libopus-dev libasound2-dev ccache llvm python3-zstandard \
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
 
@@ -244,6 +254,26 @@ jobs:
         shell: pwsh
         run: glslangValidator --version
 
+      # Only the SDK's headers are kept: the tracker loads GFSDK_Aftermath_Lib.x64.dll at run time,
+      # so the tester supplies his own copy and the artifact holds no NVIDIA files.
+      - name: Fetch Nsight Aftermath SDK headers
+        if: startsWith(matrix.platform, 'windows') && inputs.nsight_aftermath
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'aftermath-sdk.zip'
+          Invoke-WebRequest -OutFile $zip https://developer.nvidia.com/downloads/assets/tools/secure/nsight-aftermath-sdk/2026_3_0/windows_x64/NVIDIA_Nsight_Aftermath_SDK_2026.3.0.26197-windows_x64.zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($hash -ne 'e38136a60110199559b7365d3ea4ec0cb5588dc2b0f593877d864e0299659a3f') {
+            throw "Nsight Aftermath SDK hash $hash does not match the pinned release"
+          }
+          $extracted = Join-Path $env:RUNNER_TEMP 'aftermath-sdk-zip'
+          Expand-Archive $zip -DestinationPath $extracted
+          $sdk = Join-Path $env:RUNNER_TEMP 'aftermath-sdk'
+          New-Item -ItemType Directory -Force $sdk | Out-Null
+          Move-Item (Join-Path $extracted 'include') $sdk
+          Remove-Item -Recurse -Force $extracted, $zip
+          "NSIGHT_AFTERMATH_SDK=$($sdk -replace '\\', '/')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
       - name: Restore CPM downloads
         id: cpm-cache
         uses: actions/cache/restore@v5
@@ -276,14 +306,14 @@ jobs:
           flags=(
             -DCMAKE_BUILD_TYPE=Release
             -DBUILD_TESTING=OFF
-            -DYUZU_TESTS=OFF
-            -DYUZU_CMD=ON
-            -DYUZU_ROOM=OFF
-            -DYUZU_ROOM_STANDALONE=OFF
-            -DYUZU_USE_BUNDLED_QT=OFF
+            -DLICHII_TESTS=OFF
+            -DLICHII_CMD=ON
+            -DLICHII_ROOM=OFF
+            -DLICHII_ROOM_STANDALONE=OFF
+            -DLICHII_USE_BUNDLED_QT=OFF
             -DENABLE_QT_TRANSLATION=ON
             "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR"
-            -DYUZU_USE_BUNDLED_SDL3=ON
+            -DLICHII_USE_BUNDLED_SDL3=ON
             -DVulkanHeaders_FORCE_BUNDLED=ON
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
             -DENABLE_UPDATE_CHECKER=ON
@@ -320,16 +350,20 @@ jobs:
             flags+=" -Wno-error=profile-instr-out-of-date -Wno-error=profile-instr-unprofiled"
             flags+=" -Wno-error=backend-plugin"
           fi
-          cmake -S . -B build/release -G Ninja \
+          aftermath=()
+          if [ '${{ inputs.nsight_aftermath }}' = true ]; then
+            aftermath=(-DENABLE_NSIGHT_AFTERMATH=ON)
+          fi
+          cmake -S . -B build/release -G Ninja "${aftermath[@]}" \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
-            -DYUZU_TESTS=OFF \
-            -DYUZU_CMD=ON \
-            -DYUZU_ROOM=OFF \
-            -DYUZU_ROOM_STANDALONE=OFF \
-            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DLICHII_TESTS=OFF \
+            -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_QT=OFF \
             -DENABLE_QT_TRANSLATION=ON \
-            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DLICHII_USE_BUNDLED_SDL3=ON \
             -DENABLE_UPDATE_CHECKER=ON \
             -DLICHII_BUILD_TAG=build-${{ github.run_number }} \
             -DLICHII_BUILD_PLATFORM=${{ matrix.platform }} \
@@ -340,6 +374,8 @@ jobs:
             "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
             "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
             "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+            "-DCMAKE_EXE_LINKER_FLAGS=/DEBUG:FULL /OPT:REF /OPT:ICF" \
             "-DCMAKE_C_FLAGS=$flags" \
             "-DCMAKE_CXX_FLAGS=-EHsc $flags"
 
@@ -351,11 +387,11 @@ jobs:
           cmake -S . -B build/release -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
-            -DYUZU_TESTS=OFF \
-            -DYUZU_CMD=ON \
-            -DYUZU_ROOM=OFF \
-            -DYUZU_ROOM_STANDALONE=OFF \
-            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DLICHII_TESTS=OFF \
+            -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_QT=OFF \
             -DENABLE_QT_TRANSLATION=ON \
             "-DCMAKE_PREFIX_PATH=$(brew --prefix qt@6);$(brew --prefix zlib)" \
             "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
@@ -378,7 +414,7 @@ jobs:
         shell: bash
         run: |
           if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
-          targets="yuzu yuzu-cmd"
+          targets="lichii lichii-cmd"
           if [[ "${{ matrix.platform }}" == windows* ]]; then targets="$targets lichii-updater"; fi
           cmake --build build/release --target $targets --parallel
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
@@ -397,12 +433,39 @@ jobs:
             .sccache
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
+      # fsr4-vk, the community Vulkan port of FSR 4 that the x86-64 Linux packages ship
+      # (tools/fsr4-vk/build.sh pins its commit and AMD's DLL it is built from). The build's inputs
+      # are all in the script, so its output is cached by the script's hash. Its shader conversion
+      # fails its own asset check on arm64 hosts, so the aarch64 packages go without it.
+      - name: Restore fsr4-vk
+        if: startsWith(matrix.platform, 'linux-x86_64')
+        id: fsr4-vk
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/fsr4-vk
+          key: fsr4-vk-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/fsr4-vk/build.sh') }}
+
+      - name: Build fsr4-vk
+        if: startsWith(matrix.platform, 'linux-x86_64') && steps.fsr4-vk.outputs.cache-hit != 'true'
+        shell: bash
+        run: bash tools/fsr4-vk/build.sh "$RUNNER_TEMP/fsr4-vk-work" "$RUNNER_TEMP/fsr4-vk"
+
+      - name: Save fsr4-vk
+        if: startsWith(matrix.platform, 'linux-x86_64') && steps.fsr4-vk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/fsr4-vk
+          key: ${{ steps.fsr4-vk.outputs.cache-primary-key }}
+
       # Both Linux packages are self-contained: linuxdeploy bundles every library the two programs
       # need except the base system ones (glibc, X11/Wayland client libraries, the GPU driver and
-      # Vulkan loader), and its Qt plugin adds the Qt libraries and platform plugins. The AppImage
-      # packs that folder into one file; the tar.gz holds the same folder for systems without FUSE,
-      # with lichii and eden-cli links at its top. Both run on glibc 2.39+ systems. A tar.gz of the
-      # bare programs needed the Qt 6.8 they were built against installed system-wide (#901).
+      # Vulkan loader), and its Qt plugin adds the Qt libraries and platform plugins. linuxdeploy's
+      # own exclude list lacks libvulkan.so.1, which fsr4-vk and the -pgo builds' libplacebo link,
+      # so it is excluded by name: the bundled loader replaced the system one and failed Vulkan
+      # init (#1767). The AppImage packs that folder into one file; the tar.gz holds the same
+      # folder for systems without FUSE, with lichii and eden-cli links at its top. Both run on
+      # glibc 2.39+ systems. A tar.gz of the bare programs needed the Qt 6.8 they were built
+      # against installed system-wide (#901).
       - name: Package Linux AppImage and tar.gz
         if: startsWith(matrix.platform, 'linux')
         shell: bash
@@ -432,11 +495,20 @@ jobs:
           export LDAI_OUTPUT="lichii-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           export ARCH="$arch"
-          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/bin AppDir/usr/share/licenses
           cp build/release/bin/nx2_switches.txt AppDir/usr/bin/
+          # The emulator loads fsr4-vk from <exe dir>/../lib (FfxRuntime::PortLibrary).
+          fsr4=amd_fidelityfx_upscaler_vk.so
+          fsr4_library=()
+          if [ "$arch" = x86_64 ]; then
+            cp -r "$RUNNER_TEMP/fsr4-vk/licenses/fsr4-vk" AppDir/usr/share/licenses/
+            fsr4_library=(--library "$RUNNER_TEMP/fsr4-vk/$fsr4")
+          fi
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
+            "${fsr4_library[@]}" \
+            --exclude-library 'libvulkan.so*' \
             --desktop-file dist/io.github.zortos293.lichii.desktop \
             --icon-file "$icon" \
             --plugin qt \
@@ -449,6 +521,22 @@ jobs:
           ln -s usr/bin/eden-cli lichii/eden-cli
           tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" lichii
           ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
+          if tar -tzf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" | grep '/libvulkan\.so'; then
+            echo "::error::The package bundles the Vulkan loader"
+            exit 1
+          fi
+          # Both x86-64 packages must carry fsr4-vk and its licences.
+          if [ "$arch" = x86_64 ]; then
+            test "$(tar -tzf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" |
+              grep -cFx -e "lichii/usr/lib/$fsr4" -e lichii/usr/share/licenses/fsr4-vk/LICENSE \
+                -e lichii/usr/share/licenses/fsr4-vk/AMD-FidelityFX-SDK-license.md)" = 3
+            extract="$RUNNER_TEMP/appimage-check"
+            mkdir -p "$extract"
+            (cd "$extract" &&
+              "$GITHUB_WORKSPACE/$LDAI_OUTPUT" --appimage-extract "usr/lib/$fsr4" > /dev/null)
+            cmp "$extract/squashfs-root/usr/lib/$fsr4" "lichii/usr/lib/$fsr4"
+            nm -D --defined-only "lichii/usr/lib/$fsr4" | grep -w ffxCreateContext
+          fi
 
       - name: Package Windows binary
         if: startsWith(matrix.platform, 'windows')
@@ -459,7 +547,13 @@ jobs:
               throw "build/release/bin/$exe was not produced"
             }
           }
+          # Symbols ship as their own artifact, not in the release zip.
+          New-Item -ItemType Directory -Force build/release/symbols | Out-Null
+          Move-Item build/release/bin/*.pdb build/release/symbols/
           windeployqt --release --no-translations build/release/bin/lichii.exe
+          if (Get-ChildItem -Recurse build/release/bin -Filter 'GFSDK_*') {
+            throw 'build/release/bin holds Nsight Aftermath files, which must not ship'
+          }
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
       # programs load into the bundle, then the leftover Homebrew and build-tree search paths are
@@ -537,10 +631,19 @@ jobs:
         if: startsWith(matrix.platform, 'windows')
         uses: actions/upload-artifact@v7
         with:
-          name: lichii-${{ matrix.platform }}-${{ github.sha }}
+          name: lichii-${{ matrix.platform }}${{ inputs.nsight_aftermath && '-aftermath' || '' }}-${{ github.sha }}
           path: build/release/bin/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Upload Windows symbols
+        if: startsWith(matrix.platform, 'windows')
+        uses: actions/upload-artifact@v7
+        with:
+          name: symbols-${{ matrix.platform }}${{ inputs.nsight_aftermath && '-aftermath' || '' }}-${{ github.sha }}
+          path: build/release/symbols/
+          if-no-files-found: error
+          retention-days: 90
 
       # Both Linux files go in one artifact: the tar.gz and the AppImage.
       - name: Upload Linux binary

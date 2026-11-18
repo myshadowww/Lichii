@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -633,7 +632,7 @@ std::optional<NcaID> RegisteredCache::GetNcaIDFromMetadata(u64 title_id,
     if (type == ContentRecordType::Meta && meta_id.find(title_id) != meta_id.end())
         return meta_id.at(title_id);
 
-    const auto res1 = CheckMapForContentRecord(yuzu_meta, title_id, type);
+    const auto res1 = CheckMapForContentRecord(raw_meta, title_id, type);
     if (res1)
         return res1;
     return CheckMapForContentRecord(meta, title_id, type);
@@ -700,7 +699,7 @@ void RegisteredCache::ProcessFiles(const std::vector<NcaID>& ids) {
     }
 }
 
-void RegisteredCache::AccumulateYuzuMeta() {
+void RegisteredCache::AccumulateRawMeta() {
     const auto meta_dir = dir->GetSubdirectory("yuzu_meta");
     if (meta_dir == nullptr) {
         return;
@@ -712,7 +711,7 @@ void RegisteredCache::AccumulateYuzuMeta() {
         }
 
         CNMT cnmt(file);
-        yuzu_meta.insert_or_assign(cnmt.GetTitleID(), std::move(cnmt));
+        raw_meta.insert_or_assign(cnmt.GetTitleID(), std::move(cnmt));
     }
 }
 
@@ -723,7 +722,7 @@ void RegisteredCache::Refresh() {
 
     const auto ids = AccumulateFiles();
     ProcessFiles(ids);
-    AccumulateYuzuMeta();
+    AccumulateRawMeta();
 }
 
 RegisteredCache::RegisteredCache(VirtualDir dir_, ContentProviderParsingFunction parsing_function)
@@ -748,9 +747,9 @@ std::optional<u32> RegisteredCache::GetEntryVersion(u64 title_id) const {
         return meta_iter->second.GetTitleVersion();
     }
 
-    const auto yuzu_meta_iter = yuzu_meta.find(title_id);
-    if (yuzu_meta_iter != yuzu_meta.cend()) {
-        return yuzu_meta_iter->second.GetTitleVersion();
+    const auto raw_meta_iter = raw_meta.find(title_id);
+    if (raw_meta_iter != raw_meta.cend()) {
+        return raw_meta_iter->second.GetTitleVersion();
     }
 
     return std::nullopt;
@@ -782,7 +781,7 @@ void RegisteredCache::IterateAllMetadata(
             }
         }
     }
-    for (const auto& kv : yuzu_meta) {
+    for (const auto& kv : raw_meta) {
         const auto& cnmt = kv.second;
         for (const auto& rec : cnmt.GetContentRecords()) {
             if (GetFileAtID(rec.nca_id) != nullptr && filter(cnmt, rec)) {
@@ -936,7 +935,7 @@ InstallResult RegisteredCache::InstallEntry(const NCA& nca, TitleType type,
 
     std::memcpy(&c_rec.nca_id, &c_rec.hash, 16);
     const CNMT new_cnmt(header, opt_header, {c_rec}, {});
-    if (!RawInstallYuzuMeta(new_cnmt)) {
+    if (!RawInstallMeta(new_cnmt)) {
         return InstallResult::ErrorMetaFailed;
     }
     return RawInstallNCA(nca, copy, overwrite_if_exists, c_rec.nca_id);
@@ -961,7 +960,7 @@ InstallResult RegisteredCache::InstallEntry(const NCA& nca, const CNMTHeader& ba
     };
     const OptionalHeader opt_header{0, 0};
     const CNMT new_cnmt(header, opt_header, {base_record}, {});
-    if (!RawInstallYuzuMeta(new_cnmt)) {
+    if (!RawInstallMeta(new_cnmt)) {
         return InstallResult::ErrorMetaFailed;
     }
     return RawInstallNCA(nca, copy, overwrite_if_exists, base_record.nca_id);
@@ -1017,7 +1016,7 @@ bool RegisteredCache::RemoveExistingEntry(u64 title_id) const {
                          deleted_html || deleted_legal);
     }
 
-    // If patch entries for any program exist in yuzu meta, remove them
+    // If patch entries for any program exist in the yuzu_meta directory, remove them
     for (u8 i = 0; i < 0x10; i++) {
         const auto meta_dir = dir->CreateDirectoryRelative("yuzu_meta");
         const auto filename = GetCNMTName(TitleType::Update, title_id + i);
@@ -1099,7 +1098,7 @@ InstallResult RegisteredCache::RawInstallNCA(const NCA& nca, const VfsCopyFuncti
     return InstallResult::Success;
 }
 
-bool RegisteredCache::RawInstallYuzuMeta(const CNMT& cnmt) {
+bool RegisteredCache::RawInstallMeta(const CNMT& cnmt) {
     // Reasoning behind this method can be found in the comment for InstallEntry, NCA overload.
     const auto meta_dir = dir->CreateDirectoryRelative("yuzu_meta");
     const auto filename = GetCNMTName(cnmt.GetType(), cnmt.GetTitleID());
@@ -1120,9 +1119,9 @@ bool RegisteredCache::RawInstallYuzuMeta(const CNMT& cnmt) {
         }
     }
     Refresh();
-    return std::find_if(yuzu_meta.begin(), yuzu_meta.end(), [&cnmt](const std::pair<u64, CNMT>& kv) {
+    return std::find_if(raw_meta.begin(), raw_meta.end(), [&cnmt](const std::pair<u64, CNMT>& kv) {
         return kv.second.GetType() == cnmt.GetType() && kv.second.GetTitleID() == cnmt.GetTitleID();
-    }) != yuzu_meta.end();
+    }) != raw_meta.end();
 }
 
 ContentProviderUnion::~ContentProviderUnion() = default;
@@ -1282,7 +1281,8 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
     if (NupContainer::IsNupFile(file)) {
         // A NUP holds loose trees: its add-ons are served as decrypted add-on NCAs, newest
         // version per title (as in Eglantine-Community/Eglantine#724). Its updates are left to
-        // the NUP loader, which merges them into the program's RomFS.
+        // the NUP loader, which merges them into the program's RomFS. A Switch 2 Edition's
+        // add-ons can keep the Switch 1 application's ID (as in jpasqui/Eglantine#1).
         NupContainer nup{file};
         if (nup.GetStatus() != Loader::ResultStatus::Success) {
             return false;
@@ -1291,8 +1291,10 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
         std::map<u64, std::size_t> newest;
         for (std::size_t i = 0; i < packages.size(); ++i) {
             const auto& package = packages[i];
+            const u64 base = GetBaseTitleID(package.title_id);
             if (package.kind != NupContainer::PackageKind::Addon ||
-                (base_program_id && GetBaseTitleID(package.title_id) != *base_program_id)) {
+                (base_program_id && base != GetBaseTitleID(*base_program_id) &&
+                 base != GetSwitch1ApplicationID(GetBaseTitleID(*base_program_id)))) {
                 continue;
             }
             const auto [it, inserted] = newest.try_emplace(package.title_id, i);

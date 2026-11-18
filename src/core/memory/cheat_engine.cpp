@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <locale>
@@ -28,11 +27,11 @@ constexpr auto CHEAT_ENGINE_NS = std::chrono::nanoseconds{1000000000 / 12};
 std::string_view ExtractName(std::size_t& out_name_size, std::string_view data,
                              std::size_t start_index, char match) {
     auto end_index = start_index;
-    while (data[end_index] != match) {
+    while (end_index < data.size() && data[end_index] != match) {
         ++end_index;
-        if (end_index > data.size()) {
-            return {};
-        }
+    }
+    if (end_index >= data.size()) {
+        return {};
     }
 
     out_name_size = end_index - start_index;

@@ -35,7 +35,7 @@ struct CachedPages {
     std::map<DAddr, s32> counts;
 
     void UpdatePagesCachedCount(DAddr address, size_t size, s32 delta) {
-        constexpr u64 Page = Core::Memory::YUZU_PAGESIZE;
+        constexpr u64 Page = Core::Memory::LICHII_PAGESIZE;
         for (DAddr page = address / Page; page < (address + size + Page - 1) / Page; ++page) {
             counts[page * Page] += delta;
         }
@@ -178,7 +178,7 @@ TEST_CASE("NX2 reused device backing follows CPU pages through every GPU alias",
     auto& table = process.GetPageTable().GetImpl();
     table.Resize(24, 12);
 
-    constexpr u64 Page = Core::Memory::YUZU_PAGESIZE;
+    constexpr u64 Page = Core::Memory::LICHII_PAGESIZE;
     constexpr u64 Cpu = 0x10000;
     constexpr DAddr Device = 0x20000;
     constexpr DAddr OldAlias = 0x40000;

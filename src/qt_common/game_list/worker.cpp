@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,37 +56,6 @@ struct PendingRow {
         return std::exchange(items, {});
     }
 };
-
-QString GetGameListCachedObject(const std::string& filename, const std::string& ext,
-                                const std::function<QString()>& generator) {
-    if (!UISettings::values.cache_game_list || filename == "0000000000000000") {
-        return generator();
-    }
-
-    const auto path =
-        Common::FS::PathToUTF8String(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
-                                     "game_list" / fmt::format("{}.{}", filename, ext));
-
-    void(Common::FS::CreateParentDirs(path));
-
-    if (!Common::FS::Exists(path)) {
-        const auto str = generator();
-
-        QFile file{QString::fromStdString(path)};
-        if (file.open(QFile::WriteOnly)) {
-            file.write(str.toUtf8());
-        }
-
-        return str;
-    }
-
-    QFile file{QString::fromStdString(path)};
-    if (file.open(QFile::ReadOnly)) {
-        return QString::fromUtf8(file.readAll());
-    }
-
-    return generator();
-}
 
 std::pair<std::vector<u8>, std::string> GetGameListCachedObject(
     const std::string& filename, const std::string& ext,
@@ -172,6 +141,58 @@ bool HasSupportedFileExtension(const std::string& file_name) {
 
 bool IsExtractedNCAMain(const std::string& file_name) {
     return QFileInfo(QString::fromStdString(file_name)).fileName() == QStringLiteral("main");
+}
+
+// The folder a loose dump's row stands for: the one that holds its exefs (the game folder, or
+// base/ or updates/<id> when the game keeps several). A `main` outside an exefs folder stands for
+// its own folder.
+std::filesystem::path LooseDumpContentDir(const std::string& physical_name) {
+    const auto main_dir = std::filesystem::path(Common::FS::ToU8String(physical_name)).parent_path();
+    const QString dir_name =
+        QString::fromStdString(Common::FS::PathToUTF8String(main_dir.filename()));
+    if (dir_name.compare(QStringLiteral("exefs"), Qt::CaseInsensitive) == 0) {
+        return main_dir.parent_path();
+    }
+    return main_dir;
+}
+
+// Total size of the files in a loose dump's folder. Update folders directly inside it are left
+// out: they have rows of their own. Returns nothing when cancelled or when the folder can't be
+// read.
+std::optional<u64> LooseDumpFolderSize(const std::string& physical_name,
+                                       const std::atomic_bool& stop_requested) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(LooseDumpContentDir(physical_name),
+                                        fs::directory_options::skip_permission_denied, ec);
+    u64 total = 0;
+    for (; !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
+        if (stop_requested) {
+            return std::nullopt;
+        }
+        std::error_code entry_ec;
+        if (it->is_directory(entry_ec)) {
+            if (it.depth() == 0) {
+                const QString name =
+                    QString::fromStdString(Common::FS::PathToUTF8String(it->path().filename()));
+                if (name.compare(QStringLiteral("update"), Qt::CaseInsensitive) == 0 ||
+                    name.compare(QStringLiteral("updates"), Qt::CaseInsensitive) == 0) {
+                    it.disable_recursion_pending();
+                }
+            }
+            continue;
+        }
+        if (it->is_regular_file(entry_ec)) {
+            const auto size = it->file_size(entry_ec);
+            if (!entry_ec) {
+                total += size;
+            }
+        }
+    }
+    if (ec) {
+        return std::nullopt;
+    }
+    return total;
 }
 
 QString FormatGameName(const std::string& physical_name) {
@@ -265,12 +286,13 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
                                         const std::size_t size, const std::vector<u8>& icon,
                                         Loader::AppLoader& loader, u64 program_id,
                                         const PlayTime::PlayTimeManager& play_time_manager,
-                                        const FileSys::PatchManager& patch) {
+                                        const FileSys::PatchManager& patch,
+                                        GameListPatchCache& patch_cache) {
     auto const file_type = loader.GetFileType();
     auto const file_type_string = QString::fromStdString(Loader::GetFileTypeString(file_type));
 
-    QString patch_versions = GetGameListCachedObject(
-        fmt::format("{:016X}", patch.GetTitleID()), "pv.txt", [&patch, &loader] {
+    QString patch_versions = patch_cache.Get(
+        patch.GetTitleID(), UISettings::values.cache_game_list.GetValue(), [&patch, &loader] {
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
@@ -414,7 +436,7 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
         }
 
         auto entry = MakeGameListEntry(file->GetFullPath(), name, file->GetSize(), icon, *loader,
-                                       program_id, play_time_manager, patch);
+                                       program_id, play_time_manager, patch, patch_cache);
         auto pending = std::make_shared<PendingRow>(std::move(entry));
         RecordEvent([=](GameListModel* model) { model->AddEntry(pending->Release(), parent_dir); });
     }
@@ -445,6 +467,40 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
              file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ ||
              file_type == Loader::FileType::NUP || file_type == Loader::FileType::NX) &&
             !Loader::IsBootableGameContainer(file, file_type)) {
+            // Update- and DLC-only containers stay hidden. One whose programs cannot be
+            // decrypted is listed so the player sees that keys are missing.
+            const auto status = Loader::GetContainerProgramStatus(file, file_type);
+            const auto reason = Loader::GetResultStatusString(status);
+            if (!Loader::IsMissingKeyStatus(status)) {
+                if (status != Loader::ResultStatus::Success &&
+                    status != Loader::ResultStatus::ErrorNSPMissingProgramNCA &&
+                    status != Loader::ResultStatus::ErrorMissingBKTRBaseRomFS) {
+                    LOG_WARNING(Frontend, "Not listing {}: {}", physical_name, reason);
+                }
+                return;
+            }
+            LOG_WARNING(Frontend, "Listing {} without its content: {}", physical_name, reason);
+
+            const auto file_type_string =
+                QString::fromStdString(Loader::GetFileTypeString(file_type));
+            auto* const path_item = new GameListItemPath(
+                FormatGameName(physical_name), {},
+                QFileInfo(QString::fromStdString(physical_name)).completeBaseName(),
+                file_type_string, 0, 0, {});
+            path_item->setData(tr("%1\nDump current keys from your own console and install them "
+                                  "with Tools > Install Decryption Keys.")
+                                   .arg(QString::fromStdString(reason)),
+                               Qt::ToolTipRole);
+            auto pending = std::make_shared<PendingRow>(QList<QStandardItem*>{
+                path_item,
+                new GameListItem(file_type_string),
+                new GameListItemSize(Common::FS::GetSize(physical_name)),
+                new GameListItemPlayTime(0),
+                new GameListItem(tr("Decryption keys missing")),
+            });
+            RecordEvent([=](GameListModel* model) {
+                model->AddEntry(pending->Release(), parent_dir);
+            });
             return;
         }
 
@@ -501,12 +557,16 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 const u64 size = loose_dump ? 0 : Common::FS::GetSize(physical_name);
 
                 auto entry = MakeGameListEntry(physical_name, name, size, icon, *app_loader, id,
-                                               play_time_manager, patch);
+                                               play_time_manager, patch, patch_cache);
 
                 if (loose_dump) {
-                    entry[GameListModel::COLUMN_SIZE]->setText(tr("Not scanned"));
+                    entry[GameListModel::COLUMN_SIZE]->setText(tr("Calculating..."));
                     entry[GameListModel::COLUMN_SIZE]->setToolTip(
-                        tr("Folder size is not calculated during game discovery."));
+                        tr("The folder size is calculated after the game list is shown."));
+                    if (std::find(loose_dumps.begin(), loose_dumps.end(), physical_name) ==
+                        loose_dumps.end()) {
+                        loose_dumps.push_back(physical_name);
+                    }
                 }
                 auto pending = std::make_shared<PendingRow>(std::move(entry));
                 RecordEvent([=](GameListModel* model) {
@@ -552,7 +612,9 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
 void GameListWorker::run() {
     const auto started = std::chrono::steady_clock::now();
     watch_list.clear();
+    loose_dumps.clear();
     provider->ClearAllEntries();
+    patch_cache.Clear();
 
     const auto DirEntryReady = [&](GameListDir* game_list_dir) {
         auto pending = std::make_shared<std::unique_ptr<GameListDir>>(game_list_dir);
@@ -601,6 +663,7 @@ void GameListWorker::run() {
                      discovery.files.size(), discovery.directories.size(), discovery.skipped_romfs,
                      discovery.errors, stop_requested.load());
             ScanFileSystem(ScanTarget::FillManualContentProvider, discovery.files, game_list_dir);
+            patch_cache.Clear();
             ScanFileSystem(ScanTarget::PopulateGameList, discovery.files, game_list_dir);
         } else {
             AddTitlesToGameList(game_list_dir, parent_type);
@@ -613,5 +676,31 @@ void GameListWorker::run() {
                  std::chrono::steady_clock::now() - started).count(),
              watch_list.size(), stop_requested.load());
     RecordEvent([this](GameListModel* model) { model->DonePopulating(watch_list); });
+
+    // Loose dump folders are sized once the list is shown: walking their RomFS during discovery
+    // made the list slow to appear. A reload stops this through stop_requested.
+    const auto sizing_started = std::chrono::steady_clock::now();
+    std::size_t sized = 0;
+    for (const auto& physical_name : loose_dumps) {
+        if (stop_requested) {
+            break;
+        }
+        const auto size = LooseDumpFolderSize(physical_name, stop_requested);
+        if (!size) {
+            continue;
+        }
+        ++sized;
+        const QString game_path = FormatGameName(physical_name);
+        RecordEvent([game_path, bytes = *size](GameListModel* model) {
+            model->SetFolderSize(game_path, bytes);
+        });
+    }
+    if (!loose_dumps.empty()) {
+        LOG_INFO(Frontend, "Loose dump sizes: sized={} of {} elapsed_ms={} cancelled={}", sized,
+                 loose_dumps.size(),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - sizing_started).count(),
+                 stop_requested.load());
+    }
     processing_completed.Set();
 }

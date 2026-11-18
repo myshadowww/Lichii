@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -440,6 +439,15 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
             }
 
             if (!normalized_host_info.support_geometry_shader_passthrough) {
+                // The lowered shader copies only Position and the generics; the mask's other
+                // bits (InstanceId, VertexId, FrontFace...) would declare stage inputs a geometry
+                // shader can't have, BaseInstance without DrawParameters among them.
+                for (size_t i = 0; i < program.info.passthrough.mask.size(); ++i) {
+                    if (i < static_cast<size_t>(IR::Attribute::PositionX) ||
+                        i > static_cast<size_t>(IR::Attribute::Generic31W)) {
+                        program.info.passthrough.mask[i] = false;
+                    }
+                }
                 program.output_vertices = GetOutputTopologyVertices(program.output_topology);
                 LowerGeometryPassthrough(program, normalized_host_info);
             }
@@ -490,12 +498,13 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     if (!normalized_host_info.support_int64) {
         Optimization::LowerInt64ToInt32(program);
     }
-    if (!normalized_host_info.support_conditional_barrier) {
-        Optimization::ConditionalBarrierPass(program);
-    }
     Optimization::SsaRewritePass(program);
 
     Optimization::ConstantPropagationPass(env, program);
+    if (!normalized_host_info.support_conditional_barrier) {
+        Optimization::ConditionalBarrierPass(program,
+                                             normalized_host_info.max_compute_shared_memory_size);
+    }
 
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
@@ -513,6 +522,17 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         Optimization::VerificationPass(program);
     }
     Optimization::CollectShaderInfoPass(env, program);
+    // Adreno's proprietary driver culls 8x8 low-resolution-Z tiles with stale data in Ocarina
+    // (checkerboard holes in depth, sky showing through near geometry and water). Writing
+    // FragDepth = FragCoord.z from every fragment shader makes the driver turn LRZ off.
+    if (host_info.needs_lrz_disable && program.stage == Stage::Fragment &&
+        !program.info.stores_frag_depth && !program.blocks.empty()) {
+        IR::Block& entry{*program.blocks.front()};
+        IR::IREmitter ir{entry, entry.begin()};
+        ir.SetFragDepth(ir.GetAttribute(IR::Attribute::PositionZ));
+        program.info.stores_frag_depth = true;
+        program.info.loads.Set(IR::Attribute::PositionZ, true);
+    }
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {
@@ -557,10 +577,15 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.loads.mask |= vertex_b.info.loads.mask;
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
-    Optimization::JoinTextureInfo(result.info, vertex_b.info);
-    // The two halves are one stage: their storage buffers share its limit.
-    Optimization::JoinStorageInfo(result.info, vertex_b.info,
-                                  Optimization::StorageBufferLimit(host_info));
+    // Vertex B's descriptors and storage buffers join Vertex A's, which keep their indices; its
+    // handle programs and the instructions of its blocks read them where they are here. The two
+    // halves are one stage: their storage buffers share its limit.
+    const auto storage_bindings{Optimization::JoinStorageInfo(
+        result.info, vertex_b.info, Optimization::StorageBufferLimit(host_info))};
+    const auto descriptors{
+        Optimization::JoinTextureInfo(result.info, vertex_b.info, storage_bindings)};
+    Optimization::RemapTextureDescriptors(vertex_b, descriptors);
+    Optimization::RemapStorageBindings(vertex_b, storage_bindings);
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);

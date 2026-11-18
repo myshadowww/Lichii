@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -105,6 +104,11 @@ public:
         return uses_local_memory;
     }
 
+    /// The vertex shader is the last pre-rasterization stage and puts every vertex on the far plane
+    [[nodiscard]] bool OnFarPlane() const noexcept {
+        return on_far_plane;
+    }
+
     [[nodiscard]] bool IsBuilt() noexcept;
 
     template <typename Spec>
@@ -155,6 +159,7 @@ private:
     bool use_storage_buffers{};
     bool writes_global_memory{};
     bool uses_local_memory{};
+    bool on_far_plane{};
 
     static constexpr std::size_t XFB_ENTRY_STRIDE = 3;
     GLsizei num_xfb_attribs{};

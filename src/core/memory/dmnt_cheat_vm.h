@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
+#include <utility>
 #include <variant>
 #include <vector>
 #include <memory>
@@ -266,7 +266,7 @@ struct CheatVmOpcode {
 
 class DmntCheatVm {
 public:
-    /// Helper Type for DmntCheatVm <=> yuzu Interface
+    /// Helper Type for DmntCheatVm <=> Lichii Interface
     class Callbacks {
     public:
         virtual ~Callbacks();
@@ -299,6 +299,18 @@ public:
 
     bool LoadProgram(const std::vector<CheatEntry>& cheats);
     void Execute(const CheatProcessMetadata& metadata);
+
+    struct MainStore {
+        std::size_t cheat;
+        u64 begin;
+        u64 end;
+    };
+    // The main module ranges, [begin, end) offsets, the enabled cheats' static stores write
+    // whatever their conditions, with the index of the cheat each comes from. The cheats run as
+    // one program, so a register one cheat loads offsets the stores of the next. A store's offset
+    // register is followed through unconditional static loads; stores whose offset register
+    // anything else may have changed, and stores inside loops, are left out.
+    static std::vector<MainStore> MainStaticStores(const std::vector<CheatEntry>& cheats);
 
 private:
     std::unique_ptr<Callbacks> callbacks;

@@ -10,7 +10,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
 
@@ -27,7 +26,7 @@ TEST_CASE("Info lines reach the log file without an Error line or an explicit fl
 
     const std::string marker = "log flush marker " + stamp;
     LOG_INFO(Log, "{}", marker);
-    const fs::path path = dir / LOG_FILE;
+    const fs::path path = Common::Log::FilePath();
     REQUIRE(path.parent_path() == dir);
 
     bool found = false;

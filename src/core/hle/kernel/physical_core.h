@@ -1,16 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 #include "core/arm/arm_interface.h"
 
@@ -30,8 +31,8 @@ public:
     PhysicalCore(KernelCore& kernel, std::size_t core_index);
     ~PhysicalCore();
 
-    YUZU_NON_COPYABLE(PhysicalCore);
-    YUZU_NON_MOVEABLE(PhysicalCore);
+    LICHII_NON_COPYABLE(PhysicalCore);
+    LICHII_NON_MOVEABLE(PhysicalCore);
 
     // Execute guest code running on the given thread.
     void RunThread(KernelCore& kernel, KThread* thread);
@@ -68,12 +69,24 @@ public:
 
 private:
     const std::size_t m_core_index;
+    // EDEN_NX2_IDLE_STATS=1: every 10 s, each core logs how often it went idle, how many of those
+    // periods its poll caught, and how long blocked periods took to wake after the interrupt.
+    const bool m_idle_stats;
     std::mutex m_guard;
     std::condition_variable m_on_interrupt;
     Core::ArmInterface* m_arm_interface{};
     KThread* m_current_thread{};
     std::atomic<bool> m_is_interrupted{};
     bool m_is_single_core{};
+
+    std::chrono::nanoseconds m_idle_poll{};
+    // EDEN_NX2_IDLE_STATS: when Interrupt last ran, and this core's idle periods since m_stats_start.
+    std::atomic<std::chrono::steady_clock::rep> m_interrupt_time{};
+    std::chrono::steady_clock::time_point m_stats_start{};
+    u64 m_stats_idles{};
+    u64 m_stats_polled{};
+    std::chrono::nanoseconds m_stats_poll_sum{};
+    std::vector<std::chrono::nanoseconds> m_stats_blocked_wakes;
 };
 
 } // namespace Kernel

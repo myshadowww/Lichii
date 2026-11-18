@@ -22,6 +22,9 @@
 #include "video_core/host_shaders/ocarina_dlss_effects_base_comp_spv.h"
 #include "video_core/host_shaders/ocarina_dlss_effects_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#ifdef EGLANTINE_STREAMLINE
+#include "video_core/vulkan_common/streamline.h"
+#endif
 #ifdef EGLANTINE_NVIDIA_DLSS
 #include "video_core/renderer_vulkan/vk_nvidia_dlss.h"
 #include "video_core/vulkan_common/nvidia_dlss.h"
@@ -650,11 +653,21 @@ vk::ImageView CreateOcarinaView(const Device& device, VkImage image, VkFormat fo
     });
 }
 
+// DLSS Frame Generation copies the motion vectors when they are tagged.
+VkImageUsageFlags FrameGenCopyUsage() {
+#ifdef EGLANTINE_STREAMLINE
+    return Streamline::FrameGenSession() ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0;
+#else
+    return 0;
+#endif
+}
+
 struct OcarinaFrameSlot {
     OcarinaFrameSlot(const Device& device, MemoryAllocator& allocator, VkExtent2D extent_)
         : extent{extent_}, motion{CreateOcarinaImage(
                               allocator, extent, MOTION_FORMAT, VK_IMAGE_USAGE_STORAGE_BIT |
-                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
+                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                  FrameGenCopyUsage())},
           motion_view{CreateOcarinaView(device, *motion, MOTION_FORMAT)},
           color{CreateOcarinaImage(allocator, extent, LIVE_COLOR_FORMAT,
                                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)},
@@ -922,7 +935,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
                             VkExtent2D output_extent, VkExtent2D target_extent,
                             const Matrix& current, const Matrix& previous,
                             const OcarinaActorMesh& mesh, VkImage depth_image, u64 frame,
-                            std::array<f32, 2> jitter) {
+                            std::array<f32, 2> jitter, [[maybe_unused]] VkExtent2D depth_extent) {
     auto& state = *impl;
     if (state.last_frame == frame || state.Failed()) {
         return false;
@@ -996,7 +1009,8 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
     if (state.dlss && !state.dlss->Upscale({
             .color = {*resources.color_view, *resources.color, LIVE_COLOR_FORMAT, COLOR_RANGE,
                       VK_IMAGE_ASPECT_COLOR_BIT},
-            .depth = {depth, depth_image, VK_FORMAT_D32_SFLOAT, DEPTH_RANGE, VK_IMAGE_ASPECT_DEPTH_BIT},
+            .depth = {depth, depth_image, VK_FORMAT_D32_SFLOAT, DEPTH_RANGE,
+                      VK_IMAGE_ASPECT_DEPTH_BIT, depth_extent},
             .motion_vectors = {*resources.motion_view, *resources.motion, MOTION_FORMAT,
                                COLOR_RANGE, VK_IMAGE_ASPECT_COLOR_BIT},
             .render_size = extent,
@@ -1006,6 +1020,7 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
             .reset = reset,
             .depth_inverted = false,
             .hdr = false,
+            .camera = NvidiaDlssUpscaler::Inputs::Camera{current, *transform},
         })) {
         state.scheduler.InvalidateState();
         return false;
@@ -1105,9 +1120,12 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
 #ifdef EGLANTINE_NVIDIA_DLSS
     dlss_available = NvidiaDlss::IsAvailable();
 #endif
+    // Balanced's scene is padded, which only DLSS takes.
+    const auto scale = Settings::AppliedOcarinaRenderScale();
+    const bool render_scaled = scale && *scale != Settings::NvidiaDlssQuality::Balanced;
     const auto backend = VideoCommon::SelectOcarinaUpscaler(
         Settings::values.ocarina_fsr.GetValue(), Settings::GetNvidiaDlssRuntimeSettings().enabled,
-        dlss_available, value ? value : "");
+        dlss_available, render_scaled, value ? value : "");
     if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {
         return VideoCommon::OcarinaUpscaleBackend::Native;
     }

@@ -213,6 +213,13 @@ TEST_CASE("Prepared shader infos roundtrip and refuse truncation and invalid val
           "[video_core][preparation]") {
     Shader::Info info{};
     info.is_mesh = true;
+    info.position_on_far_plane = true;
+    info.demoted_conditional_barrier = true;
+    info.uses_barrier_vote = true;
+    info.binds_unmapped_pointer_word = true;
+    auto& texture = info.texture_descriptors.emplace_back();
+    texture.is_descriptor_array = true;
+    texture.handle_is_pointer_word = true;
     info.frag_color_components[2] = 11;
     info.storage_buffers_descriptors.emplace_back();
     info.storage_buffers_descriptors.back().cbuf_index = 3;
@@ -224,6 +231,7 @@ TEST_CASE("Prepared shader infos roundtrip and refuse truncation and invalid val
     std::span<const u8> input(bytes);
     REQUIRE(Shader::DeserializeInfo(input, restored));
     REQUIRE(input.empty());
+    REQUIRE(restored == info);
     std::vector<u8> roundtrip;
     Shader::SerializeInfo(restored, roundtrip);
     REQUIRE(bytes == roundtrip);

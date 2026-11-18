@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-FileCopyrightText: 2021 Skyline Team and Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -13,7 +12,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include "common/container/unordered_set.h"
 #include <vector>
 
 #include "common/address_space.h"
@@ -119,8 +117,6 @@ private:
     };
     static_assert(sizeof(IoctlRemapEntry) == 20, "IoctlRemapEntry is incorrect size");
 
-    ::Common::unordered_set<s64_le> map_buffer_offsets{};
-
     struct IoctlMapBufferEx {
         MappingFlags flags{}; // bit0: fixed_offset, bit2: cacheable
         u32_le kind{};        // -1 is default
@@ -203,8 +199,8 @@ private:
     std::mutex mutex; //!< Locks all AS operations
 
     struct VM {
-        static constexpr u32 YUZU_PAGESIZE{0x1000};
-        static constexpr u32 PAGE_SIZE_BITS{static_cast<u32>(std::countr_zero<u32>(YUZU_PAGESIZE))};
+        static constexpr u32 LICHII_PAGESIZE{0x1000};
+        static constexpr u32 PAGE_SIZE_BITS{static_cast<u32>(std::countr_zero<u32>(LICHII_PAGESIZE))};
 
         static constexpr u32 SUPPORTED_BIG_PAGE_SIZES{0x30000};
         static constexpr u32 DEFAULT_BIG_PAGE_SIZE{0x20000};
@@ -226,7 +222,7 @@ private:
         bool initialised{};
         bool absolute_big_page_limit{}; //!< Switch 2 layout: big-page limit is va_range_end
     } vm;
-    std::unique_ptr<Tegra::MemoryManager> gmmu;
+    std::shared_ptr<Tegra::MemoryManager> gmmu;
 
     struct IoctlNx2SyncpointShimInfo {
         u64_le address;

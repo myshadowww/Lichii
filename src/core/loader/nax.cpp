@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/file_sys/content_archive.h"
@@ -90,6 +89,11 @@ ResultStatus AppLoader_NAX::ReadLogo(std::vector<u8>& buffer) {
 
 ResultStatus AppLoader_NAX::ReadNSOModules(Modules& modules) {
     return nca_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_NAX::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    return nca_loader->ReadMainBuildId(system, build_id);
 }
 
 } // namespace Loader

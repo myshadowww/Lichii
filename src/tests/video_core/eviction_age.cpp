@@ -23,40 +23,48 @@ TEST_CASE("The collector keeps recently used images until the device runs short"
     // 7678 MiB budget. Aggressive (10), high priority (25) and normal (50) modes all wait.
     // (The limit here is the budget alone; the cache also takes its margins and host commit off.)
     for (const u64 mode_age : {u64{10}, u64{25}, u64{50}}) {
-        REQUIRE(EvictionAge(mode_age, 6268 * MiB, 7678 * MiB, false) == MinEvictionAge);
+        REQUIRE(EvictionAge(mode_age, 0, 6268 * MiB, 7678 * MiB, false) == MinEvictionAge);
     }
-    REQUIRE(EvictionAge(600, 6268 * MiB, 7678 * MiB, false) == 600);
+    REQUIRE(EvictionAge(600, 0, 6268 * MiB, 7678 * MiB, false) == 600);
     // At the limit, after a failed image, or with no limit to compare: the mode's own age.
-    REQUIRE(EvictionAge(10, 7678 * MiB, 7678 * MiB, false) == 10);
-    REQUIRE(EvictionAge(10, 7900 * MiB, 7678 * MiB, false) == 10);
-    REQUIRE(EvictionAge(25, 6268 * MiB, 7678 * MiB, true) == 25);
-    REQUIRE(EvictionAge(50, 6268 * MiB, 0, false) == 50);
+    REQUIRE(EvictionAge(10, 0, 7678 * MiB, 7678 * MiB, false) == 10);
+    REQUIRE(EvictionAge(10, 0, 7900 * MiB, 7678 * MiB, false) == 10);
+    REQUIRE(EvictionAge(25, 0, 6268 * MiB, 7678 * MiB, true) == 25);
+    REQUIRE(EvictionAge(50, 0, 6268 * MiB, 0, false) == 50);
 }
 
-TEST_CASE("Texture GC diagnostic retention yields to every pressure path",
+TEST_CASE("EDEN_NX2_TC_MIN_AGE can't stop eviction when the device runs short",
           "[video_core][texture_cache][eviction_age]") {
-    using VideoCommon::TextureGcEffectiveMinAge;
-    constexpr u64 limit = 7678 * MiB;
-    constexpr u64 usage = 6268 * MiB;
-    for (const u64 diagnostic : {u64{600}, u64{9000}, (std::numeric_limits<u64>::max)()}) {
-        // Routine collection still honors diagnostics, with and without a device budget.
-        CHECK(TextureGcEffectiveMinAge(50, diagnostic, usage, limit, false, false) == diagnostic);
-        CHECK(TextureGcEffectiveMinAge(25, diagnostic, usage, 0, false, false) == diagnostic);
-        // A capped critical threshold can request aggressive collection with budget to spare.
-        // Keep #1435's adaptive floor, but drop the diagnostic extension.
-        CHECK(TextureGcEffectiveMinAge(10, diagnostic, usage, limit, false, true) == 150);
-        CHECK(TextureGcEffectiveMinAge(10, diagnostic, usage, 0, false, true) == 10);
-        // The first, non-aggressive pass must already ignore diagnostics after allocation failure.
-        CHECK(TextureGcEffectiveMinAge(25, diagnostic, usage, limit, true, false) == 25);
-        CHECK(TextureGcEffectiveMinAge(10, diagnostic, usage, limit, true, true) == 10);
-        // Exact budget equality and one byte over are pressure even in a non-aggressive pass.
-        CHECK(TextureGcEffectiveMinAge(25, diagnostic, limit, limit, false, false) == 25);
-        CHECK(TextureGcEffectiveMinAge(50, diagnostic, limit + 1, limit, false, false) == 50);
-        CHECK(TextureGcEffectiveMinAge(25, diagnostic, limit - 1, limit, false, false) == diagnostic);
+    using VideoCommon::EvictionAge;
+    // #1290: Ocarina of Time on a 16 GB card with a leftover 600-frame override filled the heap
+    // and crashed. While there is room the override still applies.
+    REQUIRE(EvictionAge(10, 600, 6268 * MiB, 7678 * MiB, false) == 600);
+    REQUIRE(EvictionAge(10, 600, 6268 * MiB, 7678 * MiB, false, true) ==
+            VideoCommon::MinEvictionAge);
+    REQUIRE(EvictionAge(10, 600, 7678 * MiB, 7678 * MiB, false) == 10);
+    REQUIRE(EvictionAge(10, 600, 6268 * MiB, 7678 * MiB, true) == 10);
+    REQUIRE(EvictionAge(10, 9000, 6268 * MiB, 0, false) == 10);
+}
+
+TEST_CASE("The retention limit follows the lowest budget read lately",
+          "[video_core][texture_cache][eviction_age]") {
+    using VideoCommon::RetentionBudget;
+    using VideoCommon::RetentionBudgetRise;
+    // Ocarina of Time at 2x on a 16 GB card: the budget falls from 15226 to 14158 MiB and back.
+    REQUIRE(RetentionBudget(0, 15226 * MiB) == 15226 * MiB);
+    REQUIRE(RetentionBudget(15226 * MiB, 14158 * MiB) == 14158 * MiB);
+    // Back up at the next check, the held budget rises one step at a time.
+    REQUIRE(RetentionBudget(14158 * MiB, 15226 * MiB) == 14158 * MiB + RetentionBudgetRise);
+    u64 held = 14158 * MiB;
+    u64 checks = 0;
+    while (held < 15226 * MiB) {
+        held = RetentionBudget(held, 15226 * MiB);
+        ++checks;
     }
-    CHECK(TextureGcEffectiveMinAge(50, 0, usage, limit, false, false) == 150);
-    CHECK(TextureGcEffectiveMinAge(25, 20, usage, limit, false, false) == 150);
-    CHECK(TextureGcEffectiveMinAge(50, 20, usage, 0, false, false) == 50);
+    REQUIRE(held == 15226 * MiB);
+    REQUIRE(checks == 67);
+    // A budget that doesn't move is followed as is.
+    REQUIRE(RetentionBudget(7678 * MiB, 7678 * MiB) == 7678 * MiB);
 }
 
 TEST_CASE("Texture GC age cutoff skips early frames and includes the exact age boundary",

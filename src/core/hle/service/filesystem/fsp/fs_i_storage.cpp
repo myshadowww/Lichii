@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -9,6 +8,8 @@
 #include <thread>
 
 #include "common/settings.h"
+#include "core/core.h"
+#include "core/file_sys/common_funcs.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
@@ -18,6 +19,8 @@ namespace Service::FileSystem {
 
 IStorage::IStorage(Core::System& system_, FileSys::VirtualFile backend_)
     : ServiceFramework{system_, "IStorage"}, backend(std::move(backend_)) {
+    throttle = ReadThrottle::For(Settings::CurrentProgramIsSwitch2(),
+                                 FileSys::GetBaseTitleID(system.GetApplicationProcessProgramID()));
     static const FunctionInfo functions[] = {
         {0, D<&IStorage::Read>, "Read"},
         {1, nullptr, "Write"},
@@ -38,18 +41,13 @@ Result IStorage::Read(
     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
     R_UNLESS(static_cast<u64>(length) <= out_bytes.size(), FileSys::ResultInvalidSize);
 
-    // The 40 MB/s throttle emulates a Switch 1 card (Eden cbd4cf2d8c, Mario Strikers' intro).
-    // Switch 2 storage is many times faster, and a Switch 2 title that streams a movie with
-    // hundreds of reads a second (Ocarina of Time's opening: 300-460) sleeps most of each second
-    // on the thread that also hands decoder images back, so its video falls seconds behind.
-    if (!Settings::CurrentProgramIsSwitch2()) {
+    if (throttle.bytes_per_second > 0) {
         const auto now = std::chrono::steady_clock::now();
         if (now < next_read_tick) {
             std::this_thread::sleep_for(next_read_tick - now);
         }
         next_read_tick = std::chrono::steady_clock::now() +
-                         std::chrono::nanoseconds{std::min(length, MaxChargedReadSize) *
-                                                  1'000'000'000 / ReadBytesPerSecond};
+                         throttle.Delay(std::min(length, static_cast<s64>(out_bytes.size())));
     }
 
     // Read the data from the Storage backend

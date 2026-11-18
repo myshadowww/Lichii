@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include "common/container/unordered_map.h"
@@ -94,6 +94,8 @@ protected:
         size_t ref_count;
         size_t storage_id;
         Tegra::MemoryManager* gpu_memory;
+        /// nvdrv owns the memory manager and destroys it when the address space is closed.
+        std::weak_ptr<Tegra::MemoryManager> owner;
     };
     ::Common::unordered_map<size_t, AddressSpaceRef> address_spaces;
     mutable std::mutex config_mutex;

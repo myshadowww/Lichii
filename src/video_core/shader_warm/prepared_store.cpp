@@ -17,7 +17,7 @@ namespace {
 
 // Header: magic, u32 identity size, identity. Entry: u32 tag, u32 id, u32 frame size, frame
 // (u64 CityHash64 of the payload, payload). A blob's payload starts with its 16-byte content key.
-constexpr std::string_view Magic = "LCHPREP3";
+constexpr std::string_view Magic = "LCHPREP4";
 constexpr u32 TagBlob = 0;
 constexpr u32 TagRecord = 1;
 constexpr u32 EntryHeader = 12;

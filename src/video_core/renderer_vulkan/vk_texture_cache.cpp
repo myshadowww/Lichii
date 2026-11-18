@@ -1,24 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
-#include <limits>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdlib>
+#include <limits>
+#include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <span>
+#include <string_view>
 #include <tuple>
-#include <memory>
 #include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
-#include <bit>
-#include <numeric>
 #include "common/alignment.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
@@ -570,6 +570,19 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
         if (device.IsKhrImageFormatListSupported()) {
             image_ci.pNext = &image_format_list;
         }
+    }
+    VkImageCompressionControlEXT compression_control{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
+        .pNext = image_ci.pNext,
+        .flags = VK_IMAGE_COMPRESSION_DISABLED_EXT,
+        .compressionControlPlaneCount = 0,
+        .pFixedRateFlags = nullptr,
+    };
+    // Depth keeps its compression: disabling it would also drop HTILE (HiZ).
+    if (device.DisablesColorCompression() &&
+        VideoCore::Surface::GetFormatType(info.format) ==
+            VideoCore::Surface::SurfaceType::ColorTexture) {
+        image_ci.pNext = &compression_control;
     }
     if (unbacked) {
         if (vk::Image image = allocator.CreateUnbackedImage(image_ci, aliased)) {
@@ -1505,6 +1518,162 @@ void TextureCacheRuntime::BarrierFeedbackLoop() {
     scheduler.RequestOutsideRenderPassOperationContext();
 }
 
+VkImageView TextureCacheRuntime::ResolveColorFeedback(const ImageView& sampled,
+                                                      const ImageView& attachment) {
+    const Image* image = sampled.BackingImage();
+    const auto is_2d = [](const ImageView& view) {
+        return view.type == VideoCommon::ImageViewType::e2D ||
+               view.type == VideoCommon::ImageViewType::e2DArray ||
+               view.type == VideoCommon::ImageViewType::Rect;
+    };
+    if (!image || !sampled.ImageHandle() || sampled.ImageHandle() != attachment.ImageHandle() ||
+        !is_2d(sampled) || !is_2d(attachment) || sampled.Samples() != VK_SAMPLE_COUNT_1_BIT ||
+        attachment.Samples() != VK_SAMPLE_COUNT_1_BIT ||
+        sampled.format != PixelFormat::A2B10G10R10_UNORM || attachment.format != sampled.format ||
+        image->info.format != sampled.format || sampled.range.extent.levels != 1 ||
+        sampled.range.extent.layers != 1 || attachment.range != sampled.range ||
+        sampled.range.base.level < 0 || sampled.range.base.layer < 0 ||
+        static_cast<u32>(sampled.range.base.level) >= image->HostMipLevels() ||
+        sampled.range.base.layer >= image->info.resources.layers ||
+        image->info.type != ImageType::e2D || image->host_level_offset != 0 ||
+        image->info.is_sparse || image->IsRescaled() ||
+        True(image->flags & (ImageFlagBits::Converted | ImageFlagBits::Unbacked |
+                             ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles)) ||
+        sampled.ImageHandle() != image->Handle() || sampled.size.depth != 1 ||
+        sampled.size.width == 0 || sampled.size.height == 0 ||
+        !(image->UsageFlags() & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        return VK_NULL_HANDLE;
+    }
+    constexpr VkFormat format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    if (!device.IsFormatSupported(format,
+                                  VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                      VK_FORMAT_FEATURE_TRANSFER_DST_BIT,
+                                  FormatType::Optimal)) {
+        return VK_NULL_HANDLE;
+    }
+    const VkImage src = sampled.ImageHandle();
+    const VkImageSubresourceRange src_range =
+        MakeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT, sampled.range);
+
+    ColorFeedbackSnapshot* snapshot{};
+    const VkComponentMapping swizzle = sampled.Swizzle();
+    for (auto& candidate : color_feedback_snapshots) {
+        if (!candidate.used_this_frame && scheduler.IsFree(candidate.tick) &&
+            candidate.size == sampled.size && candidate.swizzle.r == swizzle.r &&
+            candidate.swizzle.g == swizzle.g && candidate.swizzle.b == swizzle.b &&
+            candidate.swizzle.a == swizzle.a) {
+            snapshot = &candidate;
+            break;
+        }
+    }
+    if (!snapshot) {
+        ColorFeedbackSnapshot created{
+            .image = memory_allocator.TryCreateImage(VkImageCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = format,
+                .extent = {sampled.size.width, sampled.size.height, 1},
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            }),
+            .view = {},
+            .size = sampled.size,
+            .swizzle = swizzle,
+        };
+        // Out of memory: sample the attachment as before rather than an unbacked copy.
+        if (!created.image || created.image.IsUnbacked()) {
+            return VK_NULL_HANDLE;
+        }
+        created.view = device.GetLogical().CreateImageView(VkImageViewCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = *created.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = format,
+            .components = swizzle,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        });
+        color_feedback_snapshots.push_back(std::move(created));
+        snapshot = &color_feedback_snapshots.back();
+    }
+    scheduler.RequestOutsideRenderPassOperationContext();
+    snapshot->used_this_frame = true;
+    snapshot->unused_frames = 0;
+    const VkImage dst = *snapshot->image;
+    const VkImageCopy copy{
+        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, src_range.baseMipLevel,
+                           src_range.baseArrayLayer, 1},
+        .srcOffset = {},
+        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+        .dstOffset = {},
+        .extent = {sampled.size.width, sampled.size.height, 1},
+    };
+    scheduler.Record([src, dst, src_range, copy](vk::CommandBuffer cmdbuf) {
+        const VkImageSubresourceRange dst_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const std::array before{
+            VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = src,
+                .subresourceRange = src_range,
+            },
+            VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = 0,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = dst,
+                .subresourceRange = dst_range,
+            },
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, nullptr, nullptr, before);
+        cmdbuf.CopyImage(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy);
+        const std::array after{
+            VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = src,
+                .subresourceRange = src_range,
+            },
+            VkImageMemoryBarrier{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = dst,
+                .subresourceRange = dst_range,
+            },
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                               0, nullptr, nullptr, after);
+    });
+    return *snapshot->view;
+}
+
 ByteAddressedShadow TextureCacheRuntime::CreateByteAddressedShadow(const ImageView& view) {
     const auto* image{view.BackingImage()};
     const auto extent{PackedByteAddressedExtent(view.size.width, view.size.height)};
@@ -1858,13 +2027,14 @@ bool TextureCacheRuntime::UsesNvidiaDlss() const {
 }
 
 std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput(
-    ImageView& input, ImageView& output) {
+    ImageView& input, ImageView& output, std::optional<std::array<u32, 2>> input_region) {
     if (!dlss_network_probe) {
         dlss_network_probe = std::make_unique<DlssNetworkProbe>(
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
     }
     return dlss_network_probe->Probe(input.Handle(Shader::TextureType::Color2D),
-                                     output.Handle(Shader::TextureType::Color2D));
+                                     output.Handle(Shader::TextureType::Color2D),
+                                     input_region.value_or(std::array<u32, 2>{}));
 }
 
 /// Try depth-aware FSR presentation with the supplied motion and jitter, returning false when
@@ -2579,9 +2749,13 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     const VkImage src_image = src.ImageHandle();
     const VkImageSubresourceLayers dst_layers = MakeSubresourceLayers(&dst);
     const VkImageSubresourceLayers src_layers = MakeSubresourceLayers(&src);
+    // A blit inside one image (a mip chain, say) keeps it in GENERAL: moving the whole image to
+    // TRANSFER_DST_OPTIMAL would leave the source levels in another layout than the blit reads.
+    const VkImageLayout dst_layout =
+        src_image == dst_image ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([filter, dst_region, src_region, dst_image, src_image, dst_layers, src_layers,
-                      aspect_mask, is_resolve](vk::CommandBuffer cmdbuf) {
+                      aspect_mask, is_resolve, dst_layout](vk::CommandBuffer cmdbuf) {
         const std::array read_barriers{
             VkImageMemoryBarrier{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2611,7 +2785,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                                  VK_ACCESS_TRANSFER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                 .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = dst_layout,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .image = dst_image,
@@ -2632,7 +2806,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
                              VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout = dst_layout,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -2648,14 +2822,13 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, VK_PIPELINE_STAGE_TRANSFER_BIT,
                        0, nullptr, nullptr, read_barriers);
         if (is_resolve) {
-            cmdbuf.ResolveImage(src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image,
-                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            cmdbuf.ResolveImage(src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, dst_layout,
                                 MakeImageResolve(dst_region, src_region, dst_layers, src_layers));
         } else {
             const bool is_linear = filter == Fermi2D::Filter::Bilinear;
             const VkFilter vk_filter = is_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
             cmdbuf.BlitImage(
-                src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                src_image, VK_IMAGE_LAYOUT_GENERAL, dst_image, dst_layout,
                 MakeImageBlit(dst_region, src_region, dst_layers, src_layers), vk_filter);
         }
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
@@ -3081,6 +3254,11 @@ u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }
 
+u32 TextureCacheRuntime::GetMaxScaledExtent() const noexcept {
+    return (std::min)({device.GetMaxImageDimension2D(), device.GetMaxFramebufferWidth(),
+                       device.GetMaxFramebufferHeight()});
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -3182,6 +3360,16 @@ void TextureCacheRuntime::TickFrame() {
 #endif
         last_dlss_enabled = dlss_enabled;
     }
+    // Descriptor allocation/capture can submit between the copy and the draw. Retire at the
+    // frame boundary, after all consuming draws, rather than using the copy's submission tick.
+    for (auto& snapshot : color_feedback_snapshots) {
+        if (std::exchange(snapshot.used_this_frame, false)) {
+            snapshot.tick = scheduler.CurrentTick();
+        }
+    }
+    std::erase_if(color_feedback_snapshots, [this](ColorFeedbackSnapshot& snapshot) {
+        return scheduler.IsFree(snapshot.tick) && ++snapshot.unused_frames > 60;
+    });
     while (!pending_byte_addressed_shadows.empty() &&
            scheduler.IsFree(pending_byte_addressed_shadows.front().tick)) {
         pending_byte_addressed_shadows.pop_front();
@@ -3302,7 +3490,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         flags |= VideoCommon::ImageFlagBits::Converted;
         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
     }
-    if (runtime->device.HasDebuggingToolAttached()) {
+    if (runtime->device.NamesObjects()) {
         original_image.SetObjectNameEXT(VideoCommon::Name(*this).c_str());
     }
     current_image = &Image::original_image;
@@ -3755,6 +3943,39 @@ u32 Image::HostMipLevels() const noexcept {
     return HostMipCount(info) - host_level_offset;
 }
 
+PixelFormat Image::HostFormat() const {
+    if (False(flags & ImageFlagBits::Converted)) {
+        return info.format;
+    }
+    const bool srgb = IsPixelFormatSRGB(info.format);
+    switch (AstcHostFormat(runtime->device, info)
+                .value_or(MaxwellToVK::SurfaceFormat(runtime->device, FormatType::Optimal, false,
+                                                     info.format)
+                              .format)) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+        return srgb ? PixelFormat::BC1_RGBA_SRGB : PixelFormat::BC1_RGBA_UNORM;
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK:
+        return srgb ? PixelFormat::BC3_SRGB : PixelFormat::BC3_UNORM;
+    case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        return srgb ? PixelFormat::A8B8G8R8_SRGB : PixelFormat::A8B8G8R8_UNORM;
+    case VK_FORMAT_R8_UNORM:
+        return PixelFormat::R8_UNORM;
+    case VK_FORMAT_R8_SNORM:
+        return PixelFormat::R8_SNORM;
+    case VK_FORMAT_R8G8_UNORM:
+        return PixelFormat::R8G8_UNORM;
+    case VK_FORMAT_R8G8_SNORM:
+        return PixelFormat::R8G8_SNORM;
+    case VK_FORMAT_R16G16B16A16_SFLOAT:
+        return PixelFormat::R16G16B16A16_FLOAT;
+    default:
+        return PixelFormat::Invalid;
+    }
+}
+
 VkImageView Image::StorageImageView(s32 level) noexcept {
     auto& view = storage_image_views[level];
     if (!view) {
@@ -3819,6 +4040,16 @@ bool Image::InitSparseLayers() {
         u64{granularity.width} * granularity.height * block_bytes == tile) {
         s.tile_width *= block_width;
         s.tile_height *= block_height;
+    }
+    // A block that is not one sparse page of the image can't be bound by (AMD reported 65549 x
+    // 339860304 for Mario Kart World's RGBA8 terrain arrays on an RX 9070 XT).
+    if (s.tile_width < block_width || s.tile_height < block_height ||
+        u64{s.tile_width / block_width} * (s.tile_height / block_height) * block_bytes != tile) {
+        LOG_WARNING(Render_Vulkan,
+                    "Sparse layered image {:#x}: driver block {}x{} is not a {} byte page; not "
+                    "using sparse layers",
+                    gpu_addr, granularity.width, granularity.height, tile);
+        return false;
     }
     const u32 tail_lod = (std::min)(it->imageMipTailFirstLod, s.levels);
     VkDeviceSize bytes = 0;
@@ -4949,7 +5180,15 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
 
     f32 min_lod = 0.0f;
     f32 max_lod = 0.25f;
-    if (tsc.mipmap_filter != TextureMipmapFilter::None) {
+    // The Duskbloods: a sampler without mipmap filtering still reads the level an explicit LOD
+    // selects, as on the console. Its bloom blurs level 1 of its mip chain with
+    // textureLod(..., 1.0) through such a sampler; clamped to level 0 it read a level nothing
+    // wrote (zeros, or stale NaNs that spread into black and purple blocks). Its LOD clamps then
+    // apply with nearest level selection, to implicit LODs too.
+    constexpr u64 DuskbloodsNetworkTestProgramId = 0x0400D1D02399A000ULL;
+    const bool mip_none_lods = tsc.mipmap_filter == TextureMipmapFilter::None &&
+                               Settings::GetCurrentProgramID() == DuskbloodsNetworkTestProgramId;
+    if (tsc.mipmap_filter != TextureMipmapFilter::None || mip_none_lods) {
         min_lod = tsc.MinLod();
         max_lod = tsc.MaxLod();
         // EDEN_NX2_FORCE_LOD0: sample only the top mip level (debug aid for mip layout problems).
@@ -4968,6 +5207,10 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
         added_lod_bias = biased - lod_bias;
         lod_bias = biased;
+    }
+    if (!device.SupportsSamplerMipLodBias()) {
+        lod_bias = 0.0f;
+        added_lod_bias = 0.0f;
     }
     base_ci = VkSamplerCreateInfo{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,

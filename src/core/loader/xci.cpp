@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <vector>
@@ -210,6 +209,11 @@ ResultStatus AppLoader_XCI::ReadLogo(std::vector<u8>& buffer) {
 
 ResultStatus AppLoader_XCI::ReadNSOModules(Modules& modules) {
     return nca_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_XCI::ReadMainBuildId(Core::System& system,
+                                            std::array<u8, 0x20>& build_id) {
+    return nca_loader->ReadMainBuildId(system, build_id);
 }
 
 } // namespace Loader

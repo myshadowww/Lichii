@@ -19,6 +19,7 @@ add_executable(dynarmic_tests
     A64/a64.cpp
     A64/fibonacci.cpp
     A64/fp_min_max.cpp
+    A64/host_call_return.cpp
     A64/misaligned_page_table.cpp
     A64/test_invalidation.cpp
     A64/real_world.cpp
@@ -46,6 +47,13 @@ endif()
 
 if ("riscv" IN_LIST ARCHITECTURE)
     target_link_libraries(dynarmic_tests PRIVATE biscuit::biscuit)
+endif()
+
+if ("arm64" IN_LIST ARCHITECTURE)
+    target_architecture_specific_sources(dynarmic_tests "arm64"
+        A64/cache_clear_rsb.cpp
+        A64/shared_fastmem.cpp
+    )
 endif()
 
 if ("x86_64" IN_LIST ARCHITECTURE)

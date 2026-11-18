@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /* virtual_buffer.h */
-// SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -26,7 +25,7 @@ namespace Common {
 constexpr u64 HostPageSize = 0x1000;
 constexpr u64 HostPageBits = 12;
 constexpr u64 HostPageMask = ~(HostPageSize - 1);
-bool CommitVectorPage(uintptr_t addr, bool write) noexcept;
+bool CommitVectorPage(uintptr_t addr) noexcept;
 #else
 inline const u64 HostPageSize = sysconf(_SC_PAGESIZE);
 inline const u64 HostPageBits = std::countr_zero(HostPageSize);
@@ -174,7 +173,7 @@ private:
         auto page_index = (index * sizeof(T)) >> HostPageBits;
         auto page = reinterpret_cast<uintptr_t>(base_ptr + index) & HostPageMask;
 #if defined(_WIN32)
-        if (!CommitVectorPage(page, true)) {
+        if (!CommitVectorPage(page)) {
             return false;
         }
 #else

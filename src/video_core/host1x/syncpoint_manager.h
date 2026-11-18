@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
@@ -16,11 +15,17 @@
 
 #include "common/common_types.h"
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 
 namespace Host1x {
 
 class SyncpointManager {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     static constexpr size_t NUM_MAX_SYNCPOINTS = 192;
 

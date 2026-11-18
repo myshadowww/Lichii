@@ -13,14 +13,14 @@ namespace {
 // Every field of Info is listed in VisitInfo below. An info that grows a field has to be listed
 // there too: this size check fails the build until it is (update the size with it).
 #if defined(_MSC_VER) && defined(_WIN64)
-static_assert(sizeof(Info) == 6936,
+static_assert(sizeof(Info) == 6992,
               "Shader::Info changed: list the new fields in VisitInfo, then update this size");
 // The descriptors are held in vectors, so a field they grow does not change sizeof(Info).
 static_assert(sizeof(ConstantBufferDescriptor) == 8 && sizeof(StorageBufferDescriptor) == 80 &&
                   sizeof(TextureBufferDescriptor) == 40 && sizeof(ImageBufferDescriptor) == 28 &&
-                  sizeof(TextureDescriptor) == 44 && sizeof(ImageDescriptor) == 36,
+                  sizeof(TextureDescriptor) == 48 && sizeof(ImageDescriptor) == 36,
               "A Shader::Info descriptor changed: list the new fields in its Visit function below, "
-              "then update these sizes and PrecompiledInfosMagic (vk_pipeline_cache.cpp)");
+              "then update these sizes and the prepared-store format");
 static_assert(sizeof(StorageWriteExtent) == 60,
               "StorageWriteExtent changed: list the new fields in VisitWriteExtent below");
 #endif
@@ -237,6 +237,8 @@ void VisitTexture(Io& io, D& d) {
     io(d.count);
     io(d.size_shift);
     io(d.handle_program);
+    io(d.is_descriptor_array);
+    io(d.handle_is_pointer_word);
 }
 template <typename Io, typename D>
 void VisitImage(Io& io, D& d) {
@@ -308,6 +310,7 @@ void VisitInfo(Io& io, I& info) {
     io(info.stores_tess_level_outer);
     io(info.stores_tess_level_inner);
     io(info.stores_indexed_attributes);
+    io(info.position_on_far_plane);
     io(info.stores_global_memory);
     io(info.uses_local_memory);
     io(info.uses_fp16);
@@ -324,6 +327,8 @@ void VisitInfo(Io& io, I& info) {
     io(info.uses_sparse_residency);
     io(info.uses_demote_to_helper_invocation);
     io(info.uses_subgroup_vote);
+    io(info.demoted_conditional_barrier);
+    io(info.uses_barrier_vote);
     io(info.uses_subgroup_mask);
     io(info.uses_fswzadd);
     io(info.uses_derivatives);
@@ -347,6 +352,7 @@ void VisitInfo(Io& io, I& info) {
     io(info.uses_global_memory);
     io(info.requires_coherent_global_memory);
     io(info.requires_coherent_image_memory);
+    io(info.binds_unmapped_pointer_word);
     io(info.uses_cooperative_matrix);
     io(info.native_global_bounds);
     io(info.uses_atomic_image_u32);

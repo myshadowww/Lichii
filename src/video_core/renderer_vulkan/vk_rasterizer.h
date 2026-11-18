@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -9,6 +8,7 @@
 #include <array>
 #include <optional>
 #include <string_view>
+#include <unordered_set>
 
 #include <boost/container/static_vector.hpp>
 
@@ -38,6 +38,7 @@
 #endif
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vertex_input_cache.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -120,15 +121,26 @@ public:
     bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
+    bool Nx2ListSlotsSupported() const override;
+    std::optional<u32> Nx2AcquireListSlot() override;
+    void Nx2ReleaseListSlot(u32 slot) override;
+    void Nx2SnapshotListWords(DAddr device_addr, u32 count, u32 slot) override;
+    void Nx2NoteOwedListWord(DAddr device_addr, u32 value) override;
+    void Nx2NoteInlineQmdGrid(DAddr device_addr, u32 x, u32 y, u32 z) override;
+    void Nx2ReadListSlots(std::span<const u32> slots, std::span<u32> words) override;
+    void Nx2CheckListSlot(u32 slot, std::span<const u32> words) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
     bool HasPendingQueries(DAddr addr, u64 size) override;
     bool HoldsQueries(DAddr addr, u64 size) override;
+    bool MayHoldImagesOrReports(DAddr addr, u64 size) override;
     void InvalidateRegion(DAddr addr, u64 size,
                           VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+    void InvalidateConstantBufferData(
+        std::span<const std::pair<DAddr, std::size_t>> sequences) override;
     void OnCacheInvalidation(DAddr addr, u64 size) override;
     void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
     bool TryCacheInvalidation(DAddr addr, u64 size) override;
@@ -160,8 +172,8 @@ public:
         return true;
     }
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& src,
-        const Tegra::Engines::Fermi2D::Surface& dst) override;
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region) override;
     bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
@@ -203,8 +215,8 @@ private:
     void CaptureIndirectTrace();
     void CollectIndirectTrace();
     void TraceDrawFailure(std::string_view reason);
-    /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
-    void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
+    /// Remembers render target 0 of a draw that can hold Ocarina of Time's tonemapped image.
+    void TrackOotTonemappedImage();
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
 
     void FlushWork();
@@ -254,6 +266,18 @@ private:
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
 
+    /// A dynamic vertex input state: what vkCmdSetVertexInputEXT is given.
+    struct VertexInputState {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    /// Builds the state from the attribute formats, vertex streams and repacked bindings (the
+    /// registers VideoCommon::VertexInputKey holds).
+    void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                          u32 max_bindings, VertexInputState& state);
+    /// Dynamic vertex input states built before, by the registers they were built from.
+    VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
+
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
     bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
     void FrameDumpPass(const Framebuffer* framebuffer);
@@ -289,7 +313,7 @@ private:
     /// FSR with the frame.
     void UpdateOcarinaJitter();
     void TrackOcarinaActor(u64 shader_hash, bool is_indexed, bool is_indirect);
-    bool TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace);
+    bool TryOcarinaUpscale(const ComputePipeline& pipeline, u64 native_key, bool replace);
     void ReadOcarinaActor(struct OcarinaActorMesh& mesh);
     /// Records the uniform and storage buffers of the current draw or dispatch for the frame dump.
     bool FrameDumpBuffers(bool compute, std::span<const u64> shader_hashes);
@@ -300,6 +324,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     StateTracker& state_tracker;
+    s32 bound_channel_id = -1;
     Scheduler& scheduler;
 
     StagingBufferPool staging_pool;
@@ -458,7 +483,17 @@ private:
     std::array<std::array<u32, 6>, 16> bananza_traced_attachment_shapes{};
 #endif
     std::optional<u64> oot_camera_sample_frame;
+    /// Why this frame's largest scene-target draw with a camera buffer gave no camera.
+    struct OcarinaCameraRefusal {
+        u64 frame{};
+        const char* reason{};
+        f32 camera_width{}, camera_height{};
+        u32 target_width{}, target_height{};
+    };
+    std::optional<OcarinaCameraRefusal> oot_camera_refusal;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    /// The game started at the DLSS Performance render scale (1920x1080).
+    bool oot_performance_scale{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
         const Tegra::MemoryManager* depth_channel{};
@@ -466,8 +501,17 @@ private:
         GPUVAddr depth_address{};
         u32 depth_tic{};
         VkExtent2D extent{};
+        /// The scene render targets' size: larger than the extent where the game pads them.
+        VkExtent2D image_extent{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};
+
+        /// Whether an image holds the whole scene: the game samples padded targets through
+        /// descriptors of the scene's own size.
+        [[nodiscard]] bool SceneSized(u32 width, u32 height) const noexcept {
+            return (width == extent.width || width == image_extent.width) &&
+                   (height == extent.height || height == image_extent.height);
+        }
     } oot_motion;
     std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
     bool oot_live_failed{};
@@ -572,6 +616,8 @@ private:
         HandleBind,
         HandleData,
         SampledImages,
+        ComputedHandles,
+        VertexInput,
         Count,
     };
     /// Why a recorded draw can't be followed by a delta draw.
@@ -602,6 +648,8 @@ private:
         u64 pipeline_mismatches{};
         u64 view_mismatches{};
         u64 binding_mismatches{};
+        /// Draws whose recorded dynamic vertex input isn't what the registers give.
+        u64 vertex_input_mismatches{};
         /// DeltaPipeline draws by GraphicsPipeline::DeltaDrawBlocker.
         std::array<u64, static_cast<size_t>(GraphicsPipeline::DeltaBlocker::Count)> delta_blockers{};
         /// StateChanged draws by the reason of the last break, and by its 3D method.
@@ -612,12 +660,39 @@ private:
     /// The pipeline the draw can take the delta path with, or null for a full resolve. Clears
     /// the remembered draw either way: only a recorded draw remembers one again.
     GraphicsPipeline* TakeReusableDraw(bool is_indexed, bool is_indirect);
+    /// Writes the GPU-written list word `real` over its placeholder `value` at `device_addr`
+    /// (Nx2ListIndirect), unless something wrote the word since, and tells the caches.
+    bool Nx2LandOwedWord(DAddr device_addr, u32 value, u32 real);
+
+    void InvalidateCachedWrites(std::span<const std::pair<DAddr, std::size_t>> sequences,
+                                bool constant_buffer_data);
     /// Whether the draw TakeReusableDraw took still holds once the caches are locked (serial and
     /// map_serial as read then), and the images it samples need no preparing.
     bool DeltaStillHolds(u64 serial, u64 map_serial);
     void NoteResolvedDraw(GraphicsPipeline* pipeline, bool is_indexed, bool is_indirect, u64 serial,
                           u64 map_serial);
     void ReportFastDraws();
+
+    /// EDEN_NX2_DRAW_REUSE_PROBE: a configured draw's key (state that rarely changes between
+    /// frames, leaving out uniform buffers) was in the previous frame, only earlier in this one,
+    /// or in neither.
+    enum class DrawReuse : u8 { Hit, Repeat, Miss, Count };
+    struct DrawReuseProbe {
+        std::unordered_set<u64> previous_frame;
+        std::unordered_set<u64> frame;
+        std::array<std::array<u64, static_cast<size_t>(DrawPath::Count)>,
+                   static_cast<size_t>(DrawReuse::Count)>
+            draws{}, prepare_ns{};
+        u64 gate_ns{}; ///< Full-path hits: their PrepareDraw time over 1.1 us
+        u64 probe_ns{}; ///< NoteDrawReuse's own time, left out of prepare_ns
+        u64 frames{};
+        u64 window_start{};
+    };
+    /// Classifies the draw just configured with `pipeline` and adds its key to the frame's.
+    DrawReuse NoteDrawReuse(const GraphicsPipeline& pipeline, bool is_indexed);
+    void TickDrawReuse();
+    DrawReuseProbe draw_reuse;
+
     ReusableDraw reusable_draw;
     ReusableDraw taken_draw; ///< The draw TakeReusableDraw last returned the pipeline of
     /// Device memory of the constant buffers TakeReusableDraw checks for texture handle writes.
@@ -626,10 +701,24 @@ private:
         handle_spans;
     /// The constant buffer binds and data since the previous draw.
     VideoCommon::Nx2FastDraw::Delta taken_delta;
+    /// taken_delta hasn't reached BeginGraphicsUniforms yet (the draw may still stop before).
+    bool taken_delta_unconsumed{};
+    /// Constant buffer data since the last BeginGraphicsUniforms that no delta it got holds.
+    bool uniform_writes_lost{};
     FastDrawStats fast_draw_stats;
     /// Nx2FastDraw::Enabled and VerifyEnabled as the drawing thread last read them.
     bool fast_draw_on{};
     bool fast_draw_verify{};
+    /// EDEN_NX2_FAST_DRAW_VERIFY: this draw passed DeltaStillHolds, so UpdateVertexInput compares
+    /// the vertex input recorded last with what the registers give now.
+    bool verify_vertex_input{};
+    /// The draw's pipeline puts every vertex on the far plane and the game set no polygon offset
+    /// for it: it gets a depth bias towards the far value and depth clamping (see
+    /// UpdateDynamicStates).
+    bool far_plane_draw{};
+    float depth_bias_slope_scale = 1.0f;
+    VertexInputState recorded_vertex_input;
+    bool vertex_input_recorded{};
 
     struct IndirectTrace {
         vk::Buffer readback;

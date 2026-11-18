@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_subdirectory(host_shaders)
@@ -20,6 +19,8 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/compute_write_grid.h
+    buffer_cache/indirect_buffer.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
@@ -41,6 +42,7 @@ add_library(video_core STATIC
     dirty_flags.h
     dma_pusher.cpp
     dma_pusher.h
+    due_composites.h
     engines/sw_blitter/blitter.cpp
     engines/sw_blitter/blitter.h
     engines/sw_blitter/converter.cpp
@@ -106,6 +108,8 @@ add_library(video_core STATIC
     macro_memo.h
     macro_turing.h
     fence_manager.h
+    frame_gen_choice.h
+    front_qmd.h
     gpu.cpp
     gpu.h
     gpu_timestamp.h
@@ -113,7 +117,20 @@ add_library(video_core STATIC
     gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
+    gpu_trace/map_log.h
+    gpu_trace/recorder.cpp
+    gpu_trace/recorder.h
+    gpu_trace/replay.cpp
+    gpu_trace/replay.h
+    gpu_trace/sample.cpp
+    gpu_trace/sample.h
+    gpu_trace/state.cpp
+    gpu_trace/state.h
+    gpu_trace/trace_file.cpp
+    gpu_trace/trace_file.h
     guest_memory.h
+    host_vsync.cpp
+    host_vsync.h
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
@@ -123,17 +140,26 @@ add_library(video_core STATIC
     native_qmd.h
     native_query_trace.h
     nx2.h
+    nx2_back_idle_trace.cpp
+    nx2_back_idle_trace.h
+    nx2_list_macro_trace.cpp
+    nx2_list_macro_trace.h
     nx2_cmdpage_diag.h
     nx2_debug_control.cpp
     nx2_debug_control.h
     nx2_fast_draw.cpp
     nx2_fast_draw.h
+    nx2_list_indirect.h
+    nx2_list_indirect_stats.h
+    nx2_owed_words.h
     nx2_profile.h
     nx2_stutter_trace.cpp
     nx2_stutter_trace.h
     nx2_perf.h
     nx2_async_readback.h
+    nx2_backx.h
     nx2_download_trace.h
+    nx2_drain_check.h
     pending_maps.h
     present.h
     pte_kind.h
@@ -186,6 +212,9 @@ add_library(video_core STATIC
     renderer_vulkan/framebuffer_limits.h
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
+    renderer_vulkan/mesh_vertex_input.h
+    renderer_vulkan/nx2_list_slots.cpp
+    renderer_vulkan/nx2_list_slots.h
     renderer_vulkan/pipeline_build.h
     renderer_vulkan/pipeline_build_failure.cpp
     renderer_vulkan/pipeline_build_failure.h
@@ -213,6 +242,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_fsr3_upscaler.h
     renderer_vulkan/vk_fsr4_upscaler.cpp
     renderer_vulkan/vk_fsr4_upscaler.h
+    vulkan_common/descriptor_limits.h
     vulkan_common/ffx_files.h
     vulkan_common/ffx_runtime.cpp
     vulkan_common/ffx_runtime.h
@@ -262,6 +292,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_render_pass_cache.h
     renderer_vulkan/vk_resource_pool.cpp
     renderer_vulkan/vk_resource_pool.h
+    renderer_vulkan/frame_pacer.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
     renderer_vulkan/fragment_barrier_state.h
@@ -281,6 +312,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
     renderer_vulkan/descriptor_payload_growth.h
+    vulkan_common/vulkan_address_map.cpp
+    vulkan_common/vulkan_address_map.h
     vulkan_common/vulkan_debug_callback.cpp
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
@@ -368,6 +401,8 @@ add_library(video_core STATIC
     texture_cache/types.h
     texture_cache/util.cpp
     texture_cache/util.h
+    texture_cache/writeback_ranges.h
+    texture_cache/writeback_switches.h
     textures/astc.h
     textures/astc.cpp
     textures/bcn.cpp
@@ -382,6 +417,7 @@ add_library(video_core STATIC
     textures/workers.h
     transform_feedback.cpp
     transform_feedback.h
+    vertex_input_cache.h
     video_core.cpp
     video_core.h
 )
@@ -589,7 +625,7 @@ if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()
 
-if (YUZU_USE_EXTERNAL_FFMPEG)
+if (LICHII_USE_EXTERNAL_FFMPEG)
     add_dependencies(video_core ffmpeg-build)
 endif()
 
@@ -702,6 +738,8 @@ if (ENABLE_NVIDIA_DLSS AND MSVC)
         vulkan_common/streamline.cpp
         vulkan_common/streamline.h
         vulkan_common/streamline_api.h
+        vulkan_common/streamline_frame_gen.cpp
+        vulkan_common/streamline_frame_gen.h
     )
     target_include_directories(video_core PRIVATE "${STREAMLINE_INCLUDE_DIR}")
     target_link_libraries(video_core PRIVATE version wintrust crypt32)

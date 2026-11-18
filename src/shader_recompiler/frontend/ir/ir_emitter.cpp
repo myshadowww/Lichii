@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <numeric>
@@ -331,6 +330,10 @@ void IREmitter::SetPatch(Patch patch, const F32& value) {
 
 U32 IREmitter::IsbeRead(const U32& address) {
     return Inst<U32>(Opcode::IsbeRead, address);
+}
+
+U32 IREmitter::IsbeReadOutput(const U32& address) {
+    return Inst<U32>(Opcode::IsbeReadOutput, address);
 }
 
 void IREmitter::IsbeWriteAttribute(const U32& address, const U32& value) {

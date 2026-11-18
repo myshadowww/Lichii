@@ -1,10 +1,11 @@
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "shader_recompiler/frontend/ir/abstract_syntax_list.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
@@ -28,6 +29,10 @@ struct Program {
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
     MeshInfo mesh{};
+    /// Sets of storage buffer descriptor indices, and the global accesses routed among one of them
+    /// (an index into the sets) instead of among every bound storage buffer
+    std::vector<std::vector<u32>> global_memory_routes;
+    std::unordered_map<const Inst*, u32> global_memory_route;
 };
 
 [[nodiscard]] std::string DumpProgram(const Program& program);

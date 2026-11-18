@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -444,14 +443,16 @@ namespace Kernel {
             }
         }
 
-        // Acquire the scheduler lock.
-        KScopedSchedulerLock sl{kernel};
-
         // Signal.
-        m_signaled = true;
-        KSynchronizationObject::NotifyAvailable(kernel);
+        {
+            KScopedSchedulerLock sl{kernel};
+            m_signaled = true;
+            KSynchronizationObject::NotifyAvailable(kernel);
+        }
 
-        // Close the thread.
+        // Close the thread outside the scheduler lock: objects are destroyed on their last Close
+        // here (HOS defers that), and if this one is the last, Finalize takes the process's light
+        // locks, which can't block while the scheduler lock is held.
         this->Close(kernel);
     }
 

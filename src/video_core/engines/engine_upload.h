@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -56,6 +55,17 @@ struct Registers {
         }
     } dest;
 };
+
+/// Guest memory [address, address + size) an upload writes (size 0: none).
+struct WrittenRange {
+    GPUVAddr address{};
+    u64 size{};
+};
+
+/// Where State::ProcessData writes an upload with registers `regs` (linear: lines of
+/// line_length_in bytes, pitch apart; else swizzled into the destination surface): what the split
+/// GPU thread's front notes for the back to write running the upload's data methods.
+[[nodiscard]] WrittenRange UploadedRange(const Registers& regs, bool is_linear);
 
 class State {
 public:

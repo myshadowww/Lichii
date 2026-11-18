@@ -94,6 +94,10 @@ u32 EvaluateShift(IR::Value value) {
         return std::bit_cast<u32>(std::fma(std::bit_cast<float>(arg(0)),
                                          std::bit_cast<float>(arg(1)),
                                          std::bit_cast<float>(arg(2))));
+    case IR::Opcode::IAdd32:
+        return arg(0) + arg(1);
+    case IR::Opcode::INeg32:
+        return 0U - arg(0);
     case IR::Opcode::BitwiseAnd32:
         return arg(0) & arg(1);
     case IR::Opcode::BitwiseOr32:
@@ -178,8 +182,7 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
         for (size_t index = 0; index + 1 < lowered.instructions.size(); ++index)
             CHECK(((lowered.instructions[index] >> 16) & 15) == guard);
     }
-    for (const u32 source : {0x80c03400U, 0xc0c03400U, 0x44c03400U, 0x40c03440U,
-                             0x48c03400U, 0x50c03400U, 0x60c03400U}) {
+    for (const u32 source : {0x44c03400U, 0x40c03440U, 0x48c03400U, 0x50c03400U, 0x60c03400U}) {
         auto invalid = LoggedF2I;
         invalid.words[1] = source;
         CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
@@ -195,7 +198,7 @@ TEST_CASE("Logged Pokopia F2I preserves guards and rejects unrelated modifiers",
     invalid = LoggedF2I;
     invalid.words[2] |= 1U << 27;
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
-    invalid.words = {0x00157b05, 0x40400400, 0x0021e100, 0x0001e400};
+    invalid.words = {0x00157b05, 0x00400440, 0x0021e100, 0x0001e400};
     CHECK_FALSE(LowerToMaxwell(std::array{invalid, Exit}));
 }
 
@@ -590,4 +593,29 @@ TEST_CASE("Gradient texture fetch shadows keep the array layer register",
     CHECK(((*native >> 8) & 0xff) == 210);
     const u32 gradients = static_cast<u32>((*native >> 20) & 0xff);
     CHECK((gradients + 4 <= 210 || gradients >= 213));
+}
+
+TEST_CASE("Logged Orbitals IMAD with a negated register addend",
+          "[video_core][ampere][logged_numeric][orbitals]") {
+    // IMAD R3 = R2 * R3 - R5 in a gameplay compute shader: bit 75 negates the addend. It was
+    // rejected with "native integer register multiply mode", so its dispatches were skipped.
+    constexpr Instruction logged{{0x02037224, 0x00000003, 0x078e0a05, 0x000fca00}};
+    constexpr u32 a = 0x00012345, b = 0x00010003, c = 0x00001000;
+    const auto run = [&](Instruction instruction, u32 expected) {
+        const auto lowered = LowerToMaxwell(std::array{instruction, Exit});
+        INFO(lowered.error);
+        REQUIRE(lowered);
+        auto code = lowered.instructions;
+        for (const auto& [reg, value] : {std::pair{2U, a}, std::pair{3U, b}, std::pair{5U, c}})
+            code.insert(code.begin(), 0x0100000000070000ULL | reg | (15ULL << 12) | (u64{value} << 20));
+        code.insert(code.end() - 1, Store(3));
+        TranslateAndEmit(code, expected);
+    };
+    run(logged, a * b - c);
+    auto positive = logged;
+    positive.words[2] &= ~0x800U;
+    run(positive, a * b + c);
+    auto zero_addend = logged;
+    zero_addend.words[2] |= 0xffU;
+    run(zero_addend, a * b);
 }

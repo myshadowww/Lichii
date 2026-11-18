@@ -6,15 +6,15 @@
 
 namespace Vulkan::NvidiaDlss {
 
-bool Start() { return Streamline::Start(); }
+bool Start(void* window) { return Streamline::Start(window); }
 bool WantsDevice() { return Streamline::WantsDevice(); }
 std::vector<std::string> InstanceExtensions() { return Streamline::InstanceExtensions(); }
 std::vector<std::string> DeviceExtensions(VkInstance, VkPhysicalDevice) {
     return Streamline::DeviceExtensions();
 }
 bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice device,
-                  u32 graphics_family, vk::DeviceDispatch &dld) {
-    return Streamline::AttachDevice(instance, physical, device, graphics_family, dld);
+                  u32 graphics_family, vk::DeviceDispatch& dld, u32 first_queue) {
+    return Streamline::AttachDevice(instance, physical, device, graphics_family, first_queue, dld);
 }
 bool IsAvailable() { return Streamline::IsDlssAvailable(); }
 void Stop() { Streamline::Stop(); }

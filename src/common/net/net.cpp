@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
 #include <optional>
 #include <boost/algorithm/string/replace.hpp>
 
@@ -11,6 +12,8 @@
 #include "common/scm_rev.h"
 #include "net.h"
 
+#include "common/fs/fs_util.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 
 #include "common/httplib.h"

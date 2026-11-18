@@ -19,23 +19,33 @@ constexpr u64 MinEvictionAge = 150;
 /// Frames since its last use before the collector may delete an image. `mode_age` is the age the
 /// collector's mode asks for; it applies as is only when memory is short: an image could not be
 /// made, no limit is known (0), or the usage has reached `limit` (the room the driver's budget,
-/// its margins and the host's commit leave).
-[[nodiscard]] constexpr u64 EvictionAge(u64 mode_age, u64 usage, u64 limit, bool out_of_memory) {
+/// its margins and the host's commit leave). `override_age` (EDEN_NX2_TC_MIN_AGE) raises the age
+/// only while there is room, so a stale override can't stop eviction when memory is short (#1290).
+[[nodiscard]] constexpr u64 EvictionAge(u64 mode_age, u64 override_age, u64 usage, u64 limit,
+                                        bool out_of_memory, bool aggressive = false) {
     if (out_of_memory || limit == 0 || usage >= limit) {
         return mode_age;
     }
-    return (std::max)(mode_age, MinEvictionAge);
+    // Under the critical threshold policy the adaptive floor still applies when budget remains.
+    const u64 age = (std::max)(mode_age, MinEvictionAge);
+    return aggressive ? age : (std::max)(age, override_age);
 }
 
-/// Diagnostic retention may delay routine collection, but never a pressure pass. Aggressive
-/// collection below a known budget still keeps the adaptive floor selected by EvictionAge.
-[[nodiscard]] constexpr u64 TextureGcEffectiveMinAge(u64 mode_age, u64 diagnostic_min_age,
-                                                     u64 usage, u64 limit, bool out_of_memory,
-                                                     bool aggressive_mode) {
-    const u64 age = EvictionAge(mode_age, usage, limit, out_of_memory);
-    const bool at_limit = limit != 0 && usage >= limit;
-    return aggressive_mode || out_of_memory || at_limit ? age
-                                                       : (std::max)(age, diagnostic_min_age);
+/// How far the budget RetentionBudget follows may rise at each budget check (every 30 frames).
+constexpr u64 RetentionBudgetRise = u64{16} << 20;
+
+/// The driver budget the retention limit is taken from: the lowest one read lately. It follows
+/// a drop at once and a rise by RetentionBudgetRise per check (about 1 GiB in 2000 frames).
+/// Windows moves the budget with other programs' video memory: on a 16 GB card in Ocarina of
+/// Time at 2x it fell from 15.2 to 14.1-14.4 GB every 10-25 s, while the retention limit sat
+/// only the block slack (0.5-0.8 GB) under the budget read last. Each drop took the process over
+/// the budget (Streamline: out of VRAM) and frames went from 10-13 ms to 35-80 ms.
+/// `held` is the last value (0 before the first check), `budget` the one read now.
+[[nodiscard]] constexpr u64 RetentionBudget(u64 held, u64 budget) {
+    if (held == 0 || budget <= held) {
+        return budget;
+    }
+    return (std::min)(budget, held + RetentionBudgetRise);
 }
 
 /// No image is old enough before the age window has elapsed, including one last used at tick 0.

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #if defined(_M_X64) || defined(__x86_64__)
@@ -15,12 +15,45 @@
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "core/arm/dynarmic/window_trace.h"
 #include "core/core_timing.h"
+#include "core/hardware_properties.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/nx2_thread_stats.h"
 #include "dynarmic/interface/A64/config.h"
+#include "video_core/nx2_stutter_trace.h"
 
 namespace Core {
 
 using namespace Common::Literals;
+
+namespace {
+// EDEN_NX2_GUEST_THREAD_STATS and EDEN_NX2_STUTTER_TRACE: the JIT's dispatcher counters of each
+// core's JITs (one per process).
+std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_counters{};
+// EDEN_NX2_STUTTER_TRACE: each core's counters already added to the stutter trace.
+std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_traced{};
+
+void TraceJit(size_t core) {
+    const auto& now = g_jit_counters[core];
+    auto& traced = g_jit_traced[core];
+    if (now.blocks_compiled == traced.blocks_compiled && now.cache_clears == traced.cache_clears &&
+        now.blocks_invalidated == traced.blocks_invalidated) {
+        return;
+    }
+    VideoCommon::StutterTrace::AddJit(
+        core,
+        {
+            .compile_ns = now.compile_ns - traced.compile_ns,
+            .blocks = now.blocks_compiled - traced.blocks_compiled,
+            .clears = now.cache_clears - traced.cache_clears,
+            .full_clears = now.full_clears - traced.full_clears,
+            .invalidated = now.blocks_invalidated - traced.blocks_invalidated,
+            .invalidated_bytes = now.invalidated_bytes - traced.invalidated_bytes,
+            .fastmem_recompiles = now.fastmem_recompiles - traced.fastmem_recompiles,
+        },
+        now.code_bytes);
+    traced = now;
+}
+} // Anonymous namespace
 
 DynarmicCallbacks64::DynarmicCallbacks64(ArmDynarmic64& parent, Kernel::KProcess* process)
     : m_parent{parent}, m_memory(process->GetMemory())
@@ -57,12 +90,14 @@ Dynarmic::A64::Vector DynarmicCallbacks64::MemoryRead128(u64 vaddr) {
 std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
-    auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    auto const aligned_vaddr = vaddr & ~Core::Memory::LICHII_PAGEMASK;
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
     }
-    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
+    const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::LICHII_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
         if (!m_window_trace) {
             m_window_trace = WindowTrace::sessions.Find(m_process);
@@ -204,6 +239,13 @@ void DynarmicCallbacks64::ExceptionRaised(u64 pc, Dynarmic::A64::Exception excep
     case Dynarmic::A64::Exception::SendEvent:
     case Dynarmic::A64::Exception::SendEventLocal:
     case Dynarmic::A64::Exception::Yield:
+        if (Kernel::Nx2ThreadStats::g_enabled) {
+            Kernel::Nx2ThreadStats::CountHint(
+                Kernel::Nx2ThreadStats::t_run,
+                static_cast<size_t>(exception) -
+                    static_cast<size_t>(Dynarmic::A64::Exception::WaitForInterrupt),
+                m_parent.m_system.CoreTiming().GetClockTicks(), m_spin_ticks);
+        }
         LOG_TRACE(Core_ARM, "ExceptionRaised(exception = {}, pc = {:08X}, code = {:08X}, cached = {:08X})", std::size_t(exception), pc, m_memory.Read32(pc), MemoryReadCode(pc).value_or(0));
         return;
     case Dynarmic::A64::Exception::NoExecuteFault:
@@ -263,6 +305,9 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
 #endif
     }
     m_last_cntpct = ticks;
+    if (Kernel::Nx2ThreadStats::g_enabled) {
+        Kernel::Nx2ThreadStats::CountRead(Kernel::Nx2ThreadStats::t_run, ticks, m_spin_ticks);
+    }
     return ticks;
 }
 
@@ -456,12 +501,83 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }
+    if ((Kernel::Nx2ThreadStats::g_enabled || VideoCommon::StutterTrace::Enabled()) &&
+        m_core_index < g_jit_counters.size()) {
+        config.counters = &g_jit_counters[m_core_index];
+    }
+#if defined(ARCHITECTURE_x86_64)
+    // x86-64 host code generation options; Paranoid keeps dynarmic's defaults.
+    if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
+        // The JIT spilled ~9% of its instructions to stack slots in Ocarina of Time's hot code
+        // while callee-saved GPRs sat empty: evictions go to a free callee-saved GPR first, and an
+        // operand that is overwritten but still needed is copied to a free register instead.
+        config.spill_to_free_gpr = true;
+        config.scratch_copy_to_free_reg = true;
+        // W-register writes and zero-extends of values a 32-bit instruction produced skip the
+        // second `mov r32, r32`.
+        config.elide_redundant_zext = true;
+        // ldr/str [xN, #imm]: the immediate goes into the fastmem addressing mode instead of a
+        // separate LEA (and often a register copy).
+        config.fold_address_offsets = true;
+        // The per-block %rbp frame is three instructions per block that nothing reads.
+        config.omit_block_frame = true;
+        // Fast dispatch table of 2^16 entries, 4-way set associative: 1 MiB per core instead of
+        // the 16 MiB direct-mapped 2^20 table.
+        config.fast_dispatch_table_bits = 16;
+        config.fast_dispatch_set_associative = true;
+        // A 32-entry return stack buffer: returns from deeper call chains skip the dispatcher.
+        config.rsb_size = 32;
+        // Unlinked exits jump to one shared stub per target: 5/6-byte patch sites instead of
+        // 22/23 bytes plus an inline exit stub.
+        config.compact_block_exits = true;
+        // Fault/abort paths, atomic fallbacks and exit stubs go to a cold region at the end of
+        // the code cache, so hot blocks sit densely.
+        config.far_code = true;
+        // Branches, CSEL and CBZ/TBZ read the host flags left by the instruction before them
+        // instead of reloading NZCV from the guest state.
+        config.reuse_host_flags = !config.enable_cycle_counting;
+        // Halt checks on links to lower PCs and on indirect branches instead of every linked
+        // branch (multicore only: dynarmic counts no cycles there).
+        config.halt_check_on_back_edges = !config.enable_cycle_counting;
+        // BL/BLR as host calls and RET as a host return checked against the guest return
+        // address: the CPU's return predictor predicts guest returns instead of one shared
+        // indirect jump through the return stack buffer (multicore only, no cycle counter).
+        config.host_call_return = !config.enable_cycle_counting;
+    }
+#endif
     m_jit.emplace(config);
 }
 
 HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
-    return TranslateHaltReason(m_jit->Run());
+    if (m_core_index >= g_jit_counters.size()) {
+        return TranslateHaltReason(m_jit->Run());
+    }
+    if (!Kernel::Nx2ThreadStats::g_enabled) {
+        const Dynarmic::HaltReason hr = m_jit->Run();
+        if (VideoCommon::StutterTrace::Enabled()) {
+            TraceJit(m_core_index);
+        }
+        return TranslateHaltReason(hr);
+    }
+    namespace Stats = Kernel::Nx2ThreadStats;
+    auto& timing = m_system.CoreTiming();
+    Stats::BeginRun();
+    const u64 start = timing.GetClockTicks();
+    const Dynarmic::HaltReason hr = m_jit->Run();
+    const u64 end = timing.GetClockTicks();
+    const Stats::Exit exit = Dynarmic::Has(hr, SupervisorCall) ? Stats::Exit::Svc
+                             : Dynarmic::Has(hr, BreakLoop)    ? Stats::Exit::Interrupt
+                             : Dynarmic::Has(hr, Dynarmic::HaltReason::CacheInvalidation)
+                                 ? Stats::Exit::CacheInvalidation
+                                 : Stats::Exit::Other;
+    const auto& jit = g_jit_counters[m_core_index];
+    Stats::EndRun(thread, m_core_index, start, end, exit, m_svc, jit.block_lookups,
+                  jit.blocks_compiled, jit.cache_clears);
+    if (VideoCommon::StutterTrace::Enabled()) {
+        TraceJit(m_core_index);
+    }
+    return TranslateHaltReason(hr);
 }
 
 HaltReason ArmDynarmic64::StepThread(Kernel::KThread* thread) {
@@ -495,7 +611,7 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
 
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
+    , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
@@ -550,7 +666,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
 }
 
@@ -558,7 +674,7 @@ void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

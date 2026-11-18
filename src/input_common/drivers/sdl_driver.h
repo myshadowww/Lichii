@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include "common/container/unordered_map.h"
@@ -23,6 +24,9 @@ union SDL_Event;
 namespace InputCommon {
 
 class SDLJoystick;
+#ifdef HAVE_SWITCH2_BLE
+class Switch2Ble;
+#endif
 
 using ButtonBindings =
     std::array<std::pair<Settings::NativeButton::Values, SDL_GamepadButton>, 20>;
@@ -70,6 +74,11 @@ public:
         const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) override;
 
     bool IsVibrationEnabled(const PadIdentifier& identifier) override;
+    bool IsVibrationStreamed(const PadIdentifier& identifier) override;
+
+    /// Why the controller does nothing, when it sent no input since it connected and its raw HID
+    /// device can't be opened. Empty otherwise.
+    std::string GetSilenceWarning(const Common::ParamPackage& params);
 
 private:
     void InitJoystick(SDL_JoystickID joystick_id);
@@ -126,5 +135,8 @@ private:
 
     std::atomic<bool> initialized = false;
     bool start_thread;
+#ifdef HAVE_SWITCH2_BLE
+    std::unique_ptr<Switch2Ble> switch2_ble;
+#endif
 };
 } // namespace InputCommon

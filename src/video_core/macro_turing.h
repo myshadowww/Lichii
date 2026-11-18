@@ -92,7 +92,7 @@ public:
         reread_data_ram = false;
         data_ram_reads.clear();
         data_ram_writes.clear();
-        for (Word steps = 0; steps < 1000000; ++steps) {
+        for (Word steps = 0; steps < step_limit; ++steps) {
             if (static_cast<std::size_t>(pc) * 3 + 2 >= code.size()) {
                 fail("instruction outside uploaded RAM");
                 break;
@@ -261,6 +261,13 @@ public:
         std::vector<Word> methods; ///< Ascending, each once
         bool methods_known{true};
         bool data_ram{};
+        std::vector<Word> instructions; ///< The PCs a call can run, ascending
+        /// The data RAM words DREAD can read and the registers MME_READ can read, ascending, each
+        /// once; not all of them where `..._known` is false (an address the code computes).
+        std::vector<Word> data_ram_reads;
+        bool data_ram_reads_known{true};
+        std::vector<Word> register_reads;
+        bool register_reads_known{true};
     };
 
     static Effects AnalyzeEffects(std::span<const Word> code, Word start) {
@@ -420,7 +427,13 @@ public:
                     case 17: case 18: case 19: case 20: case 21:
                         value = both ? known(taken(d.op[lane]) ? ~0U : 0) : unknown;
                         break;
-                    case 22: value = unknown; break; // A register
+                    case 22: // A register
+                        value = unknown;
+                        if (both)
+                            effects.register_reads.push_back((a + b) & 0xffff);
+                        else
+                            effects.register_reads_known = false;
+                        break;
                     case 23:
                         if (imm < 2) break;
                         // Entered, or skipped with a count of 0. Its last instruction may start
@@ -453,7 +466,14 @@ public:
                         if (!both || !jumps) flow[flow_count++] = {Flow::Next, 0, false};
                         break;
                     }
-                    case 30: effects.data_ram = true; value = unknown; break;
+                    case 30:
+                        effects.data_ram = true;
+                        value = unknown;
+                        if (x.known)
+                            effects.data_ram_reads.push_back(a);
+                        else
+                            effects.data_ram_reads_known = false;
+                        break;
                     case 31: effects.data_ram = true; break;
                     default: break; // 7: the load barrier
                     }
@@ -513,12 +533,37 @@ public:
                 }
             }
         }
-        std::ranges::sort(effects.methods);
-        effects.methods.erase(std::unique(effects.methods.begin(), effects.methods.end()),
-                              effects.methods.end());
+        for (const auto& reached : states) {
+            effects.instructions.push_back(reached.first / 2);
+        }
+        for (std::vector<Word>* list : {&effects.methods, &effects.instructions,
+                                        &effects.data_ram_reads, &effects.register_reads}) {
+            std::ranges::sort(*list);
+            list->erase(std::unique(list->begin(), list->end()), list->end());
+        }
         return effects;
     }
 
+    /// A macro's identity wherever its code was uploaded: the instructions a call from `start`
+    /// can run (AnalyzeEffects), each by its place after `start` (FNV-1a).
+    static std::uint64_t CodeHash(std::span<const Word> code, Word start, const Effects& effects) {
+        std::uint64_t hash = 0xcbf29ce484222325ULL;
+        const auto add = [&hash](Word word) {
+            for (Word shift = 0; shift < 32; shift += 8) {
+                hash = (hash ^ ((word >> shift) & 0xff)) * 0x100000001b3ULL;
+            }
+        };
+        for (const Word pc : effects.instructions) {
+            add(pc - start);
+            add(code[pc * 3]);
+            add(code[pc * 3 + 1]);
+            add(code[pc * 3 + 2]);
+        }
+        return hash;
+    }
+
+    /// Instructions a call may run before it fails.
+    Word step_limit{1000000};
     using DataRam = std::array<Word, 0xc00>;
     DataRam dram{};
     // The data RAM DREAD/DWRITE use: a channel's own copy when the caller sets one. Macro code is

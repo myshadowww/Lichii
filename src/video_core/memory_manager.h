@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -22,6 +21,7 @@
 #include "common/sparse_large_vector.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/cache_types.h"
+#include "video_core/gpu_trace/map_log.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/pte_kind.h"
 
@@ -33,9 +33,15 @@ namespace Core {
 class System;
 } // namespace Core
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 
-class MemoryManager final {
+class MemoryManager final : public std::enable_shared_from_this<MemoryManager> {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
                            GPUVAddr split_address = 1ULL << 34, u64 big_page_bits_ = 16,
@@ -48,6 +54,13 @@ public:
     // Switch 2: GPU address of the read-only syncpoint shim (u32 per syncpoint); 0 = none.
     void SetNativeSyncpointShim(GPUVAddr address);
     static constexpr u32 NumShimSyncpoints = 192; // Tegra::Host1x::SyncpointManager
+    /// Whether [address, address + size) overlaps the syncpoint shim, whose words Read serves
+    /// from the guest syncpoints instead of memory.
+    [[nodiscard]] bool OverlapsSyncpointShim(GPUVAddr address, u64 size) const {
+        const GPUVAddr shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        return shim != 0 && address < shim + NumShimSyncpoints * sizeof(u32) &&
+               address + size > shim;
+    }
 
     /// Switch 2 lays out block-linear surfaces with the console's GOB swizzle.
     void EnableNativeTiling() {
@@ -125,6 +138,10 @@ public:
     void WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
     /// WriteBlockCached of `count` consecutive words within one device page, in a single write.
     void WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count);
+    /// Constant buffer data to device memory the caller translated (not Switch 2 sparse memory).
+    /// FlushCaching hands the written ranges, merged, to the rasterizer's
+    /// InvalidateConstantBufferData instead of InnerInvalidation.
+    void WriteConstantBufferData(DAddr device_addr, const void* data, std::size_t size);
 
     /**
      * Checks if a gpu region can be simply read with a pointer.
@@ -183,6 +200,12 @@ public:
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
+    /// GetSubmappedRange and GetSubmappedDeviceRange by walking the page tables.
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+    GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const;
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+    GetSubmappedDeviceRangeUncached(GPUVAddr gpu_addr, std::size_t size) const;
+
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
     }
@@ -216,10 +239,20 @@ private:
         struct Run {
             GPUVAddr begin;
             GPUVAddr end;
+            DAddr device_addr; ///< Where begin is mapped; the run is contiguous there too.
         };
         std::vector<Run> runs;
         std::vector<std::pair<s64, PTEKind>> kinds;
     };
+
+    /// The segments GetSubmappedRangeImpl walks to, from the snapshot's runs: each run is one
+    /// segment, clipped to the range. Returns false for a range outside the address space.
+    template <bool is_gpu_address>
+    bool SubmappedRangeFromRuns(
+        GPUVAddr gpu_addr, std::size_t size,
+        boost::container::small_vector<
+            std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>&
+            result) const;
 
     /// Rebuilds the runs through the big pages a page table operation touched.
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
@@ -227,6 +260,8 @@ private:
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
                        std::source_location caller) const;
+    /// A download for a guest read not yet in guest memory would land over this write later.
+    void FinishReadsBefore(DAddr dev_addr, std::size_t size, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {
@@ -289,6 +324,8 @@ private:
     boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
+    /// What this address space maps, for a GPU trace that starts later (gpu_trace/recorder.h).
+    VideoCommon::GpuTrace::MapLog trace_maps;
     mutable std::mutex guard;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
@@ -308,6 +345,7 @@ private:
 
     const size_t unique_identifier;
     VideoCommon::InvalidationAccumulator accumulator;
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> constant_buffer_writes;
 
     static std::atomic<size_t> unique_identifier_generator;
 

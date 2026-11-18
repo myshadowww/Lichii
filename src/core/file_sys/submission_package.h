@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -77,6 +76,7 @@ private:
 
     bool extracted = false;
     Loader::ResultStatus status;
+    Loader::ResultStatus nca_error;
     std::map<u64, Loader::ResultStatus> program_status;
 
     std::shared_ptr<PartitionFilesystem> pfs;

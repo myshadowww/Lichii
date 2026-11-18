@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -64,6 +63,10 @@ public:
 
     size_t UpdateCount() const noexcept {
         return upload_start ? static_cast<size_t>(payload_cursor - upload_start) : 0;
+    }
+
+    void ReplaceSampledImage(size_t entry, VkImageView image_view) {
+        upload_start[entry].image.imageView = image_view;
     }
 
     void AddSampledImage(VkImageView image_view, VkSampler sampler) {
@@ -135,7 +138,7 @@ private:
     size_t frame_index{0};
     DescriptorUpdateEntry* payload_cursor = nullptr;
     DescriptorUpdateEntry* payload_start = nullptr;
-    const DescriptorUpdateEntry* upload_start = nullptr;
+    DescriptorUpdateEntry* upload_start = nullptr;
     std::unique_ptr<DescriptorUpdateEntry[]> payload;
     bool growth_disabled{};
     bool fallback_reported{};

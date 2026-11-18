@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
 
 #include <array>
 #include <cstddef>
+#include <span>
 #include <vector>
 
 #include "common/bit_field.h"
@@ -18,6 +18,10 @@
 
 namespace Core {
 class System;
+}
+
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
 }
 
 namespace Tegra {
@@ -99,6 +103,8 @@ public:
  */
 
 class MaxwellDMA final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     struct PackedGPUVAddr {
         u32 upper;
@@ -244,6 +250,21 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// The methods of the register file (CallMethod ignores the ones past it).
+    static constexpr u32 RegisterCount = 0x800;
+    /// Guest memory [address, address + size) a launch writes (size 0: none).
+    struct WriteRange {
+        GPUVAddr address{};
+        u64 size{};
+    };
+    struct LaunchWrites {
+        WriteRange destination; ///< Every byte Launch() may write, whatever layout it picks
+        WriteRange semaphore;   ///< ReleaseSemaphore's
+    };
+    /// What a launch with register file `registers` writes (the split GPU thread's front keeps a
+    /// copy of the registers to place the copies the back makes).
+    [[nodiscard]] static LaunchWrites WritesOfLaunch(std::span<const u32, RegisterCount> registers);
+
     explicit MaxwellDMA(MemoryManager& memory_manager_);
     ~MaxwellDMA() override;
 
@@ -333,6 +354,7 @@ private:
 #undef ASSERT_REG_POSITION
     static_assert(SemaphoreMethod * sizeof(u32) == offsetof(Regs, semaphore));
     static_assert(LaunchDmaMethod * sizeof(u32) == offsetof(Regs, launch_dma));
+    static_assert(RegisterCount == NUM_REGS);
 };
 
 } // namespace Tegra::Engines

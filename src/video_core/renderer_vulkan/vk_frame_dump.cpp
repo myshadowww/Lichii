@@ -7,22 +7,29 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <ranges>
 #include <string>
 #include <string_view>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 
 #include "common/cityhash.h"
+#include "common/fs/fs_util.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/stb.h"
 #include "common/zstd_compression.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/renderer_vulkan/maxwell_to_vk.h"
+#include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_frame_dump.h"
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
+#include "video_core/texture_cache/decode_bc.h"
 #include "video_core/texture_cache/formatter.h"
+#include "video_core/textures/astc.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 
@@ -79,6 +86,10 @@ float Unorm16(u16 value) {
     return value / 65535.0f;
 }
 
+float Snorm8(s8 value) {
+    return std::max(value / 127.0f, -1.0f);
+}
+
 float Identity(float value) {
     return value;
 }
@@ -98,6 +109,10 @@ int DecodePixel(PixelFormat format, const u8* pixel, std::array<float, 4>& out) 
         return Channels<u8>(pixel, 1, out, Unorm8);
     case PixelFormat::R8G8_UNORM:
         return Channels<u8>(pixel, 2, out, Unorm8);
+    case PixelFormat::R8_SNORM:
+        return Channels<s8>(pixel, 1, out, Snorm8);
+    case PixelFormat::R8G8_SNORM:
+        return Channels<s8>(pixel, 2, out, Snorm8);
     case PixelFormat::R16_UNORM:
         return Channels<u16>(pixel, 1, out, Unorm16);
     case PixelFormat::R16G16_UNORM:
@@ -230,9 +245,83 @@ std::string SamplerJson(const Sampler* sampler) {
 
 } // Anonymous namespace
 
+std::optional<PixelFormat> DecodedFormat(PixelFormat format) {
+    const bool srgb = VideoCore::Surface::IsPixelFormatSRGB(format);
+    if (VideoCore::Surface::IsPixelFormatASTC(format)) {
+        return srgb ? PixelFormat::A8B8G8R8_SRGB : PixelFormat::A8B8G8R8_UNORM;
+    }
+    switch (format) {
+    case PixelFormat::BC1_RGBA_UNORM:
+    case PixelFormat::BC1_RGBA_SRGB:
+    case PixelFormat::BC2_UNORM:
+    case PixelFormat::BC2_SRGB:
+    case PixelFormat::BC3_UNORM:
+    case PixelFormat::BC3_SRGB:
+    case PixelFormat::BC7_UNORM:
+    case PixelFormat::BC7_SRGB:
+        return srgb ? PixelFormat::A8B8G8R8_SRGB : PixelFormat::A8B8G8R8_UNORM;
+    case PixelFormat::BC4_UNORM:
+        return PixelFormat::R8_UNORM;
+    case PixelFormat::BC4_SNORM:
+        return PixelFormat::R8_SNORM;
+    case PixelFormat::BC5_UNORM:
+        return PixelFormat::R8G8_UNORM;
+    case PixelFormat::BC5_SNORM:
+        return PixelFormat::R8G8_SNORM;
+    case PixelFormat::BC6H_UFLOAT:
+    case PixelFormat::BC6H_SFLOAT:
+        return PixelFormat::R16G16B16A16_FLOAT;
+    default:
+        return std::nullopt;
+    }
+}
+
+std::vector<u8> DecodeBlocks(PixelFormat format, std::span<const u8> blocks, u32 width, u32 height,
+                             u32 depth) {
+    using namespace VideoCore::Surface;
+    std::vector<u8> out(size_t{width} * height * depth * BytesPerBlock(*DecodedFormat(format)));
+    if (IsPixelFormatASTC(format)) {
+        Tegra::Texture::ASTC::Decompress(blocks, width, height, depth, DefaultBlockWidth(format),
+                                         DefaultBlockHeight(format), out);
+        return out;
+    }
+    // Rows of blocks are tightly packed: DecompressBCn steps a row by buffer_row_length texels.
+    // Slices are decoded one by one, as it steps a slice by whole block rows of output.
+    const size_t slice_blocks =
+        size_t{(width + 3) / 4} * ((height + 3) / 4) * BytesPerBlock(format);
+    const size_t slice_texels = out.size() / depth;
+    for (u32 slice = 0; slice < depth; ++slice) {
+        VideoCommon::BufferImageCopy copy{
+            .buffer_offset = 0,
+            .buffer_size = slice_blocks,
+            .buffer_row_length = width < 4 ? width : (width + 3) & ~3U,
+            .buffer_image_height = height,
+            .image_subresource{},
+            .image_offset{},
+            .image_extent{width, height, 1},
+        };
+        VideoCommon::DecompressBCn(blocks.subspan(slice * slice_blocks, slice_blocks),
+                                   std::span(out).subspan(slice * slice_texels, slice_texels), copy,
+                                   format);
+    }
+    return out;
+}
+
+size_t FirstSampledLevel(std::span<const size_t> level_bytes, size_t limit) {
+    size_t total = 0;
+    for (size_t level = level_bytes.size(); level > 0; --level) {
+        total += level_bytes[level - 1];
+        if (total > limit) {
+            return level;
+        }
+    }
+    return 0;
+}
+
 FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
                      Scheduler& scheduler_)
-    : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_} {
+    : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
+      size_cap{SIZE_CAP} {
     const char* const dir = std::getenv("EDEN_NX2_FRAME_DUMP");
     if (!dir || *dir == '\0') {
         return;
@@ -245,7 +334,8 @@ FrameDump::FrameDump(const Device& device_, MemoryAllocator& memory_allocator_,
     // "file" captures once <dir>/capture.now exists, so a frame can be picked while playing.
     schedule.Configure(value, directory / "capture.now",
                        sampled_value && *sampled_value != '\0' && *sampled_value != '0');
-    LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}", directory.string(), value);
+    LOG_INFO(Render_Vulkan, "Frame dump armed: dir={} at={}",
+             Common::FS::PathToUTF8String(directory), value);
 }
 
 FrameDump::~FrameDump() {
@@ -265,15 +355,20 @@ void FrameDump::StopWriter() {
     stop_writer = false;
 }
 
-void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers, u64 id) {
-    if (!schedule.Arm(sampled, buffers, id)) {
-        VideoCore::Nx2Debug::FinishCapture(id, {.error = "another capture is in progress"});
+void FrameDump::Arm(VideoCore::Nx2Debug::CaptureRequest request) {
+    if (!schedule.Arm(request.sampled, request.buffers, request.id, request.shaders)) {
+        VideoCore::Nx2Debug::FinishCapture(request.id, {.error = "another capture is in progress"});
         return;
     }
     StopWriter();
-    directory = std::move(directory_);
+    directory = std::move(request.directory);
+    write_raw = request.raw;
+    size_cap = request.size_cap != 0 ? request.size_cap : SIZE_CAP;
+    preview_max = request.preview_max;
+    preview_jpeg = request.preview_jpeg;
     truncated = false;
     recorded_bytes = 0;
+    sampled_bytes = 0;
     written_bytes = 0;
     sequence = 0;
     images = 0;
@@ -281,6 +376,8 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     dispatch_sampled.clear();
     seen_buffers.clear();
     written_buffers.clear();
+    shader_pipelines.clear();
+    shader_programs.clear();
     pass_index = 0;
     draws = 0;
     dispatches = 0;
@@ -289,18 +386,23 @@ void FrameDump::Arm(std::filesystem::path directory_, bool sampled, bool buffers
     }
 }
 
-std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot) const {
+std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot,
+                                                       std::optional<s32> level_) const {
     using namespace VideoCore::Surface;
     const Image* const image = view.BackingImage();
     if (!image) {
         return std::nullopt;
     }
     const auto& info = image->info;
+    const PixelFormat host_format = image->HostFormat();
+    if (info.type == VideoCommon::ImageType::Buffer || host_format == PixelFormat::Invalid) {
+        return std::nullopt;
+    }
     const SurfaceType type = GetFormatType(info.format);
-    if (info.type == VideoCommon::ImageType::Buffer ||
-        (type != SurfaceType::ColorTexture && type != SurfaceType::Depth &&
+    const bool blocks = DefaultBlockWidth(host_format) != 1 || DefaultBlockHeight(host_format) != 1;
+    if ((type != SurfaceType::ColorTexture && type != SurfaceType::Depth &&
          type != SurfaceType::DepthStencil) ||
-        DefaultBlockWidth(info.format) != 1 || DefaultBlockHeight(info.format) != 1) {
+        (blocks && !DecodedFormat(host_format))) {
         return std::nullopt;
     }
     DepthEncoding depth_encoding = DepthEncoding::None;
@@ -327,17 +429,19 @@ std::optional<FrameDump::Target> FrameDump::MakeTarget(ImageView& view, u32 slot
     const auto& resolution = Settings::values.resolution_info;
     const u32 width = rescaled ? resolution.ScaleUp(info.size.width) : info.size.width;
     const u32 height = rescaled ? resolution.ScaleUp(info.size.height) : info.size.height;
-    const u32 level = static_cast<u32>(view.range.base.level);
+    const s32 level = level_.value_or(view.range.base.level);
     return Target{
         .slot = slot,
         .image = image->Handle(),
-        .format = BytesPerBlock(view.format) == BytesPerBlock(info.format) ? view.format
-                                                                           : info.format,
+        .format = host_format != info.format ? host_format
+                  : BytesPerBlock(view.format) == BytesPerBlock(info.format) ? view.format
+                                                                             : info.format,
         .width = std::max(1U, width >> level),
         .height = std::max(1U, height >> level),
         .depth = info.type == VideoCommon::ImageType::e3D ? std::max(1U, info.size.depth >> level)
                                                           : 1U,
-        .level = view.range.base.level,
+        .level = level,
+        .host_level = level - static_cast<s32>(image->host_level_offset),
         .layer = info.type == VideoCommon::ImageType::e3D ? 0 : view.range.base.layer,
         .gpu_addr = image->gpu_addr,
         .rescaled = rescaled,
@@ -355,6 +459,15 @@ u32 FrameDump::TexelBytes(const Target& target) {
     default:
         return 4;
     }
+}
+
+size_t FrameDump::ReadbackBytes(const Target& target) {
+    using namespace VideoCore::Surface;
+    const u32 block_width = DefaultBlockWidth(target.format);
+    const u32 block_height = DefaultBlockHeight(target.format);
+    return size_t{(target.width + block_width - 1) / block_width} *
+           ((target.height + block_height - 1) / block_height) * target.depth *
+           TexelBytes(target);
 }
 
 int FrameDump::Decode(const Target& target, const u8* pixel, std::array<float, 4>& out) {
@@ -410,16 +523,54 @@ std::optional<std::pair<GPUVAddr, u32>> SampledKey(const FrameDump::Sampled& tex
 bool FrameDump::RecordSampled(const Sampled& texture, u32 index, std::string name,
                               std::string tags) {
     tags += SamplerJson(texture.sampler);
-    if (const auto target = MakeTarget(*texture.view, index)) {
-        return Record(*target, std::move(name), std::move(tags));
-    }
     const Image& image = *texture.view->BackingImage();
-    const auto& info = image.info;
-    Enqueue({.tags = fmt::format(
-                 R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},"gpu_addr":"{:#x}","skipped":"format"}})",
-                 name, tags, info.format, info.size.width, info.size.height, info.size.depth,
-                 static_cast<u32>(info.type), image.gpu_addr)});
-    return false;
+    const auto skip = [&](std::string_view reason) {
+        const auto& info = image.info;
+        Enqueue({.tags = fmt::format(
+                     R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"type":{},"gpu_addr":"{:#x}","skipped":"{}"}})",
+                     name, tags, info.format, info.size.width, info.size.height, info.size.depth,
+                     static_cast<u32>(info.type), image.gpu_addr, reason)});
+        return false;
+    };
+    const ImageView& view = *texture.view;
+    const s32 end = std::min(view.range.base.level + view.range.extent.levels,
+                             static_cast<s32>(image.HostMipLevels() + image.host_level_offset));
+    std::vector<Target> levels;
+    std::vector<size_t> level_bytes;
+    for (s32 level = std::max(view.range.base.level, static_cast<s32>(image.host_level_offset));
+         level < end; ++level) {
+        const auto target = MakeTarget(*texture.view, index, level);
+        if (!target) {
+            return skip("format");
+        }
+        levels.push_back(*target);
+        level_bytes.push_back(ReadbackBytes(*target));
+    }
+    if (levels.empty()) {
+        return skip("format");
+    }
+    // Sampled textures get at most half the cap, and none more than a sixteenth of it, so the
+    // pass targets after them still fit. Mario Kart World's first compute dispatches sample four
+    // terrain textures of 896 MiB together, which filled a bug bundle's 1 GiB before any view was
+    // drawn. A mip chain that does not fit loses its finest levels first.
+    const size_t limit =
+        std::min(size_cap / 16, size_cap / 2 - std::min(sampled_bytes, size_cap / 2));
+    const size_t first = FirstSampledLevel(level_bytes, limit);
+    if (first == levels.size()) {
+        return skip("size");
+    }
+    if (first != 0) {
+        tags += fmt::format(R"(,"levels_skipped_for_size":{})", first);
+    }
+    bool recorded = false;
+    for (size_t i = first; i < levels.size(); ++i) {
+        if (!Record(levels[i], fmt::format("{}_l{}", name, levels[i].level), tags)) {
+            break;
+        }
+        sampled_bytes += level_bytes[i];
+        recorded = true;
+    }
+    return recorded;
 }
 
 bool FrameDump::NoteSampled(std::span<const Sampled> textures) {
@@ -573,8 +724,8 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
         Enqueue({.tags = fmt::format(R"({{"name":"{}",{},"skipped":"msaa"}})", name, tags)});
         return false;
     }
-    const size_t size = size_t{target.width} * target.height * target.depth * TexelBytes(target);
-    if (recorded_bytes + size > SIZE_CAP) {
+    const size_t size = ReadbackBytes(target);
+    if (recorded_bytes + size > size_cap) {
         truncated = true;
         return false;
     }
@@ -595,7 +746,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
             .aspectMask = target.depth_encoding == DepthEncoding::None
                               ? VkImageAspectFlags{VK_IMAGE_ASPECT_COLOR_BIT}
                               : VkImageAspectFlags{VK_IMAGE_ASPECT_DEPTH_BIT},
-            .mipLevel = static_cast<u32>(target.level),
+            .mipLevel = static_cast<u32>(target.host_level),
             .baseArrayLayer = static_cast<u32>(target.layer),
             .layerCount = 1,
         },
@@ -628,7 +779,7 @@ bool FrameDump::Record(const Target& target, std::string name, std::string tags)
 }
 
 bool FrameDump::RecordBuffer(VkBuffer source, u32 offset, u32 size, std::string tags) {
-    if (recorded_bytes + size > SIZE_CAP) {
+    if (recorded_bytes + size > size_cap) {
         truncated = true;
         return false;
     }
@@ -686,9 +837,8 @@ void FrameDump::Drain() {
     for (Readback& readback : readbacks) {
         readback.buffer.Invalidate();
         const Target& target = readback.target;
-        const auto mapped = readback.buffer.Mapped().first(
-            readback.raw ? readback.bytes
-                         : size_t{target.width} * target.height * target.depth * TexelBytes(target));
+        const auto mapped =
+            readback.buffer.Mapped().first(readback.raw ? readback.bytes : ReadbackBytes(target));
         Enqueue({.target = target,
                  .name = std::move(readback.name),
                  .tags = std::move(readback.tags),
@@ -725,13 +875,26 @@ void FrameDump::WriterLoop() {
                             images, job.tags, written_bytes, job.truncated)
                      << '\n';
             manifest.close();
+            shader_manifest.close();
             LOG_INFO(Render_Vulkan, "Frame dump done: {} images, {}, {} MiB in {}{}", images,
-                     job.tags, written_bytes >> 20, directory.string(),
-                     job.truncated ? fmt::format(" (stopped at the {} GiB cap)", SIZE_CAP >> 30)
+                     job.tags, written_bytes >> 20, Common::FS::PathToUTF8String(directory),
+                     job.truncated ? fmt::format(" (stopped at the {} MiB cap)", size_cap >> 20)
                                    : "");
             if (const u64 id = schedule.CaptureId(); id != 0) {
                 VideoCore::Nx2Debug::FinishCapture(id, {});
             }
+            continue;
+        }
+        if (!job.file.empty()) {
+            if (!job.zstd) {
+                WriteFile("shaders/" + job.file, job.data);
+            } else {
+                WriteFile("shaders/" + job.file, Common::Compression::DecompressDataZSTD(job.data));
+            }
+            continue;
+        }
+        if (job.shader_line) {
+            shader_manifest << job.tags << '\n';
             continue;
         }
         if (job.raw) {
@@ -746,13 +909,25 @@ void FrameDump::WriterLoop() {
 }
 
 void FrameDump::Write(const Job& job) {
-    const Target& target = job.target;
+    std::string raw{"null"};
+    if (write_raw) {
+        WriteFile(job.name + ".raw.zst",
+                  Common::Compression::CompressDataZSTDDefault(job.data.data(), job.data.size()));
+        raw = fmt::format("\"{}.raw.zst\"", job.name);
+    }
+    ++images;
+    Target target = job.target;
+    std::span<const u8> data = job.data;
+    std::vector<u8> decoded;
+    std::string decoded_tag;
+    if (const auto format = DecodedFormat(target.format)) {
+        decoded = DecodeBlocks(target.format, data, target.width, target.height, target.depth);
+        decoded_tag = fmt::format(R"(,"decoded":"{}")", *format);
+        target.format = *format;
+        data = decoded;
+    }
     const u32 bytes_per_pixel = TexelBytes(target);
     const size_t pixels = size_t{target.width} * target.height * target.depth;
-    const std::span<const u8> data = job.data;
-    WriteFile(job.name + ".raw.zst",
-              Common::Compression::CompressDataZSTDDefault(data.data(), data.size()));
-    ++images;
 
     std::array<float, 4> pixel;
     const int channels = Decode(target, data.data(), pixel);
@@ -806,25 +981,41 @@ void FrameDump::Write(const Job& job) {
         stats = fmt::format(R"(,"min":{},"max":{},"mean":{},"nan":{},"inf":{})",
                             JsonArray(first(lo)), JsonArray(first(hi)), JsonArray(first(mean)),
                             JsonArray(first(nans)), JsonArray(first(infs)));
+        int width = static_cast<int>(target.width);
+        int height = static_cast<int>(target.height * target.depth);
+        if (preview_max != 0 && static_cast<u32>((std::max)(width, height)) > preview_max) {
+            const double scale = static_cast<double>(preview_max) / (std::max)(width, height);
+            const int scaled_width = (std::max)(1, static_cast<int>(width * scale));
+            const int scaled_height = (std::max)(1, static_cast<int>(height * scale));
+            std::vector<u8> scaled(size_t(scaled_width) * scaled_height * 3);
+            stbir_resize_uint8(rgb.data(), width, height, 0, scaled.data(), scaled_width,
+                               scaled_height, 0, 3);
+            rgb = std::move(scaled);
+            width = scaled_width;
+            height = scaled_height;
+        }
+        const auto append = [](void* context, void* bytes, int size) {
+            auto* const out = static_cast<std::vector<u8>*>(context);
+            const auto* const begin = static_cast<const u8*>(bytes);
+            out->insert(out->end(), begin, begin + size);
+        };
         std::vector<u8> encoded;
-        const int ok = stbi_write_png_to_func(
-            [](void* context, void* bytes, int size) {
-                auto* const out = static_cast<std::vector<u8>*>(context);
-                const auto* const begin = static_cast<const u8*>(bytes);
-                out->insert(out->end(), begin, begin + size);
-            },
-            &encoded, static_cast<int>(target.width), static_cast<int>(target.height * target.depth), 3,
-            rgb.data(), static_cast<int>(target.width * 3));
+        const int ok = preview_jpeg
+                           ? stbi_write_jpg_to_func(append, &encoded, width, height, 3, rgb.data(), 85)
+                           : stbi_write_png_to_func(append, &encoded, width, height, 3, rgb.data(),
+                                                    width * 3);
         if (ok != 0) {
-            WriteFile(job.name + ".png", encoded);
-            png = fmt::format("\"{}.png\"", job.name);
+            const std::string file = job.name + (preview_jpeg ? ".jpg" : ".png");
+            WriteFile(file, encoded);
+            png = preview_jpeg ? fmt::format(R"(null,"preview":"{}")", file)
+                               : fmt::format("\"{}\"", file);
         }
     }
     manifest << fmt::format(
-                    R"({{"name":"{}",{},"format":"{}","width":{},"height":{},"depth":{},"level":{},"layer":{},"gpu_addr":"{:#x}","rescaled":{},"depth_encoding":{},"raw":"{}.raw.zst","png":{}{}}})",
-                    job.name, job.tags, target.format, target.width, target.height,
-                    target.depth, target.level, target.layer, target.gpu_addr, target.rescaled,
-                    static_cast<u32>(target.depth_encoding), job.name, png, stats)
+                    R"({{"name":"{}",{},"format":"{}"{},"width":{},"height":{},"depth":{},"level":{},"layer":{},"gpu_addr":"{:#x}","rescaled":{},"depth_encoding":{},"raw":{},"png":{}{}}})",
+                    job.name, job.tags, job.target.format, decoded_tag, target.width,
+                    target.height, target.depth, target.level, target.layer, target.gpu_addr,
+                    target.rescaled, static_cast<u32>(target.depth_encoding), raw, png, stats)
              << '\n';
 }
 
@@ -838,6 +1029,88 @@ void FrameDump::WriteBuffer(const Job& job) {
                                                                      job.data.size()));
     }
     manifest << fmt::format(R"({{{},"hash":"{:016x}","raw":"{}"}})", job.tags, hash, name) << '\n';
+}
+
+bool FrameDump::WantsShaders(const void* pipeline) const {
+    return schedule.Capturing() && schedule.Shaders() &&
+           std::ranges::find(shader_pipelines, pipeline) == shader_pipelines.end();
+}
+
+std::string FrameDump::NoteProgram(const VideoCommon::CapturedProgram& program) {
+    const bool compute = program.slot == 6;
+    const std::string name =
+        program.native_key != 0
+            ? fmt::format("{:016x}-{}-{:x}", program.native_key, compute ? "cs" : "gfx",
+                          program.address)
+            : fmt::format("{:016x}-maxwell-{:x}", program.unique_hash, program.address);
+    if (std::ranges::find(shader_programs, name) == shader_programs.end()) {
+        shader_programs.push_back(name);
+        Enqueue({.data = program.code, .file = fmt::format("native/{}.bin", name)});
+        if (!program.header.empty()) {
+            Enqueue({.data = program.header, .file = fmt::format("native/{}.header.bin", name)});
+        }
+    }
+    return fmt::format(
+        R"({{"slot":{},"hash":"{:016x}","native_key":"{:016x}","address":"{:#x}","code":"native/{}.bin","header":{}}})",
+        program.slot, program.unique_hash, program.native_key, program.address, name,
+        program.header.empty() ? "null" : fmt::format("\"native/{}.header.bin\"", name));
+}
+
+void FrameDump::NoteGraphicsShaders(const GraphicsPipeline& pipeline,
+                                    std::span<const VideoCommon::CapturedProgram> programs) {
+    shader_pipelines.push_back(&pipeline);
+    const auto& key = pipeline.Key();
+    const u64 hash = key.Hash();
+    const std::string key_file = fmt::format("pipelines/{:016x}.key.bin", hash);
+    const auto* const key_bytes = reinterpret_cast<const u8*>(&key);
+    Enqueue({.data = {key_bytes, key_bytes + key.Size()}, .file = key_file});
+    std::string program_entries;
+    for (const auto& program : programs) {
+        program_entries += (program_entries.empty() ? "" : ",") + NoteProgram(program);
+    }
+    std::string spirv_entries;
+    const bool built = pipeline.IsBuilt();
+    if (built) {
+        const auto& kept = pipeline.KeptSpirv();
+        for (size_t stage = 0; stage < kept.size(); ++stage) {
+            if (kept[stage].empty()) {
+                continue;
+            }
+            const std::string file = fmt::format("spirv/{:016x}-{}.spv", hash, stage);
+            Enqueue({.data = kept[stage], .file = file, .zstd = true});
+            spirv_entries += fmt::format(R"({}{{"stage":{},"file":"{}"}})",
+                                         spirv_entries.empty() ? "" : ",", stage, file);
+        }
+    }
+    Enqueue({.tags = fmt::format(
+                 R"({{"kind":"graphics","pipeline":"{:016x}","key":"{}","key_bytes":{},"built":{},"hashes":[{}],"programs":[{}],"spirv":[{}]}})",
+                 hash, key_file, key.Size(), built,
+                 fmt::join(pipeline.ShaderHashes() | std::views::transform([](u64 value) {
+                               return fmt::format("\"{:016x}\"", value);
+                           }),
+                           ","),
+                 program_entries, spirv_entries),
+             .shader_line = true});
+}
+
+void FrameDump::NoteComputeShaders(const ComputePipeline& pipeline,
+                                   const std::optional<VideoCommon::CapturedProgram>& program,
+                                   std::span<const u8> qmd) {
+    shader_pipelines.push_back(&pipeline);
+    const u64 hash = pipeline.ShaderHash();
+    const std::string qmd_file = fmt::format("pipelines/{:016x}.qmd.bin", hash);
+    Enqueue({.data = {qmd.begin(), qmd.end()}, .file = qmd_file});
+    std::string spirv{"null"};
+    const bool built = pipeline.IsBuilt();
+    if (built && !pipeline.KeptSpirv().empty()) {
+        const std::string file = fmt::format("spirv/{:016x}-cs.spv", hash);
+        Enqueue({.data = pipeline.KeptSpirv(), .file = file, .zstd = true});
+        spirv = fmt::format("\"{}\"", file);
+    }
+    Enqueue({.tags = fmt::format(
+                 R"({{"kind":"compute","shader":"{:016x}","qmd":"{}","built":{},"program":{},"spirv":{}}})",
+                 hash, qmd_file, built, program ? NoteProgram(*program) : std::string{"null"}, spirv),
+             .shader_line = true});
 }
 
 void FrameDump::WriteFile(const std::string& name, std::span<const u8> data) {
@@ -855,8 +1128,13 @@ void FrameDump::TickFrame() {
     case FrameDumpSchedule::Step::Finish:
         EndPass();
         Drain();
-        Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{})", pass_index,
-                                     draws, dispatches),
+        Enqueue({.tags = fmt::format(R"("passes":{},"draws":{},"dispatches":{}{})", pass_index,
+                                     draws, dispatches,
+                                     schedule.Shaders()
+                                         ? fmt::format(R"(,"pipelines":{},"programs":{})",
+                                                       shader_pipelines.size(),
+                                                       shader_programs.size())
+                                         : std::string{}),
                  .summary = true,
                  .truncated = truncated});
         return;
@@ -867,7 +1145,8 @@ void FrameDump::TickFrame() {
     std::filesystem::create_directories(directory, error);
     manifest.open(directory / "manifest.jsonl", std::ios::trunc);
     if (!manifest) {
-        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}", directory.string());
+        LOG_ERROR(Render_Vulkan, "Frame dump: cannot write {}",
+                  Common::FS::PathToUTF8String(directory));
         if (const u64 id = schedule.CaptureId(); id != 0) {
             VideoCore::Nx2Debug::FinishCapture(
                 id, {.error = fmt::format("cannot write {}", directory.generic_string())});
@@ -875,12 +1154,18 @@ void FrameDump::TickFrame() {
         schedule.Abort();
         return;
     }
+    if (schedule.Shaders()) {
+        for (const char* const folder : {"native", "spirv", "pipelines"}) {
+            std::filesystem::create_directories(directory / "shaders" / folder, error);
+        }
+        shader_manifest.open(directory / "shaders" / "shaders.jsonl", std::ios::trunc);
+    }
     const u64 frame = schedule.Frame();
     manifest << fmt::format(R"({{"kind":"frame","frame":{},"seconds":{:.3f}}})", frame, elapsed)
              << '\n';
     writer = std::thread{[this] { WriterLoop(); }};
     LOG_INFO(Render_Vulkan, "Frame dump: capturing frame {} ({:.1f} s after boot){} into {}", frame,
-             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), directory.string());
+             elapsed, schedule.Sampled() ? (schedule.Buffers() ? " with sampled textures and buffers" : " with sampled textures") : (schedule.Buffers() ? " with buffers" : ""), Common::FS::PathToUTF8String(directory));
 }
 
 void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path trigger_file_,
@@ -897,7 +1182,7 @@ void FrameDumpSchedule::Configure(std::string_view at, std::filesystem::path tri
     }
 }
 
-bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id) {
+bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id, bool shaders_) {
     if (capturing) {
         return false;
     }
@@ -905,6 +1190,7 @@ bool FrameDumpSchedule::Arm(bool sampled_, bool buffers_, u64 id) {
     done = false;
     sampled = sampled_;
     buffers = buffers_;
+    shaders = shaders_;
     trigger_frame = 0;
     capture_id = id;
     return true;

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -28,6 +27,10 @@
 
 namespace Vulkan {
 namespace {
+// Zero-filled space after each buffer on MoltenVK. Shaders declare every constant buffer at its
+// full 64 KiB and Metal validates that length from the binding offset.
+constexpr VkDeviceSize MOLTENVK_BUFFER_TAIL = 65536;
+
 void HostReadBarrier(vk::CommandBuffer cmdbuf) {
     const VkMemoryBarrier barrier{
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -71,8 +74,8 @@ size_t BytesPerIndex(VkIndexType index_type) {
     }
 }
 
-vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
-                        VkDeviceSize sparse_alignment) {
+vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator,
+                        StagingBufferPool& staging_pool, u64 size, VkDeviceSize sparse_alignment) {
     VkBufferUsageFlags flags =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
@@ -92,17 +95,32 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = size,
+        .size = size + (device.IsMoltenVK() ? MOLTENVK_BUFFER_TAIL : 0),
         .usage = flags,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
-    if (sparse_alignment > 1) {
-        return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
-    }
-    return memory_allocator.CreateBuffer(
-        buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
+    // The staging pool holds most of the memory that can be freed now (#262: 926 MiB of an Intel
+    // UHD's 3.2 GB heap when a 128 KiB buffer had no room after a scene change).
+    return CreateAfterRecovery(
+        [&] {
+            if (sparse_alignment > 1) {
+                return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal,
+                                                     sparse_alignment);
+            }
+            return memory_allocator.CreateBuffer(
+                buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
+        },
+        [&] {
+            static u32 logged{};
+            if (logged++ < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "No memory for a {} byte buffer; freeing staging buffers and retrying",
+                            size);
+            }
+            staging_pool.ReleaseMemory();
+        });
 }
 } // Anonymous namespace
 
@@ -123,11 +141,25 @@ Buffer::Buffer(BufferCacheRuntime& runtime, DAddr cpu_addr_, u64 size_bytes_,
                bool sparse_compatible_)
     : VideoCommon::BufferBase(cpu_addr_, size_bytes_), device{&runtime.device},
       scheduler{&runtime.scheduler},
-      buffer{CreateBuffer(*device, runtime.memory_allocator, SizeBytes(),
+      buffer{CreateBuffer(*device, runtime.memory_allocator, runtime.staging_pool, SizeBytes(),
                           runtime.SparseAlignmentFor(sparse_compatible_))},
       tracker{SizeBytes()} {
     sparse_compatible = sparse_compatible_;
-    if (runtime.device.HasDebuggingToolAttached()) {
+    if (device->IsMoltenVK()) {
+        runtime.scheduler.RequestOutsideRenderPassOperationContext();
+        runtime.scheduler.Record([handle = *buffer, offset = SizeBytes()](vk::CommandBuffer cmdbuf) {
+            cmdbuf.FillBuffer(handle, offset, MOLTENVK_BUFFER_TAIL, 0);
+            const VkMemoryBarrier barrier{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT,
+            };
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                   0, barrier);
+        });
+    }
+    if (runtime.device.NamesObjects()) {
         buffer.SetObjectNameEXT(fmt::format("Buffer {:#x}", CpuAddr()).c_str());
     }
     if (device->IsBufferDeviceAddressSupported()) {
@@ -215,7 +247,7 @@ public:
             .pQueueFamilyIndices = nullptr,
         };
         buffer = memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal);
-        if (device.HasDebuggingToolAttached()) {
+        if (device.NamesObjects()) {
             buffer.SetObjectNameEXT("Quad LUT");
         }
 
@@ -399,8 +431,11 @@ BufferCacheRuntime::BufferCacheRuntime(const Device& device_, MemoryAllocator& m
     limit_dynamic_storage_buffers = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                     driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
     if (limit_dynamic_storage_buffers) {
-        max_dynamic_storage_buffers = device.GetMaxDescriptorSetStorageBuffersDynamic();
-    }    
+        // Guest storage buffers are bound as plain VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, so the
+        // per-stage limit applies, not the much lower dynamic one (16 on Adreno 830, which left
+        // Ocarina of Time's compute shaders with half their buffers unbound).
+        max_dynamic_storage_buffers = device.GetMaxPerStageDescriptorStorageBuffers();
+    }
     if (device.SupportsUint8Indices()) {
         uint8_pass = std::make_unique<Uint8Pass>(device, scheduler, descriptor_pool, staging_pool,
                                                  compute_pass_descriptor_queue);
@@ -449,6 +484,10 @@ u64 BufferCacheRuntime::GetDeviceMemoryUsage() const {
 
 bool BufferCacheRuntime::CanReportMemoryUsage() const {
     return device.CanReportMemoryUsage();
+}
+
+u64 BufferCacheRuntime::GetBufferAllocationTail() const {
+    return device.IsMoltenVK() ? MOLTENVK_BUFFER_TAIL : 0;
 }
 
 u32 BufferCacheRuntime::GetUniformBufferAlignment() const {
@@ -914,14 +953,21 @@ void BufferCacheRuntime::ReserveNullBuffer() {
     }
 }
 
+VkDeviceSize BufferCacheRuntime::NullBufferSize() const {
+    return device.IsMoltenVK() ? MOLTENVK_BUFFER_TAIL : 4;
+}
+
 vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
     VkBufferCreateInfo create_info{
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .size = 4,
+        .size = NullBufferSize(),
         .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                 VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
@@ -933,13 +979,23 @@ vk::Buffer BufferCacheRuntime::CreateNullBuffer() {
         create_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
     vk::Buffer ret = memory_allocator.CreateBuffer(create_info, MemoryUsage::DeviceLocal);
-    if (device.HasDebuggingToolAttached()) {
+    if (device.NamesObjects()) {
         ret.SetObjectNameEXT("Null buffer");
     }
 
     scheduler.RequestOutsideRenderPassOperationContext();
     scheduler.Record([buffer = *ret](vk::CommandBuffer cmdbuf) {
         cmdbuf.FillBuffer(buffer, 0, VK_WHOLE_SIZE, 0);
+        const VkMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+                             VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT |
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               0, barrier);
     });
 
     return ret;

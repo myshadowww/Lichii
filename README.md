@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 -->
 
@@ -62,13 +61,13 @@ Search [this fork's issues](https://github.com/myshadowww/Lichii/issues) before 
 - Relevant settings and steps to reproduce the problem.
 - A screenshot and the log from the affected session, after checking it for personal information.
 
-Do not upload game files, keys, firmware or private account information.
+Do not upload game files, keys, firmware or private account information. Bug bundles, GPU traces, shader dumps, pipeline caches and crash dumps can also contain game data. Do not attach them to public reports; ask a maintainer for handling instructions before sharing them. Plain-text logs should be checked for sensitive information before posting.
 
 The inherited **Submit compatibility report** option in the application connects to an upstream service. Use this fork's GitHub issue tracker for reports about our builds.
 
 ## Building and contributing
 
-Start with the [Linux AppImage build guide](docs/linux-releases.md) for our release configuration. See also the [general build guide](docs/Build.md), [user documentation](docs/user/README.md), [contribution guide](CONTRIBUTING.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target remains `yuzu`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
+Start with the [Linux AppImage build guide](docs/linux-releases.md) for our release configuration. See also the [general build guide](docs/Build.md), [user documentation](docs/user/README.md), [contribution guide](CONTRIBUTING.md) and [coding guidelines](docs/Coding.md). Some inherited documentation and internal build target names still use upstream names. The GUI build target is `lichii`; its output is `lichii.exe` on Windows and `lichii` on other desktop platforms.
 
 Open pull requests against this repository's `desktop` branch. Bug reports with reproduction steps, Linux testing, documentation improvements and code contributions all help. Keep changes focused and distinguish code-level checks from actual gameplay testing.
 

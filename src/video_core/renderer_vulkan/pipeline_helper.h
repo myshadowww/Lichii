@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -147,9 +146,17 @@ class DescriptorLayoutBuilder {
 public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
 
+    /// Whether the layout exceeds the core descriptor limits, which only sets from an
+    /// update-after-bind pool may do: they count against the larger limits of such pools.
+    bool UsesUpdateAfterBindPool() const {
+        return device->UpdateAfterBindSampledLimits() &&
+               ExceedsSampledDescriptorLimits(std::span(bindings.data(), bindings.size()),
+                                              device->CoreSampledLimits());
+    }
+
     bool CanUsePushDescriptor() const noexcept {
         if (!device->IsKhrPushDescriptorSupported() ||
-            num_descriptors > device->MaxPushDescriptors()) {
+            num_descriptors > device->MaxPushDescriptors() || UsesUpdateAfterBindPool()) {
             return false;
         }
         return !device->IsExtDescriptorBufferSupported() ||
@@ -159,7 +166,7 @@ public:
     bool CanUseDescriptorBuffer() const noexcept {
         const auto& props = device->DescriptorBufferProperties();
         if (!device->IsExtDescriptorBufferSupported() || bindings.empty() ||
-            !props.combinedImageSamplerDescriptorSingleArray) {
+            !props.combinedImageSamplerDescriptorSingleArray || UsesUpdateAfterBindPool()) {
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();
@@ -195,6 +202,9 @@ public:
         }
         if (use_descriptor_buffer) {
             flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+        }
+        if (!use_push_descriptor && !use_descriptor_buffer && UsesUpdateAfterBindPool()) {
+            flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
         }
         boost::container::small_vector<VkDescriptorBindingFlags, 32> binding_flags;
         VkDescriptorSetLayoutBindingFlagsCreateInfo binding_flags_ci{};
@@ -392,6 +402,22 @@ public:
     std::array<f32, 4> words{};
 };
 
+/// Whether a depth-compare sample of image_view is undefined and its handle garbage: its format
+/// has no depth comparison on this device (what the sample returns then differs between vendors)
+/// and it is an integer or block-compressed color texture, or its handle was read from memory (a
+/// handle program). A single-channel color texture with a cbuf handle may be one a game compares
+/// on purpose, and keeps its view.
+[[nodiscard]] inline bool IsUncomparable(const ImageView& image_view, bool read_from_memory) {
+    if (image_view.SupportsDepthComparison()) {
+        return false;
+    }
+    const VideoCore::Surface::PixelFormat format{image_view.format};
+    return read_from_memory || VideoCore::Surface::IsPixelFormatInteger(format) ||
+           VideoCore::Surface::IsPixelFormatASTC(format) ||
+           VideoCore::Surface::IsPixelFormatBCn(format) ||
+           VideoCore::Surface::IsPixelFormatETC2(format);
+}
+
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
@@ -404,8 +430,13 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.texture_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            VideoCommon::ImageViewId image_view_id{(views++)->id};
             const VideoCommon::SamplerId sampler_id{*(samplers++)};
+            if (desc.is_depth && image_view_id != VideoCommon::NULL_IMAGE_VIEW_ID &&
+                IsUncomparable(texture_cache.GetImageView(image_view_id),
+                               desc.handle_program != ~0U)) {
+                image_view_id = VideoCommon::NULL_IMAGE_VIEW_ID;
+            }
             ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             VkImageView vk_image_view{image_view.Handle(desc.type)};
             if (vk_image_view == VK_NULL_HANDLE) {
@@ -423,11 +454,12 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.image_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             const VkImageView vk_image_view{
                 image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+                texture_cache.MarkStorageWrite(image_view_id);
             }
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};

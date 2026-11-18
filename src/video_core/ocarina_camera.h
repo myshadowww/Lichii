@@ -25,7 +25,7 @@ struct OcarinaCamera {
 };
 
 inline OcarinaCamera DecodeOcarinaCamera(std::span<const f32> values, u32 target_width,
-                                        u32 target_height) {
+                                        u32 target_height, bool allow_padding) {
     OcarinaCamera camera;
     if (values.size_bytes() < OcarinaCameraBytes) {
         return camera;
@@ -39,8 +39,11 @@ inline OcarinaCamera DecodeOcarinaCamera(std::span<const f32> values, u32 target
     }
     camera.width = static_cast<u32>(width);
     camera.height = static_cast<u32>(height);
+    // DLSS Balanced draws 2276x1280 into 2288x1280 (QuincyForbes' f7d0938b5b).
+    // Only DLSS accepts that padding, with the existing limit of 15 pixels per dimension.
     if (static_cast<f32>(camera.width) != width || static_cast<f32>(camera.height) != height ||
-        camera.width != target_width || camera.height != target_height) {
+        target_width - camera.width >= 16 || target_height - camera.height >= 16 ||
+        (!allow_padding && (camera.width != target_width || camera.height != target_height))) {
         return camera;
     }
     camera.issue = OcarinaCameraIssue::Projection;
@@ -51,6 +54,26 @@ inline OcarinaCamera DecodeOcarinaCamera(std::span<const f32> values, u32 target
     std::copy_n(values.begin() + 0x180 / sizeof(f32), 16, camera.previous.begin());
     camera.issue = OcarinaCameraIssue::None;
     return camera;
+}
+
+/// The FSR jitter for a phase (from 1) as a Halton (2, 3) offset in render pixels, applied to the
+/// scene's viewport. AMD's own drivers (PAL) clip each viewport to an integer scissor that drops
+/// the fraction of its right and bottom edges, so a negative offset loses the last column and row
+/// of every jittered draw there; on those drivers the offsets stay in [0, 1) instead of
+/// [-0.5, 0.5).
+inline std::array<f32, 2> OcarinaJitter(u32 index, bool truncated_viewport_edges) {
+    const auto halton = [](u32 value, u32 base) {
+        f32 fraction = 1.0f;
+        f32 result = 0.0f;
+        while (value > 0) {
+            fraction /= static_cast<f32>(base);
+            result += fraction * static_cast<f32>(value % base);
+            value /= base;
+        }
+        return result;
+    };
+    const f32 center = truncated_viewport_edges ? 0.0f : 0.5f;
+    return {halton(index, 2) - center, halton(index, 3) - center};
 }
 
 } // namespace VideoCommon

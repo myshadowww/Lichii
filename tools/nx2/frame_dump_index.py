@@ -41,11 +41,15 @@ def card(entry):
         title = f"pass {entry['pass']} samples tic {entry['tic']} (stage {entry['stage']}) · draw {entry['draw']}"
     else:
         title = f"present · after draw {entry.get('after_draws', '?')}"
-    png = entry.get("png")
+    png = entry.get("png") or entry.get("preview")
+    if not isinstance(png, str) or ":" in png or png.startswith(("/", "\\")):
+        png = None
     image = (f'<a href="{html.escape(png)}"><img loading="lazy" src="{html.escape(png)}"></a>'
              if png else '<div class="noimg">no preview</div>')
     rows = [
-        ("format", f"{entry.get('format', '?')} {entry.get('width', '?')}x{entry.get('height', '?')}"
+        ("format", f"{entry.get('format', '?')}"
+                   + (f" (decoded {entry['decoded']})" if entry.get("decoded") else "")
+                   + f" {entry.get('width', '?')}x{entry.get('height', '?')}"
                    + (f"x{entry['depth']}" if entry.get("depth", 1) > 1 else "")
                    + f" L{entry.get('level', 0)}/{entry.get('layer', 0)}"
                    + (" rescaled" if entry.get("rescaled") else "")),
@@ -59,7 +63,7 @@ def card(entry):
         rows.append(("nan/inf", f"{fmt_list(entry.get('nan'))} / {fmt_list(entry.get('inf'))}"))
     table = "".join(f"<tr><th>{k}</th><td>{html.escape(str(v))}</td></tr>" for k, v in rows)
     tags = "".join(f'<span class="b {c}">{html.escape(t)}</span>' for c, t in badges(entry))
-    return (f'<div class="card {kind}" id="{html.escape(entry["name"])}"><div class="t">{html.escape(title)}</div>'
+    return (f'<div class="card {html.escape(str(kind))}" id="{html.escape(entry["name"])}"><div class="t">{html.escape(title)}</div>'
             f"{tags}{image}<table>{table}</table><div class=\"n\">{html.escape(entry['name'])}</div></div>")
 
 
@@ -77,12 +81,10 @@ td{word-break:break-all}.b{display:inline-block;padding:1px 5px;margin:0 4px 4px
 """
 
 
-def main():
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
-    root = Path(sys.argv[1])
+def build_index(root: Path) -> Path:
+    """Writes root/index.html for the dump in root and returns its path."""
     entries, header, summary = [], {}, {}
-    for line in (root / "manifest.jsonl").read_text().splitlines():
+    for line in (root / "manifest.jsonl").read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         entry = json.loads(line)
@@ -106,8 +108,15 @@ def main():
             "alpha is not shown. Exact values are in the .raw.zst files (tightly packed rows).</p>"
             f'<div class="grid">{"".join(card(e) for e in entries)}</div>')
     out = root / "index.html"
-    out.write_text(page)
+    out.write_text(page, encoding="utf-8")
     print(f"{out}: {len(entries)} entries")
+    return out
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    build_index(Path(sys.argv[1]))
 
 
 if __name__ == "__main__":
