@@ -112,6 +112,7 @@
 // Qt Common //
 #include "qt_common/config/shared_translation.h"
 #include "qt_common/config/uisettings.h"
+#include "qt_common/game_list/game_list_p.h"
 
 #include "qt_common/abstract/frontend.h"
 
@@ -172,6 +173,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/frontend/applet_web_browser_types.h"
+#include "core/hle/service/bcat/backend/nextendo.h"
 
 #include "core/file_sys/card_image.h"
 #include "core/file_sys/common_funcs.h"
@@ -1602,6 +1604,11 @@ void MainWindow::InitializeHotkeys() {
     });
     connect_shortcut(QStringLiteral("Change Adapting Filter"), &MainWindow::OnToggleAdaptingFilter);
     connect_shortcut(QStringLiteral("Change Docked Mode"), &MainWindow::OnToggleDockedMode);
+    connect_shortcut(QStringLiteral("HOME Button"), [this] {
+        if (emulation_running) {
+            QtCommon::system->GetAppletManager().PressHomeButton();
+        }
+    });
     connect_shortcut(QStringLiteral("Change GPU Mode"), &MainWindow::OnToggleGpuAccuracy);
     connect_shortcut(QStringLiteral("Audio Mute/Unmute"), &MainWindow::OnMute);
     connect_shortcut(QStringLiteral("Audio Volume Down"), &MainWindow::OnDecreaseVolume);
@@ -2481,6 +2488,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         watcher.setFuture(QtConcurrent::run([&loader, title_id] {
             Common::NplnPatchCatalog::PrepareForGame(
                 title_id, [&] { return loader->ReadMainBuildIdHex(*QtCommon::system); });
+            Service::BCAT::Nextendo::PrepareForGame(title_id);
         }));
         progress.show();
         loop.exec();
@@ -2582,6 +2590,12 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     // Register an ExecuteProgram callback such that Core can execute a sub-program
     QtCommon::system->RegisterExecuteProgramCallback(
         [this](std::size_t program_index_) { render_window->ExecuteProgram(program_index_); });
+
+    QtCommon::system->RegisterLaunchInNewSessionCallback([this](u64 program_id) {
+        QMetaObject::invokeMethod(
+            this, [this, program_id] { OnLaunchInNewSession(program_id); },
+            Qt::QueuedConnection);
+    });
 
     QtCommon::system->RegisterExitCallback([this] {
         QtCommon::emu_thread->ForceStop();
@@ -3533,13 +3547,14 @@ void MainWindow::OnGameListShowList(bool show) {
     game_list_placeholder->setVisible(!show);
 };
 
-void MainWindow::OnGameListOpenPerGameProperties(const std::string& file) {
-    u64 title_id{};
+void MainWindow::OnGameListOpenPerGameProperties(u64 title_id, const std::string& file) {
     {
         const auto v_file = Core::GetGameFileFromPath(QtCommon::vfs, file);
-        const auto loader = Loader::GetLoader(*QtCommon::system, v_file);
+        const auto loader = Loader::GetLoader(*QtCommon::system, v_file, title_id);
 
-        if (loader == nullptr || loader->ReadProgramId(title_id) != Loader::ResultStatus::Success) {
+        u64 loaded_id{};
+        if (!loader || loader->ReadProgramId(loaded_id) != Loader::ResultStatus::Success ||
+            loaded_id != title_id) {
             QMessageBox::information(this, tr("Properties"),
                                      tr("The game properties could not be loaded."));
             return;
@@ -3550,45 +3565,50 @@ void MainWindow::OnGameListOpenPerGameProperties(const std::string& file) {
 }
 
 void MainWindow::OnLinkToRyujinx(const u64& program_id) {
-    namespace fs = std::filesystem;
+    if (emulation_running) {
+        QMessageBox::warning(this, tr("Stop emulation before linking saves"),
+                             tr("Close the running game before changing Ryujinx save links."));
+        return;
+    }
 
-    fs::path ryu_dir;
+    const auto profile = GetProfileID();
+    if (!profile) {
+        return;
+    }
 
-    // find an existing Ryujinx linked path in config.ini; if it exists, use it as a "hint"
-    // If it's not defined in config.ini, use default
-    const fs::path existing_path =
+    auto ryujinx_root =
         UISettings::values.ryujinx_link_paths
             .value(program_id, QDir(Common::FS::GetLegacyPath(Common::FS::RyujinxDir)))
             .filesystemAbsolutePath();
 
-    // this function also prompts the user to manually specify a portable location
-    ryu_dir = QtCommon::FS::GetRyujinxSavePath(existing_path, program_id);
-
-    if (ryu_dir.empty())
+    const auto save = QtCommon::FS::ChooseRyujinxSave(ryujinx_root, program_id, profile->AsU128());
+    if (!save) {
         return;
+    }
 
-    const std::string user_id = GetProfileIDString();
-    if (user_id.empty())
-        return;
+    const bool device = save->type == Common::FS::RyujinxSaveType::Device;
+    const auto type = device ? FileSys::SaveDataType::Device : FileSys::SaveDataType::Account;
+    const auto user = device ? u128{} : profile->AsU128();
+    const auto save_root = Common::FS::GetEdenPath(Common::FS::EdenPath::SaveDir);
+    const auto vfs_root = QtCommon::vfs->OpenDirectory(Common::FS::PathToUTF8String(save_root),
+                                                       FileSys::OpenMode::Read);
+    const auto lichii_dir = Common::FS::ConcatPathSafe(
+        save_root, FileSys::SaveDataFactory::GetFullPath(
+                       {}, vfs_root, FileSys::SaveDataSpaceId::User, type, program_id, user, 0));
 
-    const std::string hex_program = fmt::format("{:016X}", program_id);
-
-    const fs::path eden_dir = FrontendCommon::DataManager::GetDataDir(
-                                  FrontendCommon::DataManager::DataDir::Saves, user_id) /
-                              hex_program;
-
-    // CheckUnlink basically just checks to see if one or both are linked, and prompts the user to
-    // unlink if this is the case.
-    // If it returns false, neither dir is linked so it's fine to continue
-    if (!QtCommon::FS::CheckUnlink(eden_dir, ryu_dir)) {
-        RyujinxDialog dialog(eden_dir, ryu_dir, this);
-        if (dialog.exec() == QDialog::Accepted) {
-            UISettings::values.ryujinx_link_paths.insert(
-                program_id,
-                QString::fromStdString(Common::FS::GetRyuPathFromSavePath(ryu_dir).string()));
+    if (const auto unlinked = QtCommon::FS::CheckUnlink(lichii_dir, save->path)) {
+        if (!*unlinked) {
+            return;
         }
-    } else {
         UISettings::values.ryujinx_link_paths.remove(program_id);
+    } else {
+        RyujinxDialog dialog(lichii_dir, save->path,
+                             QString::fromStdString(fmt::format("{:016x}", save->save_id)), this);
+        if (dialog.exec() != QDialog::Accepted) {
+            return;
+        }
+        UISettings::values.ryujinx_link_paths.insert(
+            program_id, QString::fromStdU16String(ryujinx_root.u16string()));
     }
 
     config->SaveAllValues();
@@ -3953,6 +3973,40 @@ void MainWindow::OnExecuteProgram(std::size_t program_index) {
 
     LOG_DEBUG(Frontend, "ExecuteProgram booting from path: {}", filename.toStdString());
 
+    BootGame(filename, params);
+}
+
+void MainWindow::OnLaunchInNewSession(u64 program_id) {
+    // A request queued while its session stops would run inside ShutdownGame's event loop and boot
+    // under the outer shutdown, which then takes the new session's thread for a stuck one.
+    if (!emulation_running || QtCommon::system->IsShuttingDown()) {
+        LOG_WARNING(Frontend, "Dropping HOME Menu launch of {:016X}: its session is stopping",
+                    program_id);
+        return;
+    }
+    auto* const model = game_list->GetModel();
+    const auto matches =
+        model->match(model->index(0, 0), GameListItemPath::ProgramIdRole,
+                     QVariant::fromValue(qulonglong{program_id}), 1,
+                     Qt::MatchExactly | Qt::MatchRecursive);
+    QString filename;
+    if (!matches.isEmpty()) {
+        filename = matches.front().data(GameListItemPath::FullPathRole).toString();
+    } else if (const auto nca = QtCommon::system->GetContentProviderUnion().GetEntryRaw(
+                   program_id, FileSys::ContentRecordType::Program)) {
+        filename = QString::fromStdString(nca->GetFullPath());
+    }
+
+    LOG_INFO(Frontend, "HOME Menu launch of {:016X} in a new session from {}", program_id,
+             filename.toStdString());
+
+    ShutdownGame();
+    if (filename.isEmpty()) {
+        return;
+    }
+
+    auto params = ApplicationAppletParameters();
+    params.program_id = program_id;
     BootGame(filename, params);
 }
 

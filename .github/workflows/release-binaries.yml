@@ -169,7 +169,7 @@ jobs:
           host: linux
           target: desktop
           arch: linux_gcc_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       - name: Install Qt on Linux ARM64
@@ -180,7 +180,7 @@ jobs:
           host: linux_arm64
           target: desktop
           arch: linux_gcc_arm64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       # Ubuntu's own clang 18 cannot read a profile from a current LLVM, so take clang from the LLVM
@@ -228,7 +228,7 @@ jobs:
           host: windows
           target: desktop
           arch: win64_msvc2022_64
-          modules: qtcharts
+          modules: qtcharts qtimageformats
           cache: true
 
       # ccache does not handle MSVC-style command lines well, so the clang-cl job uses sccache. The
@@ -567,6 +567,9 @@ jobs:
           app=build/release/bin/lichii.app
           test -x "$app/Contents/MacOS/lichii"
           test -x build/release/bin/eden-cli
+          cmp dist/nx2_switches.txt "$app/Contents/Resources/nx2_switches.txt"
+          test ! -e "$app/Contents/MacOS/nx2_switches.txt"
+          python3 tools/nx2/test_switches.py SwitchDiscovery.test_signed_macos_resources_and_precedence
           cp build/release/bin/eden-cli "$app/Contents/MacOS/eden-cli"
           "$(brew --prefix qt@6)/bin/macdeployqt" "$app" \
             -executable="$app/Contents/MacOS/eden-cli" -libpath="$(brew --prefix)/lib" \

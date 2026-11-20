@@ -33,6 +33,7 @@
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
+#include "video_core/nx2_mme_capture.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -391,8 +392,17 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
         return true;
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
-               IsFastDrawVertexBuffer(method) || IsFastDrawVertexFormat(method);
+               IsFastDrawVertexBuffer(method) || IsFastDrawVertexFormat(method) ||
+               IsFastDrawQueryMethod(method);
     }
+}
+
+bool Maxwell3D::IsFastDrawQueryMethod(u32 method) {
+    // Neither is in what a delta draw keeps: the draw manager asks ShouldExecute for every draw,
+    // every draw resumes the counters and host conditional rendering (NotifySegment,
+    // CounterEnable), and a resolve that leaves the render pass ends the delta chain there.
+    return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+           method == MAXWELL3D_REG_INDEX(render_enable.mode);
 }
 
 bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
@@ -407,8 +417,10 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
     constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
     constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
     if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words) {
+        // address_high and address_low; stride, enable and frequency where they are dynamic.
         const u32 word = (method - streams) % stream_words;
-        return word == 1 || word == 2; // address_high, address_low
+        return word == 1 || word == 2 ||
+               VideoCommon::Nx2FastDraw::g_dynamic_vertex_streams.load(std::memory_order_relaxed);
     }
     constexpr u32 sizes = 0x600 / sizeof(u32); // SET_VERTEX_STREAM_SIZE_A/B (NativeVertexStreamSize)
     constexpr u32 limits = MAXWELL3D_REG_INDEX(vertex_stream_limits);
@@ -435,7 +447,8 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
-    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
+    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
+        !IsFastDrawQueryMethod(method)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {
@@ -1687,6 +1700,15 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
+void Maxwell3D::FrontCaptureMmeWrite(const FrontState& fs, u32 method, u32 value, bool from_macro) {
+    if (method - MAXWELL3D_REG_INDEX(load_mme.instruction_ptr) < 4) {
+        VideoCommon::MmeCapture::RecordWrite(
+            memory_manager.GetID(), this, from_macro ? "3d macro" : "3d dma", "3d", method, value,
+            GetNativeMacroEngine().native_write_offset,
+            fs.regs[MAXWELL3D_REG_INDEX(load_mme.start_address_ptr)]);
+    }
+}
+
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -1714,6 +1736,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
         return;
+    }
+    if (VideoCommon::MmeCapture::active) {
+        FrontCaptureMmeWrite(fs, method, value, from_macro);
     }
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
@@ -1887,6 +1912,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 fs.shadow[method] = argument;
             } else if (fs.control == Regs::ShadowRamControl::Replay) {
                 value = fs.shadow[method];
+            }
+            if (VideoCommon::MmeCapture::active) {
+                FrontCaptureMmeWrite(fs, method, value, false);
             }
             fs.regs[method] = value;
             FrontTrackInstanceLoop(fs, method, value); // DrawBegin runs for every word

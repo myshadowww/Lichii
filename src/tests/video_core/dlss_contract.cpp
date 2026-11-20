@@ -17,6 +17,12 @@ TEST_CASE("Star Fox depth-stencil input is isolated from the Fire Emblem contrac
     REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::D32_FLOAT, true));
     REQUIRE(DC::ValidDepthFormat(PixelFormat::D32_FLOAT, false));
     REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::D32_FLOAT_S8_UINT, false));
+    for (const auto format : {PixelFormat::D24_UNORM_S8_UINT, PixelFormat::S8_UINT_D24_UNORM}) {
+        REQUIRE(DC::IsUpscalerDepthFormat(format));
+        REQUIRE(DC::ValidDepthFormat(format, false));
+        REQUIRE_FALSE(DC::ValidDepthFormat(format, true));
+    }
+    REQUIRE_FALSE(DC::ValidDepthFormat(PixelFormat::R32_FLOAT, false));
 }
 
 TEST_CASE("Spatial cutscene replacement decodes sRGB into float without temporal history",

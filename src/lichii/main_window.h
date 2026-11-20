@@ -245,6 +245,7 @@ signals:
 public slots:
     void OnLoadComplete();
     void OnExecuteProgram(std::size_t program_index);
+    void OnLaunchInNewSession(u64 program_id);
     void OnExit();
     void OnSaveConfig();
     void AmiiboSettingsShowDialog(const Core::Frontend::CabinetParameters& parameters,
@@ -394,7 +395,7 @@ private slots:
     void OnGameListOpenDirectory(const QString& directory);
     void OnGameListAddDirectory();
     void OnGameListShowList(bool show);
-    void OnGameListOpenPerGameProperties(const std::string& file);
+    void OnGameListOpenPerGameProperties(u64 title_id, const std::string& file);
     void OnLinkToRyujinx(const u64& program_id);
     void OnMenuLoadFile();
     void OnMenuLoadFolder();

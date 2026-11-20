@@ -3299,6 +3299,8 @@ public:
     static bool IsFastDrawVertexBuffer(u32 method);
     /// A vertex attribute format, when vertex input is dynamic state.
     static bool IsFastDrawVertexFormat(u32 method);
+    /// Counter resets and the render enable mode: query state every draw applies itself.
+    static bool IsFastDrawQueryMethod(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
     /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
     /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map. False, having
@@ -3509,6 +3511,7 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontCaptureMmeWrite(const FrontState& state, u32 method, u32 value, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);

@@ -2262,6 +2262,16 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           std::array<f32, 2> jitter,
                                           std::array<f32, 2> motion_scale, bool use_history,
                                           bool reset_history) {
+    // Which backend drew the DLSS output and why, logged when that changes. A rejection is not
+    // logged: the caller may retry without history or depth, and the retry reports what drew.
+    const auto report = [this](std::string_view backend, std::string_view reason) {
+        if (backend == last_upscale_backend && reason == last_upscale_reason) {
+            return;
+        }
+        last_upscale_backend = backend;
+        last_upscale_reason = reason;
+        LOG_INFO(Render_Vulkan, "DLSS replacement drawn by {}: {}", backend, reason);
+    };
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
@@ -2394,6 +2404,7 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
     }
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
                                  jitter, motion_scale)) {
+        report(UsesNvidiaDlss() ? "NVIDIA DLSS" : "FSR 3.1", "all inputs present");
         return true;
     }
     const VkFormat format =
@@ -2573,6 +2584,11 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           dst_region, sharpness);
     }
     temporal_history.current = write_index;
+    report("the stand-in", !use_history                  ? "no history"
+                           : fsr3_unsupported             ? "FSR 3.1 unsupported or failed"
+                           : !WantsTemporalUpscaleDepth() ? "stand-in forced"
+                           : !depth                       ? "no depth"
+                                                          : "FSR 3.1 declined");
     return true;
 }
 
@@ -5108,12 +5124,16 @@ bool CustomBorderColorBudget::TryAcquire(const Device& device, size_t count) {
     return true;
 }
 
+void CustomBorderColorBudget::Release(size_t count) noexcept {
+    device_ptr->ReleaseCustomBorderColorSamplers(count);
+    held -= count;
+}
+
 void CustomBorderColorBudget::Release() noexcept {
     if (device_ptr != nullptr) {
-        device_ptr->ReleaseCustomBorderColorSamplers(held);
+        Release(held);
     }
     device_ptr = nullptr;
-    held = 0;
 }
 
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
@@ -5233,7 +5253,10 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         .unnormalizedCoordinates = VK_FALSE,
     };
     variants.reserve(1);
-    Emplace(VariantKey{});
+    Emplace(VariantKey{}, &runtime.fallback_sampler);
+    if (!runtime.fallback_sampler.handle) {
+        runtime.fallback_sampler = variants.front().binding;
+    }
 }
 
 Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth) const noexcept {
@@ -5269,10 +5292,10 @@ VkSampler Sampler::Find(const VariantKey& key) const noexcept {
     if (it == variants.end()) {
         return VK_NULL_HANDLE;
     }
-    return *it->sampler;
+    return it->binding.handle;
 }
 
-VkSampler Sampler::Emplace(VariantKey key) {
+VkSampler Sampler::Emplace(VariantKey key, const SamplerBinding* fallback) {
     bool custom_border = has_custom_border_colors && !key.drop_custom_border;
     if (custom_border && !custom_border_color_budget.TryAcquire(*device_ptr, 1)) {
         static bool warned_budget = false;
@@ -5340,11 +5363,57 @@ VkSampler Sampler::Emplace(VariantKey key) {
     if (!custom_border) {
         create_info.borderColor = ConvertBorderColor(color);
     }
-    variants.push_back(Variant{
+    Variant variant{
         .key = key,
-        .sampler = device_ptr->GetLogical().CreateSampler(create_info),
-    });
-    return *variants.back().sampler;
+        .sampler = {},
+        .binding = {.compatibility = {
+                        .mag_linear = create_info.magFilter == VK_FILTER_LINEAR,
+                        .min_linear = create_info.minFilter == VK_FILTER_LINEAR,
+                        .mipmap_linear = create_info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                        .anisotropy = create_info.anisotropyEnable != VK_FALSE,
+                        .compare = create_info.compareEnable != VK_FALSE,
+                        .minmax = has_minmax_reduction && !key.drop_reduction,
+                        .clamp_to_border =
+                            create_info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                            create_info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                            create_info.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+                        .custom_border = custom_border,
+                    }},
+    };
+    try {
+        variant.sampler = device_ptr->GetLogical().CreateSampler(create_info);
+        variant.binding.handle = *variant.sampler;
+    } catch (const vk::Exception& exception) {
+        if (custom_border) {
+            custom_border_color_budget.Release(1);
+        }
+        const VkResult result = exception.GetResult();
+        if (result != VK_ERROR_TOO_MANY_OBJECTS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+            result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            throw;
+        }
+        const auto compatible = std::ranges::find_if(variants, [&](const Variant& existing) {
+            return existing.binding.compatibility == variant.binding.compatibility &&
+                   (!custom_border || existing.key.swizzle == key.swizzle);
+        });
+        if (compatible != variants.end()) {
+            variant.binding.handle = compatible->binding.handle;
+        } else if (fallback && fallback->compatibility == variant.binding.compatibility &&
+                   !custom_border) {
+            variant.binding.handle = fallback->handle;
+        }
+        if (!variant.binding.handle) {
+            throw;
+        }
+        static std::atomic<u32> warnings{0};
+        if (warnings.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_Vulkan,
+                      "The driver refused a sampler ({}, its limit is {}): using another one",
+                      exception.what(), device_ptr->GetMaxSamplerAllocationCount());
+        }
+    }
+    variants.push_back(std::move(variant));
+    return variants.back().binding.handle;
 }
 
 VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
