@@ -45,9 +45,9 @@ if [[ ! -x $work_dir/venv/bin/python ]]; then
 fi
 "$work_dir/venv/bin/pip" install cmake==4.4.4 aqtinstall==3.3.0
 qt_root="$work_dir/qt/6.8.3/gcc_64"
-if [[ ! -x $qt_root/bin/qmake ]]; then
+if [[ ! -x $qt_root/bin/qmake || ! -f $qt_root/plugins/imageformats/libqwebp.so ]]; then
     "$work_dir/venv/bin/aqt" install-qt linux desktop 6.8.3 linux_gcc_64 \
-        -m qtcharts qtwaylandcompositor -O "$work_dir/qt"
+        -m qtcharts qtimageformats qtwaylandcompositor -O "$work_dir/qt"
 fi
 printf '%s\n' "$revision" > "$source_dir/GIT-COMMIT"
 printf '%s\n' desktop > "$source_dir/GIT-REFSPEC"
