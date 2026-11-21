@@ -8,6 +8,7 @@ add_executable(nx2-precompile main.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/shader_cache_v2/cache_file.cpp
     ${CMAKE_SOURCE_DIR}/src/video_core/shader_cache_v2/cache_format.cpp
     ${CMAKE_SOURCE_DIR}/src/core/file_sys/nup_container.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/file_sys/program_metadata.cpp
     ${CMAKE_SOURCE_DIR}/src/core/file_sys/vfs/vfs.cpp
     ${CMAKE_SOURCE_DIR}/src/core/file_sys/vfs/vfs_real.cpp
     ${CMAKE_SOURCE_DIR}/src/core/file_sys/vfs/vfs_vector.cpp

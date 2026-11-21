@@ -392,9 +392,15 @@ struct BufferCacheTestAccess {
     }
     static Binding Bind(Cache& cache, Tegra::MemoryManager& memory, GPUVAddr descriptor,
                         bool written = false, bool native = false, bool table = false,
-                        bool compute = false, bool sized = false) {
+                        bool compute = false, bool sized = false, bool extend_only = false) {
         cache.gpu_memory = &memory;
-        return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute, sized);
+        return cache.StorageBufferBinding(descriptor, 0, written, native, table, compute, sized,
+                                           extend_only);
+    }
+    static Binding BindGraphics(Cache& cache, size_t stage, u32 offset, bool written = false) {
+        cache.UnbindGraphicsStorageBuffers(stage);
+        cache.BindGraphicsStorageBuffer(stage, 0, 0, offset, written);
+        return cache.channel_state->storage_buffers[stage][0];
     }
     template <class C>
     static BufferId Add(C& cache, DAddr address, u32 size, bool mapped = false) {
@@ -1006,6 +1012,21 @@ TEST_CASE("NVN graphics descriptors bind their size and stop at a device range g
     REQUIRE(f.Bind(false, true, false, false, true).size == 16 << 20);
 }
 
+TEST_CASE("Storage binding cache distinguishes exact descriptors from extension-only slots",
+          "[buffer_ports]") {
+    Fixture f;
+    constexpr GPUVAddr base = 0x4000000;
+    f.memory->Map(base, 0x10000000, 80 << 20, Tegra::PTEKind::PITCH, true);
+    f.Descriptor(base, 1 << 20);
+    const auto bind = [&](bool extend_only) {
+        return Access::Bind(*f.cache, *f.memory, 0x100000, false, true, false, false, true,
+                            extend_only).size;
+    };
+    CHECK(bind(false) == 1 << 20);
+    CHECK(bind(true) == 8 << 20);
+    CHECK(bind(false) == 1 << 20);
+}
+
 TEST_CASE("Storage binding cache does not reuse a destroyed address space", "[buffer_ports]") {
     Fixture f;
     f.memory->Map(0x200000, 0x20000, 0x10000, Tegra::PTEKind::PITCH, true);
@@ -1020,6 +1041,76 @@ TEST_CASE("Storage binding cache does not reuse a destroyed address space", "[bu
     REQUIRE(f.memory->MapSerial() == serial);
     REQUIRE(f.memory->GetID() != owner);
     REQUIRE(f.Bind(true).device_addr == 0x30000);
+}
+
+TEST_CASE("Native NVN descriptor slots extend read-only bindings to their declared size",
+          "[buffer_ports]") {
+    Fixture f;
+    constexpr size_t vertex = 0;
+    constexpr size_t fragment = VideoCommon::NUM_STAGES - 1;
+    constexpr GPUVAddr base = 0x4000000;
+    constexpr DAddr device_base = 0x10000000;
+    constexpr u64 size = 56 << 20;
+    constexpr u64 mapped_size = 64 << 20;
+    constexpr u64 bare_size = 8 << 20;
+    constexpr u64 gap_offset = 16 << 20;
+    f.memory->Map(base, device_base, mapped_size, Tegra::PTEKind::PITCH, true);
+
+    const auto write_descriptor = [&](u32 offset, u64 declared_size) {
+        std::memcpy(f.bytes + offset, &base, sizeof(base));
+        std::memcpy(f.bytes + offset + sizeof(base), &declared_size, sizeof(declared_size));
+    };
+    for (const u32 offset : {0x110U, 0x500U, 0x540U, 0x568U, 0x600U, 0x610U}) {
+        write_descriptor(offset, size);
+    }
+
+    Tegra::Control::ChannelState state{0};
+    bool exact_descriptor = false;
+    SECTION("Other games extend read-only slots") {}
+    SECTION("Mario Kart World keeps exact read and write descriptors") {
+        state.program_id = Settings::MarioKartWorldProgramId;
+        exact_descriptor = true;
+    }
+    state.memory_manager = &*f.memory;
+    state.payload.emplace(f.system, *f.memory, state);
+    auto& engine = state.payload->maxwell_3d;
+    engine.SetNativeTuringMacroMode(true);
+    for (const size_t stage : {vertex, fragment}) {
+        engine.state.shader_stages[stage].const_buffers[0] = {
+            .address = 0x100000, .size = 0x10000, .enabled = true};
+    }
+    f.cache->CreateChannel(state);
+    f.cache->BindToChannel(state.bind_id);
+
+    const auto coefficients = Access::BindGraphics(*f.cache, fragment, 0x540);
+    REQUIRE(coefficients.device_addr == device_base);
+    REQUIRE(coefficients.size == size);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x600).size == size);
+    REQUIRE(Access::BindGraphics(*f.cache, vertex, 0x110).size == size);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x500).size == bare_size);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x568).size == bare_size);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x610).size == bare_size);
+    REQUIRE(Access::BindGraphics(*f.cache, vertex, 0x540).size == bare_size);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x540, true).size ==
+            (exact_descriptor ? size : bare_size));
+
+    auto& bank = engine.state.shader_stages[fragment].const_buffers[0];
+    bank.size = 0x548;
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x540).size == bare_size);
+    bank.size = 0x10000;
+
+    write_descriptor(0x540, 1 << 20);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x540).size ==
+            (exact_descriptor ? 1 << 20 : bare_size));
+    write_descriptor(0x540, mapped_size + 0x1000);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x540).size == bare_size);
+    write_descriptor(0x540, (1ULL << 32) | size);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x540).size == bare_size);
+
+    write_descriptor(0x540, size);
+    f.memory->Map(base + gap_offset, 0x20000000, 0x10000, Tegra::PTEKind::PITCH, true);
+    REQUIRE(f.memory->GetMemoryLayoutSize(base) == mapped_size);
+    REQUIRE(Access::BindGraphics(*f.cache, fragment, 0x540).size == gap_offset);
 }
 
 TEST_CASE("Batch downloads clamp buffers, deduplicate pages and finish before publication",

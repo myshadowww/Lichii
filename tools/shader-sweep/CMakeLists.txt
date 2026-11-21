@@ -73,6 +73,7 @@ endif()
 add_executable(nup-shader-export
     nup_export.cpp
     ${REPOSITORY_ROOT}/src/core/file_sys/nup_container.cpp
+    ${REPOSITORY_ROOT}/src/core/file_sys/program_metadata.cpp
     ${REPOSITORY_ROOT}/src/core/file_sys/vfs/vfs.cpp
     ${REPOSITORY_ROOT}/src/core/file_sys/vfs/vfs_real.cpp
     ${REPOSITORY_ROOT}/src/core/file_sys/vfs/vfs_vector.cpp

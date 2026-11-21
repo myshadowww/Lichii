@@ -771,6 +771,9 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         has_shader_warm ? tr("Rebuild Shader Precache") : tr("Build Shader Precache"));
     QAction* prepare_shaders_recipe =
         context_menu.addAction(tr("Build Shader Precache from Recipe..."));
+    QAction* precompile_shaders = context_menu.addAction(tr("Precompile All Shaders"));
+    precompile_shaders->setCheckable(true);
+    precompile_shaders->setChecked(ShaderWarmRequested(program_id));
     QAction* delete_shader_warm = nullptr;
     if (has_shader_warm) {
         delete_shader_warm = context_menu.addAction(tr("Delete Shader Precache"));
@@ -853,7 +856,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
                 [this, program_id] { emit ReportCompatibilityRequested(program_id); });
     }
 
-    const std::array<std::pair<QAction*, const char*>, 20> icons{{
+    const std::array<std::pair<QAction*, const char*>, 21> icons{{
         {favorite, "star"},
         {start_game, "play"},
         {start_game_global, "play"},
@@ -861,6 +864,7 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
         {open_mod_location, "puzzle"},
         {open_transferable_shader_cache, "layers"},
         {prepare_shaders, "cpu"},
+        {precompile_shaders, "cpu"},
         {delete_shader_warm, "trash"},
         {ryujinx, "link"},
         {remove_menu->menuAction(), "trash"},
@@ -913,6 +917,9 @@ void GameList::AddGamePopup(QMenu& context_menu, u64 program_id, const std::stri
             [this, program_id, path]() { emit PrepareShaderWarmRequested(program_id, path); });
     connect(prepare_shaders_recipe, &QAction::triggered, this, [this, program_id, path]() {
         emit PrepareShaderWarmFromRecipeRequested(program_id, path);
+    });
+    connect(precompile_shaders, &QAction::toggled, this, [this, program_id, path](bool checked) {
+        emit PrecompileShadersRequested(program_id, path, checked);
     });
     if (delete_shader_warm) {
         connect(delete_shader_warm, &QAction::triggered, this,
