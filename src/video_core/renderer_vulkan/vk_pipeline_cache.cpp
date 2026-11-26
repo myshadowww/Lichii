@@ -344,6 +344,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 
         info.dual_source_blend = key.state.attachment0_dual_source_blend != 0;
 
+        const auto zeta_format{static_cast<Tegra::DepthFormat>(key.state.depth_format.Value())};
+        info.quantize_frag_depth_d24 = key.state.depth_enabled != 0 &&
+                                       !device.SupportsD24DepthBuffer() &&
+                                       (zeta_format == Tegra::DepthFormat::Z24_UNORM_S8_UINT ||
+                                        zeta_format == Tegra::DepthFormat::X8Z24_UNORM ||
+                                        zeta_format == Tegra::DepthFormat::S8Z24_UNORM ||
+                                        zeta_format == Tegra::DepthFormat::V8Z24_UNORM);
+
         if (device.IsMoltenVK()) {
             for (size_t i = 0; i < 8; ++i) {
                 const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
@@ -791,6 +799,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
+        .has_broken_global_memory_search_call =
+            driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+            device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         // Mesa MR 45092 ("radv: Clear stale vertex user SGPR state when binding mesh shaders"),
         // in 26.2.5. Only GFX11+ is affected, but the workaround costs one SGPR read anywhere.
         .has_broken_mesh_user_sgprs = driver_id == VK_DRIVER_ID_MESA_RADV &&
@@ -808,6 +819,15 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     if (profile.has_broken_mesh_user_sgprs) {
         LOG_INFO(Render_Vulkan, "RADV before 26.2.5: native mesh shaders read the grid size to "
                                 "avoid the stale mesh user SGPR hang");
+    }
+    if (profile.select_global_memory_buffer) {
+        constexpr std::array arch_names{"Kepler or older", "Maxwell", "Pascal", "Volta", "Turing",
+                                        "Ampere or newer"};
+        LOG_INFO(Render_Vulkan, "NVIDIA {}: global memory accesses search the bound buffers {}",
+                 arch_names[static_cast<size_t>(device.GetNvidiaArch())],
+                 profile.has_broken_global_memory_search_call
+                     ? "inline in every stage"
+                     : "through one non-inlined function outside task and mesh programs");
     }
 
     host_info = Shader::HostTranslateInfo{
@@ -1097,14 +1117,31 @@ void PipelineCache::SaveUsedPipelines() {
                               VideoCommon::ShaderCacheV2::EncodeUsed(record));
 }
 
-GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool key_unchanged) {
+    VideoCommon::GpuSplit::BackOwned("PipelineCache::CurrentGraphicsPipeline");
 
+    if (VideoCommon::GpuSplit::TracksGraphicsLookups()) {
+        ++graphics_lookups;
+        last_lookup_kept = false;
+    }
+    std::array<u64, 6> hashes;
+    if (key_unchanged) {
+        hashes = graphics_key.unique_hashes;
+    }
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
     }
     const bool mesh_draw =
         maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled();
+    // Refresh would rebuild the key current_pipeline was found with: same registers, programs and
+    // topology (its parts kept behind dirty flags come from the same registers).
+    if (key_unchanged && current_pipeline != nullptr && !mesh_draw && !vertex_input_lent &&
+        hashes == graphics_key.unique_hashes) {
+        last_lookup_kept = true;
+        current_pipeline->MarkUsed(frame_count);
+        return BuiltPipeline(current_pipeline);
+    }
     if (vertex_input_lent && !mesh_draw) {
         // Refresh keeps the key's vertex input until the registers change it.
         vertex_input_lent = false;
@@ -1229,6 +1266,7 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
+    VideoCommon::GpuSplit::BackOwned("PipelineCache::CurrentComputePipeline");
 
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
@@ -1315,6 +1353,36 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     }
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
+}
+
+ComputePipeline* PipelineCache::UnlentComputePipeline(u64& native_key) {
+    VideoCommon::GpuSplit::BackOwned("PipelineCache::UnlentComputePipeline");
+    const ShaderInfo* const shader{KnownComputeShader()};
+    if (!shader) {
+        return nullptr;
+    }
+    const auto& qmd{kepler_compute->launch_description};
+    const ComputePipelineCacheKey key{
+        .unique_hash = shader->unique_hash,
+        .shared_memory_size = qmd.shared_alloc,
+        .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
+    };
+    const auto it{compute_cache.find(key)};
+    if (it == compute_cache.end()) {
+        return nullptr;
+    }
+    ComputePipelineCacheEntry& entry{it->second};
+    if (!entry.pipeline || entry.pending_rebuild ||
+        (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
+         StaleNullPointerSlot(entry)) ||
+        !KnownComputeShaderChecks(shader)) {
+        return nullptr;
+    }
+    native_key = shader->lowered_native ? shader->lowered_native->native_program_key : 0;
+    if (VideoCommon::StutterTrace::Enabled() && !std::exchange(entry.used, true)) {
+        VideoCommon::StutterTrace::CountLookup(VideoCommon::StutterTrace::Lookup::ComputePrebuilt);
+    }
+    return entry.pipeline.get();
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -1822,11 +1890,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
                 .cpu_bytes = TranslationBytes(bytes),
                 .driver_bytes = DriverCompileBytes,
                 .cpu = [this, &state, &built_one, &records, &pipeline_record, &unreadable, key,
-                        indices = std::move(indices),
+                        job_indices = std::move(indices),
                         read_properties](VideoCommon::ShaderJobContext& context)
                     -> VideoCommon::ShaderDriverStage {
                     std::vector<CachedComputeTranslation> candidates;
-                    for (const size_t index : indices) {
+                    for (const size_t index : job_indices) {
                         const CacheV2::LogRecord& record = *records[index];
                         Common::UniqueFunction<void, std::istream&, FileEnvironment> read_compute{
                             [&](std::istream& file, FileEnvironment env) {
@@ -1947,8 +2015,13 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
                 }
                 bool incomplete{};
                 try {
-                    return TranslateCachedGraphics(record.payload, record.key, nullptr,
-                                                   incomplete);
+                    auto pipeline = TranslateCachedGraphics(record.payload, record.key, nullptr,
+                                                            incomplete);
+                    if (incomplete) {
+                        std::scoped_lock lock{incomplete_prebuilds_mutex};
+                        incomplete_prebuilds.insert(record.key.Hash());
+                    }
+                    return pipeline;
                 } catch (const std::ios_base::failure&) {
                     return std::unique_ptr<GraphicsPipeline>{};
                 }
@@ -3769,16 +3842,27 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0;
     };
     const bool depth_tested =
-        native ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
-                     regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
-                     ColorWritesHaveHistory(
-                         std::min<u32>(regs.rt_control.count,
-                                       static_cast<u32>(Maxwell::NumRenderTargets)),
-                         [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
-                         [this](u32 rt_index) {
-                             return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
-                         })
-               : regs.zeta_enable != 0;
+        native
+            ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
+                  regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
+                  ColorWritesHaveHistory(
+                      std::min<u32>(regs.rt_control.count,
+                                    static_cast<u32>(Maxwell::NumRenderTargets)),
+                      [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
+                      [this](u32 rt_index) {
+                          if (!VideoCommon::GpuSplit::LendsToRender()) {
+                              return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
+                          }
+                          // An unlent draw's lookup asks GPURender's texture cache.
+                          auto& split = VideoCommon::GpuSplit::Get();
+                          split.NoteLookupLend();
+                          bool written{};
+                          split.LendRender([&] {
+                              written = texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
+                          });
+                          return written;
+                      })
+            : regs.zeta_enable != 0;
     // Native draws are judged by the heuristic only when a mode other than Wait is chosen.
     const bool can_discard = CanDiscardPendingDraw(
         native, depth_tested, draw_state.draw_element_count, draw_state.draw_element_count,
@@ -4772,7 +4856,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    if (disk_pipelines.contains(graphics_key.Hash())) {
+    const bool incomplete_record = [&] {
+        std::scoped_lock lock{incomplete_prebuilds_mutex};
+        return incomplete_prebuilds.erase(graphics_key.Hash()) != 0;
+    }();
+    if (disk_pipelines.contains(graphics_key.Hash()) && !incomplete_record) {
         // In the disk cache already, only not built at boot.
         QueueVulkanPipelineCacheFlush();
         return pipeline;

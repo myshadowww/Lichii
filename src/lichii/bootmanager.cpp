@@ -803,7 +803,10 @@ bool GRenderWindow::InitRenderTarget() {
     setMinimumSize(1, 1);
 
 #if !defined(__linux__) || defined(__ANDROID__)
-    resize(target_width, target_height);
+    // A separate render window keeps the size it was restored to when the user asked for that.
+    if (!isWindow() || !UISettings::values.preserve_window_size.GetValue()) {
+        resize(target_width, target_height);
+    }
 
     OnMinimalClientAreaChangeRequest(GetActiveConfig().min_client_area_size);
 #endif

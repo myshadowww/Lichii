@@ -36,6 +36,7 @@
 #include "video_core/nx2_mme_capture.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_render_view.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
 #include "video_core/rasterizer_interface.h"
@@ -780,6 +781,9 @@ void Maxwell3D::StoreStateRegisters(std::span<const u64, 4> flags, std::span<con
         if (tracked) {
             shadow_state.reg_array[method] = value;
         }
+        if (render_view_writes) [[unlikely]] {
+            render_view_writes->Note(method);
+        }
     }
     for (size_t word = 0; word < flags.size(); ++word) {
         for (u64 bits = flags[word]; bits != 0; bits &= bits - 1) {
@@ -1214,6 +1218,9 @@ void Maxwell3D::ProcessCBBind(size_t stage_index) {
     }
     buffer.address = regs.const_buffer.Address();
     buffer.size = regs.const_buffer.size;
+    if (render_view_writes) [[unlikely]] {
+        render_view_writes->NoteBind(stage_index, bind_data.shader_slot);
+    }
 
     const bool is_enabled = bind_data.valid.Value() != 0;
     if (!is_enabled) {
@@ -1285,8 +1292,17 @@ bool Maxwell3D::WriteBoundConstantBuffer(u32 offset, const void* data, u32 bytes
         return false;
     }
     const DAddr device = bound.device + offset;
-    FastDraw::NoteConstantData(begin, begin + bytes);
-    FastDraw::NoteDeviceData(device, device + bytes);
+    // Data memory already holds changes neither the texture handles nor the uniforms a delta draw
+    // keeps from the draw before (Donkey Kong Bananza writes most of its handles again unchanged).
+    // GPU-written pages can be newer than memory, and memory can be newer than what the last full
+    // resolve read (a guest CPU write, watch change or sync since, or a page CPU writes to don't
+    // notify): writes there count.
+    if (Tegra::Nx2MayBeGpuWritten(device, bytes) ||
+        !memory_manager.ConstantBufferDataMatches(device, data, bytes) ||
+        !FastDraw::HandleMemoryUnchanged() || !memory_manager.IsDeviceRangeCached(device, bytes)) {
+        FastDraw::NoteConstantData(begin, begin + bytes);
+        FastDraw::NoteDeviceData(device, device + bytes);
+    }
     memory_manager.WriteConstantBufferData(device, data, bytes);
     return true;
 }

@@ -1000,6 +1000,18 @@ void KeyManager::SetKey(S256KeyType id, Key256 key, u64 field1, u64 field2) {
     s256_keys[{id, field1, field2}] = key;
 }
 
+std::optional<Key256> KeyManager::TakeKeyForTest(S256KeyType id, u64 field1, u64 field2) {
+    const auto node = s256_keys.extract({id, field1, field2});
+    if (node.empty()) {
+        return std::nullopt;
+    }
+    return node.mapped();
+}
+
+void KeyManager::RestoreKeyForTest(S256KeyType id, const Key256& key, u64 field1, u64 field2) {
+    s256_keys[{id, field1, field2}] = key;
+}
+
 bool KeyManager::KeyFileExists(bool title) {
     const auto keys_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
     if (title)

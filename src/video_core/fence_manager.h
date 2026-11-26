@@ -55,6 +55,10 @@ class FenceManager {
     static constexpr bool can_async_check = Traits::HAS_ASYNC_CHECK;
 
 public:
+    /// EDEN_NX2_RENDER_POST_FENCE: GPURender plays a fence the back posted, whose buffer half the
+    /// back found empty: the commit leaves the back's buffer cache alone.
+    bool skip_buffer_half{};
+
     /// Notify the fence manager about a new frame
     void TickFrame() {
         std::unique_lock lock(ring_guard);
@@ -168,6 +172,13 @@ public:
         SignalFence(std::move(func));
     }
 
+    /// Tests only: runs on the fencing thread, with guard held, each time it found no fences and
+    /// is about to sleep.
+    void SetFenceThreadSleepHookForTest(std::function<void()> hook) {
+        std::scoped_lock lock{guard};
+        fence_thread_sleep_hook = std::move(hook);
+    }
+
     void WaitPendingFences([[maybe_unused]] bool force) {
         if constexpr (!can_async_check) {
             TryReleasePendingFences<true>();
@@ -209,8 +220,9 @@ protected:
     virtual ~FenceManager() {
         if constexpr (can_async_check) {
             {
-                // Serialize the stop with the wait predicate so its notification cannot land
-                // between the worker checking the empty queue and entering cv.wait.
+                // Under guard, as the fencing thread reads it before it sleeps: requested between
+                // that read and the sleep, the stop and its notify were lost, and the join never
+                // returned (closing a game, and once in a while the split_fence_wait test).
                 std::scoped_lock lock{guard};
                 fence_thread.request_stop();
             }
@@ -302,10 +314,20 @@ private:
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
-                cv.wait(lock, [&] {
+                const auto can_release = [&] {
                     fence_thread_waiting = !stop_token.stop_requested() && fences.empty();
+                    if (fence_thread_waiting && fence_thread_sleep_hook) {
+                        fence_thread_sleep_hook();
+                    }
                     return !fence_thread_waiting;
-                });
+                };
+                if (fence_thread_sleep_hook) {
+                    if (!cv.wait_for(lock, std::chrono::seconds{10}, can_release)) {
+                        continue;
+                    }
+                } else {
+                    cv.wait(lock, can_release);
+                }
                 fence_thread_waiting = false;
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
@@ -426,7 +448,7 @@ private:
                 flushes.committed |= TextureFlushes;
             }
         }
-        {
+        if (!skip_buffer_half) {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
                 buffer_cache.CommitAsyncFlushes();
@@ -521,6 +543,7 @@ private:
     std::mutex uncommitted_guard; ///< Guards uncommitted_operations
     std::condition_variable cv;
     bool fence_thread_waiting{}; ///< The fencing thread waits on cv for fences (guarded by guard)
+    std::function<void()> fence_thread_sleep_hook; ///< Tests only (guarded by guard)
 
     std::jthread fence_thread;
 

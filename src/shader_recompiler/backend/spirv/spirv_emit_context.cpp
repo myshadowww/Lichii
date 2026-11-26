@@ -1228,6 +1228,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     // search is one function that is not inlined, and the accesses stay inlined. Task and mesh
     // programs search inline: as calls, the first of two consecutive loads in Ocarina's tree task
     // program returned 0 on NVIDIA, so every tree cell drew its 256-record cap (upstream #907).
+    // Pascal and older search inline in every stage (has_broken_global_memory_search_call).
     Id search_function{};
     bool selects_all_buffers{};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, const StorageTypeDefinition& type_def,
@@ -1544,7 +1545,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
         const bool all{route == 0};
         const bool words{!profile.support_descriptor_aliasing &&
                          (use.accesses[1] || use.accesses[2])};
-        if (selects_all_buffers && stage != Stage::Task && stage != Stage::Mesh) {
+        if (selects_all_buffers && !profile.has_broken_global_memory_search_call &&
+            stage != Stage::Task && stage != Stage::Mesh) {
             search_function = OpFunction(U32[3], spv::FunctionControlMask::DontInline,
                                          TypeFunction(U32[3], U64));
             const Id addr{OpFunctionParameter(U64)};
@@ -2080,8 +2082,11 @@ void EmitContext::DefineInputs(const IR::Program& program) {
         std::ranges::any_of(info.interpolation, [](Interpolation mode) {
             return mode == Interpolation::NoPerspective;
         })};
+    const bool quantized_frag_depth{stage == Stage::Fragment && info.stores_frag_depth &&
+                                    runtime_info.quantize_frag_depth_d24};
     if (loads.AnyComponent(IR::Attribute::PositionX) ||
-        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth) {
+        info.passthrough.AnyComponent(IR::Attribute::PositionX) || noperspective_as_smooth ||
+        quantized_frag_depth) {
         const bool is_fragment{stage == Stage::Fragment};
         if (!is_fragment && profile.has_broken_spirv_position_input) {
             need_input_position_indirect = true;

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -335,18 +336,34 @@ TEST_CASE("NCA with an AES-XTS section opens a storage", "[core][file_sys]") {
     REQUIRE(nca.Open() == ResultSuccess);
 }
 
-TEST_CASE("NCA without a header key reports the missing key", "[core][file_sys]") {
-    if (Core::Crypto::KeyManager::Instance().HasKey(Core::Crypto::S256KeyType::Header)) {
-        SKIP("A header key is installed");
+/// Takes the installed header key out of memory for one test and puts it back after, so the
+/// missing-key paths run on machines with keys too. The key files are not touched.
+class WithoutHeaderKey {
+public:
+    WithoutHeaderKey()
+        : key{Core::Crypto::KeyManager::Instance().TakeKeyForTest(
+              Core::Crypto::S256KeyType::Header)} {}
+    ~WithoutHeaderKey() {
+        if (key) {
+            Core::Crypto::KeyManager::Instance().RestoreKeyForTest(
+                Core::Crypto::S256KeyType::Header, *key);
+        }
     }
+    WithoutHeaderKey(const WithoutHeaderKey&) = delete;
+    WithoutHeaderKey& operator=(const WithoutHeaderKey&) = delete;
+
+private:
+    std::optional<Core::Crypto::Key256> key;
+};
+
+TEST_CASE("NCA without a header key reports the missing key", "[core][file_sys]") {
+    const WithoutHeaderKey without_header_key;
     const NCA nca{MakeFile(std::vector<u8>(0xC00, 0xA5))};
     CHECK(nca.GetStatus() == Loader::ResultStatus::ErrorMissingHeaderKey);
 }
 
 TEST_CASE("NSP that cannot be decrypted reports the missing key", "[core][file_sys]") {
-    if (Core::Crypto::KeyManager::Instance().HasKey(Core::Crypto::S256KeyType::Header)) {
-        SKIP("A header key is installed");
-    }
+    const WithoutHeaderKey without_header_key;
     const auto nsp = MakeFile(MakePfs0WithFiles(
         {{"0123456789abcdef0123456789abcdef.cnmt.nca", std::vector<u8>(0xC00, 0xA5)}}));
     CHECK_FALSE(Loader::IsBootableGameContainer(nsp, Loader::FileType::NSP));

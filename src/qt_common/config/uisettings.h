@@ -93,6 +93,7 @@ struct Values {
 
     Setting<bool> single_window_mode{linkage, true, "singleWindowMode", Category::Ui};
     Setting<bool> fullscreen{linkage, false, "fullscreen", Category::Ui};
+    Setting<bool> preserve_window_size{linkage, false, "preserveWindowSize", Category::Ui};
     Setting<bool> show_filter_bar{linkage, true, "showFilterBar", Category::Ui};
     Setting<bool> show_status_bar{linkage, true, "showStatusBar", Category::Ui};
 
@@ -156,6 +157,9 @@ struct Values {
 
     // Discord RPC
     Setting<bool> enable_discord_presence{linkage, false, "enable_discord_presence", Category::Ui};
+    Setting<std::string> mod_store_api_url{linkage, "https://lichii-api.zortos.me",
+                                           "mod_store_api_url", Category::Ui,
+                                           Settings::Specialization::Default, false};
 
     // logging
     Setting<bool> show_console{linkage, false, "showConsole", Category::Ui};
